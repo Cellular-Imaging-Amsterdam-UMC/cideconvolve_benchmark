@@ -37,14 +37,29 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # --- Runtime system packages ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3-pip \
         openjdk-17-jre-headless \
         libfftw3-3 libgsl27 libtiff5 libpng16-16 \
         ocl-icd-libopencl1 \
         wget ca-certificates \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
     && rm -rf /var/lib/apt/lists/*
+
+# --- Install Miniforge (conda-forge only, no Anaconda ToS) ---
+RUN wget -q -O /tmp/miniforge.sh \
+        "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh" \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm /tmp/miniforge.sh \
+    && /opt/conda/bin/conda clean -afy
+
+ENV PATH="/opt/conda/bin:${PATH}"
+
+# --- Create conda env with Python 3.11 + pycudadecon ---
+RUN conda create -n deconv python=3.11 -y \
+    && conda install -n deconv -c conda-forge pycudadecon=0.5.1 -y \
+    && conda clean -afy
+
+# Activate the conda env for all subsequent RUN commands
+ENV PATH="/opt/conda/envs/deconv/bin:${PATH}"
+ENV CONDA_DEFAULT_ENV=deconv
 
 # --- Copy deconwolf binaries from builder ---
 COPY --from=builder /usr/local/bin/dw /usr/local/bin/dw
@@ -60,7 +75,7 @@ COPY bin/DeconvolutionLab_2.jar /app/bin/DeconvolutionLab_2.jar
 
 WORKDIR /app
 
-# --- Python dependencies ---
+# --- Python dependencies (pip installs into the conda env) ---
 COPY requirements_docker.txt /app/requirements_docker.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements_docker.txt
