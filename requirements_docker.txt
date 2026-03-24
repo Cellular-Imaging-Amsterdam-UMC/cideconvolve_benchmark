@@ -1,0 +1,34 @@
+# ===========================================================================
+# Docker-specific requirements for CIDeconvolve benchmark
+# ===========================================================================
+# PyTorch CUDA wheels are pulled via --extra-index-url (see Dockerfile).
+# All optional GPU packages are enabled here since the Docker image ships
+# with NVIDIA CUDA runtime + OpenCL support.
+# ===========================================================================
+
+# PyTorch with CUDA 12.6 support
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch
+torchvision
+
+# Core dependencies
+numpy>=1.23.0
+tifffile>=2023.1.0
+ome-types>=0.5.0
+scipy>=1.10.0
+Pillow>=9.0.0
+scikit-image>=0.20.0
+
+# OME-TIFF reading
+bioio>=1.0.0
+bioio-ome-tiff>=1.0.0
+
+# PSF generation (vendored sdeconv & psf_generator use these)
+zernikepy>=0.1.0
+
+# RedLionfish RL deconvolution (OpenCL GPU + CPU fallback)
+redlionfish
+
+# cuCIM GPU-accelerated Richardson-Lucy (Linux only, NVIDIA GPU)
+cucim-cu12
+cupy-cuda12x

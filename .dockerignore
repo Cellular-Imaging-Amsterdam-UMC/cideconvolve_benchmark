@@ -1,0 +1,38 @@
+# Large cloned repos (not needed in image)
+gitclones/
+
+# Output is mounted at runtime, not baked in
+output/
+
+# Data is mounted at runtime, not baked in
+data/
+
+# Windows binaries (Linux builds deconwolf from source)
+bin/dw.exe
+bin/dw_bw.exe
+bin/*.dll
+bin/dl2classes/
+bin/dl2stubs/
+bin/dl2_sources.txt
+
+# Git and IDE
+.git/
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# vcpkg build artifacts
+vcpkg/
+
+# Runtime caches
+VkFFT_kernelCache_*.binary
+fftw_wisdom_*.dat
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

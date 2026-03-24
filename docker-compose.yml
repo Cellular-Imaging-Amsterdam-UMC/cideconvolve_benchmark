@@ -1,0 +1,15 @@
+services:
+  benchmark:
+    build: .
+    # Mount data (read-only) and output (writable)
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output
+    # NVIDIA GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
