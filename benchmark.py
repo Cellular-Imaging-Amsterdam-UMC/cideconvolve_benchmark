@@ -1,5 +1,5 @@
 """
-Demo: Richardson-Lucy deconvolution only — U2OS widefield data.
+Benchmark: Richardson-Lucy deconvolution only — U2OS widefield data.
 
 Loads the U2OS_R3D_WF_DV widefield image from the data/ folder, generates
 channel-specific PSFs from OME metadata, and runs Richardson-Lucy
@@ -7,9 +7,20 @@ deconvolution (2D single-slice, full 3D, and plane-by-plane).
 Also generates MIPs from the Huygens deconvolution for comparison.
 
 Usage:
-    python benchmark.py
+    python benchmark.py [image_filename] [blocks]
+
+    image_filename  Optional image file in data/ folder.
+                    Defaults to DividingCellcrop.ome.tiff.
+                    The Huygens file (*_decon*) and output prefix
+                    are derived automatically from the filename.
+    blocks          Block tiling mode (default: auto).
+                    'auto': calculate minimum blocks so each tile
+                    stays within XY and Z limits.
+                    0 or 1: no tiling.
+                    >1: explicit number of blocks.
 """
 
+import gc
 import logging
 import sys
 import time
@@ -28,6 +39,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Import deconvolve FIRST — it handles the torch-before-numpy DLL load
 # order required on Windows with mixed conda/pip environments.
 from deconvolve import (
+    MAX_TILE_XY,
+    MAX_TILE_Z,
     METHODS,
     _channel_color,
     deconvolve,
@@ -45,31 +58,55 @@ DATA_DIR = Path(__file__).parent / "data"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-IMAGE_FILE = "U2OS_R3D_WF_DV.ome.tiff"
-HUYGENS_FILE = "U2OS_R3D_WF_DV_decon.ome.tiff"
-PREFIX = "U2OS"
-NITERS = [15, 45]  # iteration counts to test for full 3D RL
+# Defaults — overridden by command-line argument in __main__
+IMAGE_FILE = "DividingCellcrop.ome.tiff"
+HUYGENS_FILE = "DividingCellcrop_decon.ome.tiff"
+PREFIX = "DividingCellcrop.ome"
+ORIGINAL_DATA_DIR = DATA_DIR  # preserved even when benchmark mode redirects DATA_DIR
+
+
+def _derive_names(image_file: str):
+    """Derive HUYGENS_FILE and PREFIX from an image filename."""
+    p = Path(image_file)
+    suffixes = "".join(p.suffixes)          # e.g. ".ome.tiff"
+    base = p.name[:-len(suffixes)] if suffixes else p.name  # e.g. "DividingCellcrop"
+    huygens = base + "_decon" + suffixes    # e.g. "DividingCellcrop_decon.ome.tiff"
+    prefix = p.stem                         # e.g. "DividingCellcrop.ome"
+    return huygens, prefix
+NITERS = [20, 40, 60]  # iteration counts to test 
 TIMINGS = {}  # key: output filename stem → elapsed seconds
 
 # --- Toggle individual algorithms on/off ---
-RUN_SDECONV_CPU = True
-RUN_SDECONV_CUDA = True
-RUN_PYCUDADECON = True
+RUN_SDECONV_CPU_RL = True
+RUN_SDECONV_CUDA_RL = True
+RUN_SDECONV_PLANE_BY_PLANE_RL = True
+RUN_PYCUDADECON_RL = True
 RUN_DECONWOLF_RL = True
 RUN_DECONWOLF_SHB = True
 RUN_DECONVLAB2_RL = True
 RUN_DECONVLAB2_RLTV = True
-RUN_PLANE_BY_PLANE = True
-RUN_REDLIONFISH = True
+RUN_REDLIONFISH_RL = True
 RUN_SKIMAGE_RL = True
-RUN_CUCIM_RL = True
+RUN_SKIIMAGE_CUCIM_RL = True
 
-# Channels to skip in the filtered multicolour montage (0-based indices).
-# For example, [0] skips the first channel (often DAPI).
-MONTAGE_SKIP_CHANNELS = [0]
+# XY block-tiling: split each image into N_BLOCKS tiles before deconvolution.
+# "auto" (default) calculates the minimum block count so each tile stays
+# within XY Z max.  Set to 0 or 1 to disable tiling, or >1 for
+# an explicit block count.
+N_BLOCKS = "auto"
+
+# Benchmark mode: crop image to tile-size limits and skip saving OME-TIFFs.
+BENCHMARK_MODE = False
+
+# Save PSF arrays as TIFF files (enabled by --psf).
+SAVE_PSF = False
+
+# Metadata overrides passed to deconvolve_image() so the cropped benchmark
+# TIFF inherits the original pixel sizes, NA, wavelengths, etc.
+_META_OVERRIDES: dict = {}
 
 
-def demo_metadata():
+def benchmark_metadata():
     """Step 1: Load the image and inspect metadata."""
     print("\n" + "=" * 70)
     print("STEP 1: Load image and extract metadata")
@@ -102,33 +139,44 @@ def demo_metadata():
     return data
 
 
-def demo_psf(metadata):
-    """Step 2: Generate PSFs for each channel."""
+def benchmark_psf(metadata):
+    """Step 2: Generate PSFs for channel 0 using all available generators."""
     print("\n" + "=" * 70)
-    print("STEP 2: Generate PSFs from metadata")
+    print("STEP 2: Generate PSFs from metadata (ch0, all generators)")
     print("=" * 70)
 
-    psfs = []
-    for ch_idx in range(len(metadata["channels"])):
-        psf = generate_psf(metadata, channel_idx=ch_idx)
-        psfs.append(psf)
-        print(f"\nChannel {ch_idx} PSF:")
-        print(f"  Shape: {psf.shape}")
-        print(f"  Sum: {psf.sum():.6f}")
-        print(f"  Max: {psf.max():.6e}")
-        print(f"  Center slice max at: {np.unravel_index(psf[psf.shape[0]//2].argmax(), psf[psf.shape[0]//2].shape)}")
+    import shutil
+    from deconvolve import _DW_BW_EXE
 
-    # Save PSF MIP images (XY and XZ) for visual inspection
-    _save_psf_mips(psfs, metadata)
+    # Collect (label, psf) pairs for ch0
+    labelled_psfs: list[tuple[str, np.ndarray]] = []
 
-    return psfs
+    # 1. psf_generator (vectorial/scalar)
+    psf_gen = generate_psf(metadata, channel_idx=0)
+    labelled_psfs.append(("psf_generator", psf_gen))
+    print(f"\n  psf_generator: shape={psf_gen.shape}, sum={psf_gen.sum():.6f}")
+
+    # 2. deconwolf dw_bw (Born-Wolf)
+    if _DW_BW_EXE:
+        try:
+            psf_dw = generate_psf_deconwolf(metadata, channel_idx=0)
+            labelled_psfs.append(("deconwolf (dw_bw)", psf_dw))
+            print(f"  deconwolf dw_bw: shape={psf_dw.shape}, sum={psf_dw.sum():.6f}")
+        except Exception as exc:
+            print(f"  deconwolf dw_bw: FAILED — {exc}")
+    else:
+        print("  deconwolf dw_bw: not available (skipped)")
+
+    # Save montage images
+    _save_psf_montage(labelled_psfs, metadata)
+
+    return [psf for _, psf in labelled_psfs]
 
 
-def _save_psf_mips(psfs, metadata):
-    """Save XY and XZ maximum-intensity projections of PSFs as colour PNGs."""
+def _save_psf_montage(labelled_psfs, metadata):
+    """Save XY and XZ grayscale montage of all PSFs with algorithm labels."""
     from PIL import Image, ImageDraw, ImageFont
 
-    n_ch = len(psfs)
     scale = 4  # upscale small PSFs for visibility
 
     # Try to load a font
@@ -143,7 +191,8 @@ def _save_psf_mips(psfs, metadata):
 
     for view in ("XY", "XZ"):
         panels = []
-        for ch_idx, psf in enumerate(psfs):
+        labels = []
+        for label, psf in labelled_psfs:
             if psf.ndim == 3:
                 if view == "XY":
                     mip = psf.max(axis=0)  # max over Z → (Y, X)
@@ -159,30 +208,23 @@ def _save_psf_mips(psfs, metadata):
             else:
                 mip = np.zeros_like(mip)
 
-            # Get channel colour
-            ch_meta = metadata["channels"][ch_idx]
-            em = ch_meta.get("emission_wavelength")
-            if em:
-                from deconvolve import _emission_to_rgb
-                rgb = _emission_to_rgb(em)
-            else:
-                rgb = (255, 255, 255)
-
-            # Build colour image
-            h, w = mip.shape
-            img_arr = np.zeros((h, w, 3), dtype=np.uint8)
-            for c in range(3):
-                img_arr[:, :, c] = np.clip(mip * rgb[c], 0, 255).astype(np.uint8)
-
             # Apply gamma for better visibility of weak lobes
-            img_arr = np.clip(np.power(img_arr / 255.0, 0.4) * 255, 0, 255).astype(np.uint8)
+            mip = np.power(mip, 0.4)
+
+            # Convert to grayscale uint8
+            grey = np.clip(mip * 255, 0, 255).astype(np.uint8)
 
             # Upscale
-            img = Image.fromarray(img_arr, mode="RGB")
+            h, w = grey.shape
+            img = Image.fromarray(grey, mode="L")
             img = img.resize((w * scale, h * scale), Image.NEAREST)
             panels.append(img)
+            labels.append(label)
 
-        # Montage: all channels side by side with labels
+        if not panels:
+            continue
+
+        # Montage: all generators side by side with labels
         label_height = 24
         padding = 2
         max_w = max(p.size[0] for p in panels)
@@ -190,7 +232,8 @@ def _save_psf_mips(psfs, metadata):
         cell_w = max_w + 2 * padding
         cell_h = max_h + label_height + 2 * padding
 
-        montage = Image.new("RGB", (n_ch * cell_w, cell_h), color=(0, 0, 0))
+        n = len(panels)
+        montage = Image.new("L", (n * cell_w, cell_h), color=0)
         draw = ImageDraw.Draw(montage)
 
         for i, panel in enumerate(panels):
@@ -198,21 +241,19 @@ def _save_psf_mips(psfs, metadata):
             y0 = padding + (max_h - panel.size[1]) // 2
             montage.paste(panel, (x0, y0))
 
-            ch_meta = metadata["channels"][i]
-            em = ch_meta.get("emission_wavelength", 0)
-            label = f"Ch{i} ({em:.0f} nm)"
-            bbox = draw.textbbox((0, 0), label, font=font)
+            bbox = draw.textbbox((0, 0), labels[i], font=font)
             tw = bbox[2] - bbox[0]
             tx = i * cell_w + padding + (max_w - tw) // 2
             ty = padding + max_h + 2
-            draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
+            draw.text((tx, ty), labels[i], fill=255, font=font)
 
         out = OUTPUT_DIR / f"psf_{PREFIX}_{view}.png"
-        montage.save(str(out))
-        print(f"  Saved PSF {view} MIP: {out}  ({montage.size[0]}x{montage.size[1]})")
+        if not BENCHMARK_MODE or SAVE_PSF:
+            montage.save(str(out))
+            print(f"  Saved PSF {view} montage: {out}  ({montage.size[0]}x{montage.size[1]})")
 
 
-def demo_deconvolution_2d(data):
+def benchmark_deconvolution_2d(data):
     """Step 3: Quick 2D Richardson-Lucy deconvolution of a single Z-slice."""
     print("\n" + "=" * 70)
     print("STEP 3: 2D Richardson-Lucy deconvolution of single Z-slice")
@@ -232,23 +273,24 @@ def demo_deconvolution_2d(data):
     psf_2d = generate_psf(meta_2d, channel_idx=0)
     print(f"2D PSF shape: {psf_2d.shape}")
 
-    info = METHODS["richardson_lucy"]
-    print(f"\n  richardson_lucy: {info['description']}")
+    info = METHODS["sdeconv_rl"]
+    print(f"\n  sdeconv_rl: {info['description']}")
     print(f"  Memory factor: ~{info['memory_factor']}x image size")
 
     t0 = time.perf_counter()
-    result = deconvolve(img_2d, psf_2d, method="richardson_lucy", niter=30)
+    result = deconvolve(img_2d, psf_2d, method="sdeconv_rl", niter=30)
     elapsed = time.perf_counter() - t0
     print(f"  Result: shape={result.shape}, min={result.min():.2f}, max={result.max():.2f}")
     print(f"  Elapsed time: {elapsed:.1f} s")
 
-    import tifffile
-    out_path = OUTPUT_DIR / f"{PREFIX}_slice_z{mid_z}_ch0_richardson_lucy.tiff"
-    tifffile.imwrite(str(out_path), result)
-    print(f"  Saved to: {out_path}")
+    if not BENCHMARK_MODE:
+        import tifffile
+        out_path = OUTPUT_DIR / f"{PREFIX}_slice_z{mid_z}_ch0_richardson_lucy.tiff"
+        tifffile.imwrite(str(out_path), result)
+        print(f"  Saved to: {out_path}")
 
 
-def demo_full_3d():
+def benchmark_full_3d():
     """Step 4: Full 3D RL — compare all backends × three iteration counts."""
     print("\n" + "=" * 70)
     print("STEP 4: Full 3D deconvolution — multiple backends × iteration counts")
@@ -271,142 +313,177 @@ def demo_full_3d():
     print(f"  DeconvolutionLab2: {'available' if dl2_available else 'NOT found (skipping)'}")
 
     # --- (a) sdeconv on CPU ---
-    if not RUN_SDECONV_CPU:
+    if not RUN_SDECONV_CPU_RL:
         print("\n--- (a) sdeconv CPU — SKIPPED (disabled) ---")
-    for nit in NITERS if RUN_SDECONV_CPU else []:
+    for nit in NITERS if RUN_SDECONV_CPU_RL else []:
         print(f"\n--- (a) sdeconv Richardson-Lucy on CPU, {nit} iterations ---")
         t0 = time.perf_counter()
         result_cpu = deconvolve_image(
-            image_path, method="richardson_lucy", niter=nit, device="cpu",
+            image_path, method="sdeconv_rl", niter=nit, device="cpu",
+            n_blocks=N_BLOCKS, **_META_OVERRIDES,
         )
         elapsed = time.perf_counter() - t0
         for i, ch in enumerate(result_cpu["channels"]):
             print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
         print(f"  Elapsed time: {elapsed:.1f} s")
         out = OUTPUT_DIR / f"{PREFIX}_RL_sdeconv_cpu_{nit}i.ome.tiff"
-        save_result(result_cpu, out)
+        save_result(result_cpu, out, mip_only=BENCHMARK_MODE)
         TIMINGS[out.stem] = elapsed
         print(f"  Saved to: {out}")
 
     # --- (b) sdeconv on CUDA ---
-    if cuda_available and RUN_SDECONV_CUDA:
+    if cuda_available and RUN_SDECONV_CUDA_RL:
         for nit in NITERS:
             print(f"\n--- (b) sdeconv Richardson-Lucy on CUDA, {nit} iterations ---")
             t0 = time.perf_counter()
             result_gpu = deconvolve_image(
-                image_path, method="richardson_lucy", niter=nit, device="cuda",
+                image_path, method="sdeconv_rl", niter=nit, device="cuda",
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
             )
             elapsed = time.perf_counter() - t0
             for i, ch in enumerate(result_gpu["channels"]):
                 print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
             print(f"  Elapsed time: {elapsed:.1f} s")
             out = OUTPUT_DIR / f"{PREFIX}_RL_sdeconv_cuda_{nit}i.ome.tiff"
-            save_result(result_gpu, out)
+            save_result(result_gpu, out, mip_only=BENCHMARK_MODE)
             TIMINGS[out.stem] = elapsed
             print(f"  Saved to: {out}")
+        del result_gpu
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
         print("\n--- (b) sdeconv CUDA — SKIPPED (no GPU or disabled) ---")
 
-    # --- (c) pycudadecon ---
-    if cuda_available and RUN_PYCUDADECON:
+    # --- (c) sdeconv plane-by-plane ---
+    if RUN_SDECONV_PLANE_BY_PLANE_RL:
         for nit in NITERS:
-            print(f"\n--- (c) pycudadecon Richardson-Lucy (CUDA), {nit} iterations ---")
+            print(f"\n--- (c) sdeconv plane-by-plane, {nit} iterations ---")
+            t0 = time.perf_counter()
+            result_pbp = deconvolve_image(
+                image_path,
+                method="sdeconv_rl",
+                niter=nit,
+                plane_by_plane=True,
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
+            )
+            elapsed = time.perf_counter() - t0
+            for i, ch in enumerate(result_pbp["channels"]):
+                print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
+            print(f"  Elapsed time: {elapsed:.1f} s")
+            out_path = OUTPUT_DIR / f"{PREFIX}_plane_by_plane_RL_{nit}i.ome.tiff"
+            save_result(result_pbp, out_path, mip_only=BENCHMARK_MODE)
+            TIMINGS[out_path.stem] = elapsed
+            print(f"  Saved to: {out_path}")
+    else:
+        print("\n--- (c) sdeconv plane-by-plane — SKIPPED (disabled) ---")
+
+    # --- (d) pycudadecon ---
+    if cuda_available and RUN_PYCUDADECON_RL:
+        for nit in NITERS:
+            print(f"\n--- (d) pycudadecon Richardson-Lucy (CUDA), {nit} iterations ---")
             try:
                 t0 = time.perf_counter()
                 result_pcd = deconvolve_image(
-                    image_path, method="richardson_lucy_cuda", niter=nit,
+                    image_path, method="pycudadecon_rl_cuda", niter=nit,
+                    n_blocks=N_BLOCKS, **_META_OVERRIDES,
                 )
                 elapsed = time.perf_counter() - t0
                 for i, ch in enumerate(result_pcd["channels"]):
                     print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
                 print(f"  Elapsed time: {elapsed:.1f} s")
                 out = OUTPUT_DIR / f"{PREFIX}_RL_pycudadecon_{nit}i.ome.tiff"
-                save_result(result_pcd, out)
+                save_result(result_pcd, out, mip_only=BENCHMARK_MODE)
                 TIMINGS[out.stem] = elapsed
                 print(f"  Saved to: {out}")
             except ImportError as exc:
                 print(f"  SKIPPED — {exc}")
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
-        print("\n--- (c) pycudadecon — SKIPPED (no GPU or disabled) ---")
+        print("\n--- (d) pycudadecon — SKIPPED (no GPU or disabled) ---")
 
-    # --- (d) deconwolf RL ---
+    # --- (e) deconwolf RL ---
     if dw_available and RUN_DECONWOLF_RL:
         for nit in NITERS:
-            print(f"\n--- (d) deconwolf RL, {nit} iterations ---")
+            print(f"\n--- (e) deconwolf RL, {nit} iterations ---")
             t0 = time.perf_counter()
             result_dw = deconvolve_image(
                 image_path, method="deconwolf_rl", niter=nit,
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
             )
             elapsed = time.perf_counter() - t0
             for i, ch in enumerate(result_dw["channels"]):
                 print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
             print(f"  Elapsed time: {elapsed:.1f} s")
             out = OUTPUT_DIR / f"{PREFIX}_RL_deconwolf_{nit}i.ome.tiff"
-            save_result(result_dw, out)
+            save_result(result_dw, out, mip_only=BENCHMARK_MODE)
             TIMINGS[out.stem] = elapsed
             print(f"  Saved to: {out}")
     else:
-        print("\n--- (d) deconwolf RL — SKIPPED (dw not found or disabled) ---")
+        print("\n--- (e) deconwolf RL — SKIPPED (dw not found or disabled) ---")
 
-    # --- (e) deconwolf SHB ---
+    # --- (f) deconwolf SHB ---
     if dw_available and RUN_DECONWOLF_SHB:
         for nit in NITERS:
-            print(f"\n--- (e) deconwolf SHB, {nit} iterations ---")
+            print(f"\n--- (f) deconwolf SHB, {nit} iterations ---")
             t0 = time.perf_counter()
             result_dw_shb = deconvolve_image(
                 image_path, method="deconwolf_shb", niter=nit,
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
             )
             elapsed = time.perf_counter() - t0
             for i, ch in enumerate(result_dw_shb["channels"]):
                 print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
             print(f"  Elapsed time: {elapsed:.1f} s")
             out = OUTPUT_DIR / f"{PREFIX}_SHB_deconwolf_{nit}i.ome.tiff"
-            save_result(result_dw_shb, out)
+            save_result(result_dw_shb, out, mip_only=BENCHMARK_MODE)
             TIMINGS[out.stem] = elapsed
             print(f"  Saved to: {out}")
     else:
-        print("\n--- (e) deconwolf SHB — SKIPPED (dw not found or disabled) ---")
+        print("\n--- (f) deconwolf SHB — SKIPPED (dw not found or disabled) ---")
 
-    # --- (f) DeconvolutionLab2 RL ---
+    # --- (g) DeconvolutionLab2 RL ---
     if dl2_available and RUN_DECONVLAB2_RL:
         for nit in NITERS:
-            print(f"\n--- (f) DeconvolutionLab2 RL, {nit} iterations ---")
+            print(f"\n--- (g) DeconvolutionLab2 RL, {nit} iterations ---")
             t0 = time.perf_counter()
             result_dl2 = deconvolve_image(
                 image_path, method="deconvlab2_rl", niter=nit,
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
             )
             elapsed = time.perf_counter() - t0
             for i, ch in enumerate(result_dl2["channels"]):
                 print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
             print(f"  Elapsed time: {elapsed:.1f} s")
             out = OUTPUT_DIR / f"{PREFIX}_RL_deconvlab2_{nit}i.ome.tiff"
-            save_result(result_dl2, out)
+            save_result(result_dl2, out, mip_only=BENCHMARK_MODE)
             TIMINGS[out.stem] = elapsed
             print(f"  Saved to: {out}")
     else:
-        print("\n--- (f) DeconvolutionLab2 RL — SKIPPED (JAR/java not found or disabled) ---")
+        print("\n--- (g) DeconvolutionLab2 RL — SKIPPED (JAR/java not found or disabled) ---")
 
-    # --- (g) DeconvolutionLab2 RLTV ---
+    # --- (h) DeconvolutionLab2 RLTV ---
     if dl2_available and RUN_DECONVLAB2_RLTV:
         for nit in NITERS:
-            print(f"\n--- (g) DeconvolutionLab2 RLTV, {nit} iterations ---")
+            print(f"\n--- (h) DeconvolutionLab2 RLTV, {nit} iterations ---")
             t0 = time.perf_counter()
             result_dl2tv = deconvolve_image(
                 image_path, method="deconvlab2_rltv", niter=nit, tv_lambda=1e-4,
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
             )
             elapsed = time.perf_counter() - t0
             for i, ch in enumerate(result_dl2tv["channels"]):
                 print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
             print(f"  Elapsed time: {elapsed:.1f} s")
             out = OUTPUT_DIR / f"{PREFIX}_RLTV_deconvlab2_{nit}i.ome.tiff"
-            save_result(result_dl2tv, out)
+            save_result(result_dl2tv, out, mip_only=BENCHMARK_MODE)
             TIMINGS[out.stem] = elapsed
             print(f"  Saved to: {out}")
     else:
-        print("\n--- (g) DeconvolutionLab2 RLTV — SKIPPED (JAR/java not found or disabled) ---")
+        print("\n--- (h) DeconvolutionLab2 RLTV — SKIPPED (JAR/java not found or disabled) ---")
 
-    # --- (h) RedLionfish RL ---
-    if RUN_REDLIONFISH:
+    # --- (i) RedLionfish RL ---
+    if RUN_REDLIONFISH_RL:
         try:
             import RedLionfishDeconv
             rlf_available = True
@@ -414,45 +491,49 @@ def demo_full_3d():
             rlf_available = False
         if rlf_available:
             for nit in NITERS:
-                print(f"\n--- (h) RedLionfish RL, {nit} iterations ---")
+                print(f"\n--- (i) RedLionfish RL, {nit} iterations ---")
                 t0 = time.perf_counter()
                 result_rlf = deconvolve_image(
                     image_path, method="redlionfish_rl", niter=nit,
+                    n_blocks=N_BLOCKS, **_META_OVERRIDES,
                 )
                 elapsed = time.perf_counter() - t0
                 for i, ch in enumerate(result_rlf["channels"]):
                     print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
                 print(f"  Elapsed time: {elapsed:.1f} s")
                 out = OUTPUT_DIR / f"{PREFIX}_RL_redlionfish_{nit}i.ome.tiff"
-                save_result(result_rlf, out)
+                save_result(result_rlf, out, mip_only=BENCHMARK_MODE)
                 TIMINGS[out.stem] = elapsed
                 print(f"  Saved to: {out}")
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
-            print("\n--- (h) RedLionfish RL — SKIPPED (not installed) ---")
+            print("\n--- (i) RedLionfish RL — SKIPPED (not installed) ---")
     else:
-        print("\n--- (h) RedLionfish RL — SKIPPED (disabled) ---")
+        print("\n--- (i) RedLionfish RL — SKIPPED (disabled) ---")
 
-    # --- (i) scikit-image RL ---
+    # --- (j) scikit-image RL ---
     if RUN_SKIMAGE_RL:
         for nit in NITERS:
-            print(f"\n--- (i) scikit-image RL (CPU), {nit} iterations ---")
+            print(f"\n--- (j) scikit-image RL (CPU), {nit} iterations ---")
             t0 = time.perf_counter()
             result_ski = deconvolve_image(
                 image_path, method="skimage_rl", niter=nit,
+                n_blocks=N_BLOCKS, **_META_OVERRIDES,
             )
             elapsed = time.perf_counter() - t0
             for i, ch in enumerate(result_ski["channels"]):
                 print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
             print(f"  Elapsed time: {elapsed:.1f} s")
             out = OUTPUT_DIR / f"{PREFIX}_RL_skimage_{nit}i.ome.tiff"
-            save_result(result_ski, out)
+            save_result(result_ski, out, mip_only=BENCHMARK_MODE)
             TIMINGS[out.stem] = elapsed
             print(f"  Saved to: {out}")
     else:
-        print("\n--- (i) scikit-image RL — SKIPPED (disabled) ---")
+        print("\n--- (j) scikit-image RL — SKIPPED (disabled) ---")
 
-    # --- (j) cuCIM RL ---
-    if cuda_available and RUN_CUCIM_RL:
+    # --- (k) cuCIM RL ---
+    if cuda_available and RUN_SKIIMAGE_CUCIM_RL:
         try:
             import cupy  # noqa: F401
             import cucim  # noqa: F401
@@ -461,63 +542,39 @@ def demo_full_3d():
             cucim_available = False
         if cucim_available:
             for nit in NITERS:
-                print(f"\n--- (j) cuCIM RL (CUDA), {nit} iterations ---")
+                print(f"\n--- (k) cuCIM RL (CUDA), {nit} iterations ---")
                 t0 = time.perf_counter()
                 result_cucim = deconvolve_image(
-                    image_path, method="cucim_rl", niter=nit,
+                    image_path, method="skimage_cucim_rl", niter=nit,
+                    n_blocks=N_BLOCKS, **_META_OVERRIDES,
                 )
                 elapsed = time.perf_counter() - t0
                 for i, ch in enumerate(result_cucim["channels"]):
                     print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
                 print(f"  Elapsed time: {elapsed:.1f} s")
                 out = OUTPUT_DIR / f"{PREFIX}_RL_cucim_{nit}i.ome.tiff"
-                save_result(result_cucim, out)
+                save_result(result_cucim, out, mip_only=BENCHMARK_MODE)
                 TIMINGS[out.stem] = elapsed
                 print(f"  Saved to: {out}")
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
-            print("\n--- (j) cuCIM RL — SKIPPED (cupy/cucim not installed) ---")
+            print("\n--- (k) cuCIM RL — SKIPPED (cupy/cucim not installed) ---")
     else:
-        print("\n--- (j) cuCIM RL — SKIPPED (no GPU or disabled) ---")
+        print("\n--- (k) cuCIM RL — SKIPPED (no GPU or disabled) ---")
 
 
-def demo_plane_by_plane():
-    """Step 5: Plane-by-plane 3D RL deconvolution (sdeconv, 30/60/90 iter)."""
+def benchmark_huygens_mip():
+    """Step 5: Generate MIP from Huygens (SVI) deconvolution for comparison."""
     print("\n" + "=" * 70)
-    print("STEP 5: Plane-by-plane Richardson-Lucy (memory-efficient, 30/60/90 iter)")
+    print("STEP 5: MIP from Huygens deconvolution (for comparison)")
     print("=" * 70)
 
-    image_path = DATA_DIR / IMAGE_FILE
-
-    if not RUN_PLANE_BY_PLANE:
-        print("\n--- plane-by-plane — SKIPPED (disabled) ---")
+    huygens_path = ORIGINAL_DATA_DIR / HUYGENS_FILE
+    if not huygens_path.exists():
+        print(f"\n  Huygens file not found: {huygens_path}")
+        print("  Skipping Huygens MIP generation.")
         return
-
-    for nit in NITERS:
-        print(f"\n--- sdeconv plane-by-plane, {nit} iterations ---")
-        t0 = time.perf_counter()
-        result = deconvolve_image(
-            image_path,
-            method="richardson_lucy",
-            niter=nit,
-            plane_by_plane=True,
-        )
-        elapsed = time.perf_counter() - t0
-        for i, ch in enumerate(result["channels"]):
-            print(f"  Channel {i}: shape={ch.shape}, min={ch.min():.2f}, max={ch.max():.2f}")
-        print(f"  Elapsed time: {elapsed:.1f} s")
-        out_path = OUTPUT_DIR / f"{PREFIX}_plane_by_plane_RL_{nit}i.ome.tiff"
-        save_result(result, out_path)
-        TIMINGS[out_path.stem] = elapsed
-        print(f"  Saved to: {out_path}")
-
-
-def demo_huygens_mip():
-    """Step 6: Generate MIP from Huygens (SVI) deconvolution for comparison."""
-    print("\n" + "=" * 70)
-    print("STEP 6: MIP from Huygens deconvolution (for comparison)")
-    print("=" * 70)
-
-    huygens_path = DATA_DIR / HUYGENS_FILE
     data = load_image(huygens_path)
     meta = data["metadata"]
     images = data["images"]
@@ -534,6 +591,15 @@ def demo_huygens_mip():
     mip = np.stack(mip_channels, axis=0)  # (C, Y, X)
     print(f"  MIP shape: {mip.shape}")
 
+    # In benchmark mode, centre-crop the Huygens MIP to match the
+    # benchmark crop dimensions so it fits in the montage.
+    if BENCHMARK_MODE:
+        _, h, w = mip.shape
+        ny, nx = min(h, MAX_TILE_XY), min(w, MAX_TILE_XY)
+        y0, x0 = (h - ny) // 2, (w - nx) // 2
+        mip = mip[:, y0:y0+ny, x0:x0+nx]
+        print(f"  Cropped Huygens MIP to {mip.shape}")
+
     mip_tiff = OUTPUT_DIR / f"mip_Huygens_{PREFIX}.tiff"
     tifffile.imwrite(str(mip_tiff), mip)
     print(f"  Saved MIP TIFF: {mip_tiff}")
@@ -543,18 +609,44 @@ def demo_huygens_mip():
     print(f"  Saved MIP PNG:  {mip_png}")
 
 
-def _timed_label(label, stem):
-    """Append timing info to a label if available."""
+def _timed_label(name, nit, stem):
+    """Algorithm name on line 1, iteration count + timing on line 2."""
     t = TIMINGS.get(stem)
     if t is not None:
-        return f"{label}\n{t:.1f}s"
-    return label
+        return f"{name}\n{nit} iterations in {t:.1f} sec"
+    return f"{name}\n{nit} iterations"
 
 
-def demo_montage():
-    """Step 7: Create a montage of all MIP PNG images with algorithm labels."""
+def _make_metadata_panel(meta, width, height, font):
+    """Create an image panel showing PSF-relevant metadata."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (width, height), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    lines = [
+        f"Microscope: {meta.get('microscope_type', '?')}",
+        f"NA: {meta.get('na', '?')}",
+        f"RI: {meta.get('refractive_index', '?')}",
+        f"Pixel XY: {meta.get('pixel_size_x', '?')} \u00b5m",
+        f"Pixel Z:  {meta.get('pixel_size_z', '?')} \u00b5m",
+        f"Size: {meta.get('size_x', '?')}\u00d7{meta.get('size_y', '?')}\u00d7{meta.get('size_z', '?')}",
+        "",
+    ]
+    for i, ch in enumerate(meta.get("channels", [])):
+        em = ch.get("emission_wavelength") or "?"
+        ex = ch.get("excitation_wavelength") or "?"
+        lines.append(f"Ch{i}: Ex {ex} / Em {em} nm")
+
+    text = "\n".join(lines)
+    draw.text((8, 8), text, fill=(255, 255, 255), font=font)
+    return img
+
+
+def benchmark_montage():
+    """Step 6: Create a montage of all MIP PNG images with algorithm labels."""
     print("\n" + "=" * 70)
-    print("STEP 7: Create montage of all MIP images")
+    print("STEP 6: Create montage of all MIP images")
     print("=" * 70)
 
     from PIL import Image, ImageDraw, ImageFont
@@ -570,17 +662,17 @@ def demo_montage():
     # Rows by iteration count, all backends
     for nit in NITERS:
         rows.append([
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cpu_{nit}i.ome.png", _timed_label(f"sdeconv CPU {nit}i", f"{PREFIX}_RL_sdeconv_cpu_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cuda_{nit}i.ome.png", _timed_label(f"sdeconv CUDA {nit}i", f"{PREFIX}_RL_sdeconv_cuda_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_pycudadecon_{nit}i.ome.png", _timed_label(f"pycudadecon {nit}i", f"{PREFIX}_RL_pycudadecon_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_plane_by_plane_RL_{nit}i.ome.png", _timed_label(f"PbP sdeconv {nit}i", f"{PREFIX}_plane_by_plane_RL_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_deconwolf_{nit}i.ome.png", _timed_label(f"deconwolf RL {nit}i", f"{PREFIX}_RL_deconwolf_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_SHB_deconwolf_{nit}i.ome.png", _timed_label(f"deconwolf SHB {nit}i", f"{PREFIX}_SHB_deconwolf_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_deconvlab2_{nit}i.ome.png", _timed_label(f"DL2 RL {nit}i", f"{PREFIX}_RL_deconvlab2_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RLTV_deconvlab2_{nit}i.ome.png", _timed_label(f"DL2 RLTV {nit}i", f"{PREFIX}_RLTV_deconvlab2_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_redlionfish_{nit}i.ome.png", _timed_label(f"RedLionfish {nit}i", f"{PREFIX}_RL_redlionfish_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_skimage_{nit}i.ome.png", _timed_label(f"skimage RL {nit}i", f"{PREFIX}_RL_skimage_{nit}i.ome")),
-            (OUTPUT_DIR / f"mip_{PREFIX}_RL_cucim_{nit}i.ome.png", _timed_label(f"cuCIM RL {nit}i", f"{PREFIX}_RL_cucim_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cpu_{nit}i.ome.png", _timed_label("sdeconv_cpu_rl", nit, f"{PREFIX}_RL_sdeconv_cpu_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cuda_{nit}i.ome.png", _timed_label("sdeconv_cuda_rl", nit, f"{PREFIX}_RL_sdeconv_cuda_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_plane_by_plane_RL_{nit}i.ome.png", _timed_label("sdeconv_plane_by_plane_rl", nit, f"{PREFIX}_plane_by_plane_RL_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_pycudadecon_{nit}i.ome.png", _timed_label("pycudadecon_rl", nit, f"{PREFIX}_RL_pycudadecon_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_deconwolf_{nit}i.ome.png", _timed_label("deconwolf_rl", nit, f"{PREFIX}_RL_deconwolf_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_SHB_deconwolf_{nit}i.ome.png", _timed_label("deconwolf_shb", nit, f"{PREFIX}_SHB_deconwolf_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_deconvlab2_{nit}i.ome.png", _timed_label("deconvlab2_rl", nit, f"{PREFIX}_RL_deconvlab2_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RLTV_deconvlab2_{nit}i.ome.png", _timed_label("deconvlab2_rltv", nit, f"{PREFIX}_RLTV_deconvlab2_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_redlionfish_{nit}i.ome.png", _timed_label("redlionfish_rl", nit, f"{PREFIX}_RL_redlionfish_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_skimage_{nit}i.ome.png", _timed_label("skimage_rl", nit, f"{PREFIX}_RL_skimage_{nit}i.ome")),
+            (OUTPUT_DIR / f"mip_{PREFIX}_RL_cucim_{nit}i.ome.png", _timed_label("skiimage_cucim_rl", nit, f"{PREFIX}_RL_cucim_{nit}i.ome")),
         ])
 
     # Filter each row to existing files and load images
@@ -603,10 +695,6 @@ def demo_montage():
 
     print(f"  Found {total} MIP images")
 
-    # Number of columns = max row width
-    n_cols = max(len(row) for row in loaded_rows)
-    n_rows = len(loaded_rows)
-
     # Label bar height (extra space for optional timing line)
     label_height = 60
     padding = 4
@@ -615,13 +703,6 @@ def demo_montage():
     all_imgs = [img for row in loaded_rows for img, _ in row]
     max_w = max(img.size[0] for img in all_imgs)
     max_h = max(img.size[1] for img in all_imgs)
-    cell_w = max_w + 2 * padding
-    cell_h = max_h + label_height + 2 * padding
-
-    montage_w = n_cols * cell_w
-    montage_h = n_rows * cell_h
-    montage = Image.new("RGB", (montage_w, montage_h), color=(0, 0, 0))
-    draw = ImageDraw.Draw(montage)
 
     # Try to load a decent font, fall back to default
     font = None
@@ -632,6 +713,24 @@ def demo_montage():
             font = ImageFont.truetype("DejaVuSans.ttf", 18)
         except OSError:
             font = ImageFont.load_default()
+
+    # Insert PSF metadata panel next to Source in row 0
+    _meta_data = load_image(DATA_DIR / IMAGE_FILE)
+    meta_panel = _make_metadata_panel(_meta_data["metadata"], max_w, max_h, font)
+    if loaded_rows:
+        loaded_rows[0].insert(1, (meta_panel, "PSF Parameters"))
+
+    # Number of columns = max row width (after metadata panel insertion)
+    n_cols = max(len(row) for row in loaded_rows)
+    n_rows = len(loaded_rows)
+
+    cell_w = max_w + 2 * padding
+    cell_h = max_h + label_height + 2 * padding
+
+    montage_w = n_cols * cell_w
+    montage_h = n_rows * cell_h
+    montage = Image.new("RGB", (montage_w, montage_h), color=(0, 0, 0))
+    draw = ImageDraw.Draw(montage)
 
     for row_idx, row_images in enumerate(loaded_rows):
         for col_idx, (img, label) in enumerate(row_images):
@@ -650,134 +749,13 @@ def demo_montage():
             ty = y0 + max_h + padding
             draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
 
-    out_path = OUTPUT_DIR / f"montage_{PREFIX}.png"
+    _clean = PREFIX.replace(".ome", "")
+    out_path = OUTPUT_DIR / f"decon_benchmark_{_clean}.png"
     montage.save(str(out_path))
     print(f"  Saved montage: {out_path}  ({montage_w}x{montage_h})")
 
-    # --- Filtered multicolour montage (skip channels) ---
-    if MONTAGE_SKIP_CHANNELS:
-        _make_filtered_colour_montage(font)
-
     # --- Per-channel montages ---
     _make_per_channel_montages(font)
-
-
-def _make_filtered_colour_montage(font):
-    """Create a multicolour montage skipping the channels listed in MONTAGE_SKIP_CHANNELS.
-
-    Re-composites from MIP TIFF files (C, Y, X) so that individual channels
-    can be excluded — useful to e.g. drop the DAPI channel for clarity.
-    """
-    from PIL import Image, ImageDraw, ImageFont
-    import tifffile
-
-    data = load_image(DATA_DIR / IMAGE_FILE)
-    meta = data["metadata"]
-    n_ch = meta["n_channels"]
-
-    keep = [i for i in range(n_ch) if i not in MONTAGE_SKIP_CHANNELS]
-    if not keep:
-        print("  All channels skipped — nothing to compose.")
-        return
-
-    skipped_str = ",".join(str(c) for c in sorted(MONTAGE_SKIP_CHANNELS))
-    print(f"\n  Creating filtered colour montage (skipping ch {skipped_str})...")
-
-    # Build the same row structure as demo_montage
-    mip_rows = [
-        [
-            ("Source", OUTPUT_DIR / "mip_source.ome.tiff"),
-            ("Huygens", OUTPUT_DIR / f"mip_Huygens_{PREFIX}.tiff"),
-        ],
-    ]
-    for nit in NITERS:
-        mip_rows.append([
-            (_timed_label(f"sdeconv CPU {nit}i", f"{PREFIX}_RL_sdeconv_cpu_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cpu_{nit}i.ome.tiff"),
-            (_timed_label(f"sdeconv CUDA {nit}i", f"{PREFIX}_RL_sdeconv_cuda_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cuda_{nit}i.ome.tiff"),
-            (_timed_label(f"pycudadecon {nit}i", f"{PREFIX}_RL_pycudadecon_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_pycudadecon_{nit}i.ome.tiff"),
-            (_timed_label(f"PbP sdeconv {nit}i", f"{PREFIX}_plane_by_plane_RL_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_plane_by_plane_RL_{nit}i.ome.tiff"),
-            (_timed_label(f"deconwolf RL {nit}i", f"{PREFIX}_RL_deconwolf_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_deconwolf_{nit}i.ome.tiff"),
-            (_timed_label(f"deconwolf SHB {nit}i", f"{PREFIX}_SHB_deconwolf_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_SHB_deconwolf_{nit}i.ome.tiff"),
-            (_timed_label(f"DL2 RL {nit}i", f"{PREFIX}_RL_deconvlab2_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_deconvlab2_{nit}i.ome.tiff"),
-            (_timed_label(f"DL2 RLTV {nit}i", f"{PREFIX}_RLTV_deconvlab2_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RLTV_deconvlab2_{nit}i.ome.tiff"),
-            (_timed_label(f"RedLionfish {nit}i", f"{PREFIX}_RL_redlionfish_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_redlionfish_{nit}i.ome.tiff"),
-            (_timed_label(f"skimage RL {nit}i", f"{PREFIX}_RL_skimage_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_skimage_{nit}i.ome.tiff"),
-            (_timed_label(f"cuCIM RL {nit}i", f"{PREFIX}_RL_cucim_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_cucim_{nit}i.ome.tiff"),
-        ])
-
-    # Load existing TIFF MIPs and composite only the kept channels
-    loaded_rows = []
-    total = 0
-    for row_entries in mip_rows:
-        row_images = []
-        for label, path in row_entries:
-            if not path.exists():
-                continue
-            arr = tifffile.imread(str(path))
-            if arr.ndim == 2:
-                arr = arr[np.newaxis]
-            c, h, w = arr.shape
-            # Additive false-colour composite of kept channels
-            canvas = np.zeros((h, w, 3), dtype=np.float64)
-            for ch_idx in keep:
-                if ch_idx >= c:
-                    continue
-                ch_img = arr[ch_idx].astype(np.float64)
-                lo, hi = ch_img.min(), ch_img.max()
-                if hi > lo:
-                    ch_img = (ch_img - lo) / (hi - lo)
-                else:
-                    ch_img = np.zeros_like(ch_img)
-                rgb = _channel_color(meta, ch_idx)
-                for ci in range(3):
-                    canvas[:, :, ci] += ch_img * (rgb[ci] / 255.0)
-            canvas = np.clip(canvas, 0, 1)
-            canvas = (canvas * 255).astype(np.uint8)
-            img = Image.fromarray(canvas, mode="RGB")
-            row_images.append((img, label))
-            total += 1
-        if row_images:
-            loaded_rows.append(row_images)
-
-    if total == 0:
-        print("  No MIP TIFF files found — skipping filtered montage.")
-        return
-
-    # Layout — same logic as the main montage
-    n_cols = max(len(row) for row in loaded_rows)
-    n_rows = len(loaded_rows)
-    label_height = 60
-    padding = 4
-
-    all_imgs = [img for row in loaded_rows for img, _ in row]
-    max_w = max(img.size[0] for img in all_imgs)
-    max_h = max(img.size[1] for img in all_imgs)
-    cell_w = max_w + 2 * padding
-    cell_h = max_h + label_height + 2 * padding
-
-    montage_w = n_cols * cell_w
-    montage_h = n_rows * cell_h
-    montage = Image.new("RGB", (montage_w, montage_h), color=(0, 0, 0))
-    draw = ImageDraw.Draw(montage)
-
-    for row_idx, row_images in enumerate(loaded_rows):
-        for col_idx, (img, label) in enumerate(row_images):
-            x0 = col_idx * cell_w + padding
-            y0 = row_idx * cell_h + padding
-            x_off = (max_w - img.size[0]) // 2
-            y_off = (max_h - img.size[1]) // 2
-            montage.paste(img, (x0 + x_off, y0 + y_off))
-
-            bbox = draw.textbbox((0, 0), label, font=font)
-            tw = bbox[2] - bbox[0]
-            tx = x0 + (max_w - tw) // 2
-            ty = y0 + max_h + padding
-            draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
-
-    kept_str = "+".join(str(c) for c in keep)
-    out_path = OUTPUT_DIR / f"montage_{PREFIX}_ch{kept_str}.png"
-    montage.save(str(out_path))
-    print(f"  Saved filtered montage: {out_path}  ({montage_w}x{montage_h})")
 
 
 def _make_per_channel_montages(font):
@@ -800,17 +778,17 @@ def _make_per_channel_montages(font):
     ]
     for nit in NITERS:
         mip_rows.append([
-            (_timed_label(f"sdeconv CPU {nit}i", f"{PREFIX}_RL_sdeconv_cpu_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cpu_{nit}i.ome.tiff"),
-            (_timed_label(f"sdeconv CUDA {nit}i", f"{PREFIX}_RL_sdeconv_cuda_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cuda_{nit}i.ome.tiff"),
-            (_timed_label(f"pycudadecon {nit}i", f"{PREFIX}_RL_pycudadecon_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_pycudadecon_{nit}i.ome.tiff"),
-            (_timed_label(f"PbP sdeconv {nit}i", f"{PREFIX}_plane_by_plane_RL_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_plane_by_plane_RL_{nit}i.ome.tiff"),
-            (_timed_label(f"deconwolf RL {nit}i", f"{PREFIX}_RL_deconwolf_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_deconwolf_{nit}i.ome.tiff"),
-            (_timed_label(f"deconwolf SHB {nit}i", f"{PREFIX}_SHB_deconwolf_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_SHB_deconwolf_{nit}i.ome.tiff"),
-            (_timed_label(f"DL2 RL {nit}i", f"{PREFIX}_RL_deconvlab2_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_deconvlab2_{nit}i.ome.tiff"),
-            (_timed_label(f"DL2 RLTV {nit}i", f"{PREFIX}_RLTV_deconvlab2_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RLTV_deconvlab2_{nit}i.ome.tiff"),
-            (_timed_label(f"RedLionfish {nit}i", f"{PREFIX}_RL_redlionfish_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_redlionfish_{nit}i.ome.tiff"),
-            (_timed_label(f"skimage RL {nit}i", f"{PREFIX}_RL_skimage_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_skimage_{nit}i.ome.tiff"),
-            (_timed_label(f"cuCIM RL {nit}i", f"{PREFIX}_RL_cucim_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_cucim_{nit}i.ome.tiff"),
+            (_timed_label("sdeconv_cpu_rl", nit, f"{PREFIX}_RL_sdeconv_cpu_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cpu_{nit}i.ome.tiff"),
+            (_timed_label("sdeconv_cuda_rl", nit, f"{PREFIX}_RL_sdeconv_cuda_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_sdeconv_cuda_{nit}i.ome.tiff"),
+            (_timed_label("sdeconv_plane_by_plane_rl", nit, f"{PREFIX}_plane_by_plane_RL_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_plane_by_plane_RL_{nit}i.ome.tiff"),
+            (_timed_label("pycudadecon_rl", nit, f"{PREFIX}_RL_pycudadecon_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_pycudadecon_{nit}i.ome.tiff"),
+            (_timed_label("deconwolf_rl", nit, f"{PREFIX}_RL_deconwolf_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_deconwolf_{nit}i.ome.tiff"),
+            (_timed_label("deconwolf_shb", nit, f"{PREFIX}_SHB_deconwolf_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_SHB_deconwolf_{nit}i.ome.tiff"),
+            (_timed_label("deconvlab2_rl", nit, f"{PREFIX}_RL_deconvlab2_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_deconvlab2_{nit}i.ome.tiff"),
+            (_timed_label("deconvlab2_rltv", nit, f"{PREFIX}_RLTV_deconvlab2_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RLTV_deconvlab2_{nit}i.ome.tiff"),
+            (_timed_label("redlionfish_rl", nit, f"{PREFIX}_RL_redlionfish_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_redlionfish_{nit}i.ome.tiff"),
+            (_timed_label("skimage_rl", nit, f"{PREFIX}_RL_skimage_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_skimage_{nit}i.ome.tiff"),
+            (_timed_label("skiimage_cucim_rl", nit, f"{PREFIX}_RL_cucim_{nit}i.ome"), OUTPUT_DIR / f"mip_{PREFIX}_RL_cucim_{nit}i.ome.tiff"),
         ])
 
     # Filter to existing files and load per row
@@ -847,13 +825,9 @@ def _make_per_channel_montages(font):
     label_height = 60
     padding = 4
 
-    # Number of columns = max row width from loaded_rows
-    n_cols = max(len(row) for row in loaded_rows)
-    n_grid_rows = len(loaded_rows)
-
     for ch_idx in range(n_ch):
         ch_meta = meta["channels"][ch_idx]
-        em = ch_meta.get("emission_wavelength", 520)
+        em = ch_meta.get("emission_wavelength") or 0
 
         panel_rows = []
         for row_data in loaded_rows:
@@ -874,7 +848,7 @@ def _make_per_channel_montages(font):
 
                 # Draw channel label on top-left of the image
                 img_draw = ImageDraw.Draw(img)
-                ch_label = f"Ch{ch_idx} ({em:.0f} nm)"
+                ch_label = f"Ch{ch_idx}"
                 img_draw.text((4, 2), ch_label, fill=(255, 255, 255), font=overlay_font)
 
                 row_panels.append((img, label))
@@ -887,6 +861,14 @@ def _make_per_channel_montages(font):
         all_imgs = [img for row in panel_rows for img, _ in row]
         max_w = max(img.size[0] for img in all_imgs)
         max_h = max(img.size[1] for img in all_imgs)
+
+        # Insert PSF metadata panel next to Source in row 0
+        ch_meta_panel = _make_metadata_panel(meta, max_w, max_h, font)
+        panel_rows[0].insert(1, (ch_meta_panel, "PSF Parameters"))
+
+        n_cols = max(len(row) for row in panel_rows)
+        n_grid_rows = len(panel_rows)
+
         cell_w = max_w + 2 * padding
         cell_h = max_h + label_height + 2 * padding
 
@@ -909,36 +891,208 @@ def _make_per_channel_montages(font):
                 ty = y0 + max_h + padding
                 draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
 
-        out = OUTPUT_DIR / f"montage_{PREFIX}_ch{ch_idx}_{em:.0f}nm.png"
+        _clean = PREFIX.replace(".ome", "")
+        out = OUTPUT_DIR / f"decon_benchmark_{_clean}_ch{ch_idx}.png"
         montage.save(str(out))
-        print(f"    Ch{ch_idx} ({em:.0f} nm): {out}  ({montage_w}x{montage_h})")
+        print(f"    Ch{ch_idx}: {out}  ({montage_w}x{montage_h})")
 
 
 if __name__ == "__main__":
-    print("Microscopy Deconvolution Demo — U2OS Widefield (Richardson-Lucy only)")
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Microscopy Deconvolution Benchmark",
+    )
+    parser.add_argument(
+        "image", nargs="?", default=IMAGE_FILE,
+        help="Image filename in data/ folder (default: %(default)s)",
+    )
+    parser.add_argument(
+        "blocks", nargs="?", default=None,
+        help=(
+            "Block tiling mode. 'auto' (default): calculate minimum blocks "
+            "so each tile \u2264 1024 px per side. 0 or 1: no tiling. "
+            ">1: explicit block count."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help=(
+            "Benchmark mode: centre-crop the image to MAX_TILE_XY × MAX_TILE_Z "
+            "(if larger) and only save montage images."
+        ),
+    )
+    parser.add_argument(
+        "--psf", action="store_true",
+        help="Save PSF montage PNG (XY and XZ MIP) in the output folder.",
+    )
+    args = parser.parse_args()
+
+    IMAGE_FILE = args.image
+    if args.blocks is not None:
+        _blk = args.blocks.strip().lower()
+        if _blk == "auto":
+            N_BLOCKS = "auto"
+        else:
+            N_BLOCKS = max(int(_blk), 0)  # 0 = no tiling
+    # If the user supplied a path (absolute or relative with directories),
+    # set DATA_DIR to that folder so every DATA_DIR / IMAGE_FILE reference
+    # resolves correctly for both the image and the Huygens _decon file.
+    _image_path = Path(IMAGE_FILE).resolve()
+    if _image_path.parent != Path(".").resolve():
+        DATA_DIR = _image_path.parent
+        IMAGE_FILE = _image_path.name
+    ORIGINAL_DATA_DIR = DATA_DIR
+    HUYGENS_FILE, PREFIX = _derive_names(IMAGE_FILE)
+    if args.benchmark:
+        BENCHMARK_MODE = True
+    if args.psf:
+        SAVE_PSF = True
+
+    print(f"Microscopy Deconvolution Benchmark — {IMAGE_FILE}")
+    print(f"  Data folder  : {DATA_DIR}")
+    print(f"  Huygens file : {HUYGENS_FILE}")
+    print(f"  Output prefix: {PREFIX}")
+    print(f"  Blocks       : {N_BLOCKS}")
+    if BENCHMARK_MODE:
+        print(f"  Benchmark    : ON  (crop to {MAX_TILE_XY}×{MAX_TILE_XY}×{MAX_TILE_Z}, montage only)")
+    if SAVE_PSF:
+        print(f"  Save PSFs    : ON")
     print("Available methods:", list(METHODS.keys()))
 
     # Step 1: Load and inspect
-    data = demo_metadata()
+    data = benchmark_metadata()
+
+    # Benchmark mode: centre-crop all channels to tile-size limits
+    if BENCHMARK_MODE:
+        import tifffile as _tiff
+        images = data["images"]
+        cropped = []
+        for img in images:
+            if img.ndim == 3:
+                Z, H, W = img.shape
+                nz = min(Z, MAX_TILE_Z)
+                ny = min(H, MAX_TILE_XY)
+                nx = min(W, MAX_TILE_XY)
+                z0 = (Z - nz) // 2
+                y0 = (H - ny) // 2
+                x0 = (W - nx) // 2
+                img = img[z0:z0+nz, y0:y0+ny, x0:x0+nx]
+            elif img.ndim == 2:
+                H, W = img.shape
+                ny = min(H, MAX_TILE_XY)
+                nx = min(W, MAX_TILE_XY)
+                y0 = (H - ny) // 2
+                x0 = (W - nx) // 2
+                img = img[y0:y0+ny, x0:x0+nx]
+            cropped.append(img)
+        data["images"] = cropped
+        print(f"  Benchmark crop: {images[0].shape} -> {cropped[0].shape}")
+
+        # Write cropped channels as OME-TIFF with full metadata so that
+        # load_image() on the cropped file returns correct pixel sizes,
+        # NA, emission wavelengths, etc.
+        meta = data["metadata"]
+        stack = np.stack(cropped, axis=0)  # (C, Z, Y, X) or (C, Y, X)
+        cropped_path = OUTPUT_DIR / f"_benchmark_crop_{IMAGE_FILE}"
+        axes = "CZYX" if cropped[0].ndim == 3 else "CYX"
+        px_x = meta.get("pixel_size_x")
+        px_y = meta.get("pixel_size_y")
+        px_z = meta.get("pixel_size_z")
+        resolution = (1.0 / px_x, 1.0 / px_y) if px_x and px_y else None
+        _tiff.imwrite(
+            str(cropped_path), stack,
+            ome=True,
+            photometric="minisblack",
+            resolution=resolution,
+            resolutionunit=1,
+            metadata={
+                "axes": axes,
+                "PhysicalSizeX": px_x,
+                "PhysicalSizeY": px_y,
+                "PhysicalSizeZ": px_z,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeYUnit": "µm",
+                "PhysicalSizeZUnit": "µm",
+                "Channel": {
+                    "Name": [
+                        ch.get("name", f"Ch{i}")
+                        for i, ch in enumerate(meta.get("channels", []))
+                    ],
+                    "EmissionWavelength": [
+                        ch.get("emission_wavelength")
+                        for ch in meta.get("channels", [])
+                    ],
+                    "ExcitationWavelength": [
+                        ch.get("excitation_wavelength")
+                        for ch in meta.get("channels", [])
+                    ],
+                },
+            },
+        )
+
+        # Store original metadata overrides so every deconvolve_image() call
+        # on the cropped file gets the correct pixel sizes, NA, wavelengths.
+        _META_OVERRIDES.update({
+            "na": meta.get("na"),
+            "refractive_index": meta.get("refractive_index"),
+            "pixel_size_xy": meta.get("pixel_size_x"),
+            "pixel_size_z": meta.get("pixel_size_z"),
+            "emission_wavelengths": [
+                ch.get("emission_wavelength")
+                for ch in meta.get("channels", [])
+            ] or None,
+        })
+        # Update metadata sizes for PSF generation
+        if cropped[0].ndim == 3:
+            data["metadata"]["size_z"] = cropped[0].shape[0]
+            data["metadata"]["size_y"] = cropped[0].shape[1]
+            data["metadata"]["size_x"] = cropped[0].shape[2]
+        else:
+            data["metadata"]["size_y"] = cropped[0].shape[0]
+            data["metadata"]["size_x"] = cropped[0].shape[1]
+        # Redirect globals so all subsequent benchmark steps use cropped file
+        DATA_DIR = OUTPUT_DIR
+        IMAGE_FILE = cropped_path.name
+        print(f"  Cropped image saved: {cropped_path}")
 
     # Step 2: Generate PSFs
-    psfs = demo_psf(data["metadata"])
+    psfs = benchmark_psf(data["metadata"])
 
     # Step 3: Quick 2D RL
-    demo_deconvolution_2d(data)
+    benchmark_deconvolution_2d(data)
 
-    # Step 4: Full 3D RL deconvolution
-    demo_full_3d()
+    # Step 4: Full 3D RL deconvolution (includes plane-by-plane)
+    benchmark_full_3d()
 
-    # Step 5: Memory-efficient plane-by-plane RL
-    demo_plane_by_plane()
+    # Step 5: Huygens MIP for comparison
+    benchmark_huygens_mip()
 
-    # Step 6: Huygens MIP for comparison
-    demo_huygens_mip()
+    # Step 6: Montage of all MIP images
+    benchmark_montage()
 
-    # Step 7: Montage of all MIP images
-    demo_montage()
+    # In benchmark mode, remove individual MIP files (keep only montages)
+    if BENCHMARK_MODE:
+        for pattern in ("mip_*.png", "mip_*.tiff"):
+            for f in OUTPUT_DIR.glob(pattern):
+                f.unlink(missing_ok=True)
+                print(f"  Removed: {f.name}")
+
+    # Clean up deconwolf VkFFT kernel cache and FFTW wisdom files
+    cwd = Path(".")
+    for pattern in ("VkFFT_kernelCache_*.binary", "fftw_wisdom_*.dat"):
+        for f in cwd.glob(pattern):
+            f.unlink(missing_ok=True)
+            print(f"  Removed cache file: {f.name}")
+
+    # Remove temporary benchmark-crop file
+    if BENCHMARK_MODE:
+        crop_file = OUTPUT_DIR / f"_benchmark_crop_{_derive_names(args.image)[1]}.tiff"
+        # Find any _benchmark_crop_* files in output
+        for f in OUTPUT_DIR.glob("_benchmark_crop_*"):
+            f.unlink(missing_ok=True)
+            print(f"  Removed temp crop file: {f.name}")
 
     print("\n" + "=" * 70)
-    print("Demo complete! Check the output/ folder for results.")
+    print("Benchmark complete! Check the output/ folder for results.")
     print("=" * 70)

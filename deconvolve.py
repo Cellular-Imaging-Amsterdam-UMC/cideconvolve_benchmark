@@ -371,13 +371,19 @@ def load_image(
             if i < len(meta["channels"]):
                 meta["channels"][i]["emission_wavelength"] = wl
 
-    # Apply defaults for critical missing values
-    meta.setdefault("na", 1.4)
-    meta.setdefault("refractive_index", 1.515)
-    meta.setdefault("microscope_type", "widefield")
-    meta.setdefault("pixel_size_x", 0.1)
-    meta.setdefault("pixel_size_y", 0.1)
-    meta.setdefault("pixel_size_z", 0.3)
+    # Apply defaults for critical missing values (setdefault won't
+    # replace an existing key whose value is None, so fix those too).
+    _defaults = {
+        "na": 1.4,
+        "refractive_index": 1.515,
+        "microscope_type": "widefield",
+        "pixel_size_x": 0.1,
+        "pixel_size_y": 0.1,
+        "pixel_size_z": 0.3,
+    }
+    for _k, _v in _defaults.items():
+        if meta.get(_k) is None:
+            meta[_k] = _v
     meta["sample_refractive_index"] = sample_refractive_index
     meta["n_channels"] = len(images)
 
@@ -468,7 +474,7 @@ def generate_psf(
 
     # 3D vs 2D
     is_3d = n_z > 1
-    n_defocus = n_z if is_3d else 1
+    n_defocus = max(2 * n_z - 1, 1) if is_3d else 1
     defocus_step = pix_z_nm if is_3d else 0.0
 
     # psf_generator has device-placement bugs when using CUDA (tensors end
@@ -549,24 +555,285 @@ def generate_psf(
 # Available methods and their approximate memory multiplier relative to image
 # size (Consideration 2: memory for large volumes)
 METHODS = {
-    "richardson_lucy": {"memory_factor": 4, "description": "Iterative RL (PyTorch)"},
-    "wiener": {"memory_factor": 3, "description": "Wiener filter with Laplacian regularization"},
-    "spitfire": {"memory_factor": 8, "description": "Sparse Hessian variational deconvolution"},
-    "richardson_lucy_cuda": {"memory_factor": 4, "description": "CUDA-accelerated RL (pycudadecon)"},
+    "sdeconv_rl": {"memory_factor": 4, "description": "Iterative RL (PyTorch)"},
+    "sdeconv_wiener": {"memory_factor": 3, "description": "Wiener filter with Laplacian regularization"},
+    "sdeconv_spitfire": {"memory_factor": 8, "description": "Sparse Hessian variational deconvolution"},
+    "pycudadecon_rl_cuda": {"memory_factor": 4, "description": "CUDA-accelerated RL (pycudadecon)"},
     "deconwolf_rl": {"memory_factor": 4, "description": "deconwolf Richardson-Lucy (CLI)"},
     "deconwolf_shb": {"memory_factor": 4, "description": "deconwolf Scaled Heavy Ball (CLI)"},
     "deconvlab2_rl": {"memory_factor": 4, "description": "DeconvolutionLab2 Richardson-Lucy (CLI)"},
     "deconvlab2_rltv": {"memory_factor": 4, "description": "DeconvolutionLab2 RL-Total Variation (CLI)"},
     "redlionfish_rl": {"memory_factor": 4, "description": "RedLionfish RL (OpenCL GPU + CPU fallback)"},
     "skimage_rl": {"memory_factor": 4, "description": "scikit-image Richardson-Lucy (CPU)"},
-    "cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
+    "skimage_cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
 }
+
+
+# ---------------------------------------------------------------------------
+# XY block-tiling helpers (large image support)
+# ---------------------------------------------------------------------------
+
+# Maximum tile dimensions for the "auto" tiling mode.  When the image
+# exceeds these limits the auto-calculator splits it into the smallest
+# number of blocks that keeps every tile within bounds.
+# OpenCL device limits are [1024, 1024, 64].  We use smaller XY values
+# because the extracted tile includes overlap margins on each side
+# (core + 2*overlap must stay within 1024).
+MAX_TILE_Z = 64
+MAX_TILE_XY = 512
+# Extra pixels extracted around each tile and discarded after
+# deconvolution to eliminate FFT edge artifacts (bright stripes).
+TILE_MARGIN = 16
+
+
+def _auto_n_blocks(
+    shape: tuple[int, ...],
+    max_z: int = MAX_TILE_Z,
+    max_xy: int = MAX_TILE_XY,
+) -> int:
+    """Return the minimum number of XY blocks so each tile fits within limits.
+
+    Only XY is tiled; Z is never split.  If the image already fits
+    within *max_z* and *max_xy* the function returns 1 (no tiling).
+    If Z alone exceeds *max_z* tiling cannot help, so 1 is returned
+    (the backend will have to cope or fail).
+    """
+    if len(shape) < 3:
+        return 1  # 2-D image, no tiling needed
+    Z, H, W = shape[:3]
+    ny = max(1, -(-H // max_xy))  # ceil division
+    nx = max(1, -(-W // max_xy))
+    n_blocks = ny * nx
+    if n_blocks <= 1:
+        return 1
+    return n_blocks
+
+
+def _resolve_n_blocks(
+    n_blocks: Union[int, str],
+    shape: tuple[int, ...],
+) -> int:
+    """Resolve *n_blocks* to a concrete integer.
+
+    Accepted values: ``"auto"`` (compute from image shape), or an int
+    (0 and 1 both mean no tiling, >1 = explicit block count).
+    """
+    if isinstance(n_blocks, str):
+        if n_blocks.lower() == "auto":
+            return _auto_n_blocks(shape)
+        raise ValueError(
+            f"n_blocks must be 'auto' or an integer, got '{n_blocks}'"
+        )
+    return max(int(n_blocks), 1)  # 0 → 1 (no tiling)
+
+
+def _compute_tile_grid(
+    shape_yx: tuple[int, int], n_blocks: int,
+) -> tuple[int, int]:
+    """Return (ny, nx) tile counts that best cover *shape_yx*.
+
+    Tries to keep tiles roughly square by minimising aspect-ratio skew.
+    """
+    if n_blocks <= 1:
+        return (1, 1)
+    best = (1, n_blocks)
+    best_ratio = float("inf")
+    for ny in range(1, n_blocks + 1):
+        if n_blocks % ny != 0:
+            continue
+        nx = n_blocks // ny
+        tile_h = shape_yx[0] / ny
+        tile_w = shape_yx[1] / nx
+        ratio = max(tile_h, tile_w) / max(min(tile_h, tile_w), 1)
+        if ratio < best_ratio:
+            best_ratio = ratio
+            best = (ny, nx)
+    return best
+
+
+def _compute_tile_slices(
+    shape_zyx: tuple[int, int, int],
+    ny: int,
+    nx: int,
+    overlap: int,
+) -> list[dict]:
+    """Return a list of tile descriptors with overlap margins.
+
+    Each descriptor is a dict with:
+        'extract'  – (z, y, x) slices to cut from the source image
+        'insert'   – (z, y, x) slices where the blended core goes in output
+        'core'     – (z, y, x) slices within the *tile* that map to 'insert'
+        'blend_y'  – (top, bottom) overlap widths inside the tile
+        'blend_x'  – (left, right) overlap widths inside the tile
+    """
+    _, H, W = shape_zyx
+    tile_h = H / ny
+    tile_w = W / nx
+    tiles = []
+    for iy in range(ny):
+        y0_core = round(iy * tile_h)
+        y1_core = round((iy + 1) * tile_h)
+        y0_ext = max(y0_core - overlap, 0)
+        y1_ext = min(y1_core + overlap, H)
+        ov_top = y0_core - y0_ext
+        ov_bot = y1_ext - y1_core
+        for ix in range(nx):
+            x0_core = round(ix * tile_w)
+            x1_core = round((ix + 1) * tile_w)
+            x0_ext = max(x0_core - overlap, 0)
+            x1_ext = min(x1_core + overlap, W)
+            ov_left = x0_core - x0_ext
+            ov_right = x1_ext - x1_core
+            tiles.append({
+                "extract": (slice(None), slice(y0_ext, y1_ext), slice(x0_ext, x1_ext)),
+                "insert":  (slice(None), slice(y0_core, y1_core), slice(x0_core, x1_core)),
+                "core":    (slice(None), slice(ov_top, ov_top + y1_core - y0_core),
+                             slice(ov_left, ov_left + x1_core - x0_core)),
+                "blend_y": (ov_top, ov_bot),
+                "blend_x": (ov_left, ov_right),
+            })
+    return tiles
+
+
+def _blend_tile(tile_result: np.ndarray, desc: dict) -> np.ndarray:
+    """Apply linear ramp blending in overlap zones and return core region."""
+    ov_top, ov_bot = desc["blend_y"]
+    ov_left, ov_right = desc["blend_x"]
+    _, core_y, core_x = desc["core"]
+    core_h = core_y.stop - core_y.start
+    core_w = core_x.stop - core_x.start
+
+    # Build 2-D weight map for the full tile (Z is broadcast)
+    tile_h = tile_result.shape[1]
+    tile_w = tile_result.shape[2]
+    weight = np.ones((tile_h, tile_w), dtype=np.float32)
+
+    # Top overlap ramp
+    if ov_top > 0:
+        ramp = np.linspace(0, 1, ov_top + 1, dtype=np.float32)[1:]  # exclude 0
+        weight[:ov_top, :] *= ramp[:, np.newaxis]
+    # Bottom overlap ramp
+    if ov_bot > 0:
+        ramp = np.linspace(1, 0, ov_bot + 1, dtype=np.float32)[:-1]  # exclude 0
+        weight[tile_h - ov_bot:, :] *= ramp[:, np.newaxis]
+    # Left overlap ramp
+    if ov_left > 0:
+        ramp = np.linspace(0, 1, ov_left + 1, dtype=np.float32)[1:]
+        weight[:, :ov_left] *= ramp[np.newaxis, :]
+    # Right overlap ramp
+    if ov_right > 0:
+        ramp = np.linspace(1, 0, ov_right + 1, dtype=np.float32)[:-1]
+        weight[:, tile_w - ov_right:] *= ramp[np.newaxis, :]
+
+    # Apply weight and extract the region that maps back to the output
+    weighted = tile_result * weight[np.newaxis, :, :]
+
+    # The output slot is core-sized; we need the full overlap extent
+    # We return (weighted_patch, weight_patch) for the *extended* region
+    # so the caller can accumulate numerator/denominator.
+    return weighted, weight
+
+
+def _pad_to_shape(
+    arr: np.ndarray, target_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Centre-pad *arr* with zeros so it matches *target_shape*.
+
+    Used when a backend returns a slightly smaller array than the input
+    (e.g. pycudadecon trims to FFT-friendly dimensions).
+    """
+    if arr.shape == target_shape:
+        return arr
+    out = np.zeros(target_shape, dtype=arr.dtype)
+    offsets = tuple((t - a) // 2 for t, a in zip(target_shape, arr.shape))
+    slices = tuple(slice(o, o + min(a, t))
+                   for o, a, t in zip(offsets, arr.shape, target_shape))
+    src_slices = tuple(slice(0, min(a, t))
+                       for a, t in zip(arr.shape, target_shape))
+    out[slices] = arr[src_slices]
+    return out
+
+
+def _deconvolve_tiled(
+    image: np.ndarray,
+    psf: np.ndarray,
+    n_blocks: int,
+    method: str,
+    **kwargs,
+) -> np.ndarray:
+    """Split *image* into XY tiles, deconvolve each, and blend back."""
+    overlap = max(psf.shape[-1], psf.shape[-2]) // 2
+    margin = TILE_MARGIN
+
+    ny, nx = _compute_tile_grid(image.shape[1:], n_blocks)
+    min_tile_yx = min(image.shape[1] / ny, image.shape[2] / nx)
+    if min_tile_yx < max(psf.shape[-2:]):
+        # Tiles too small for meaningful deconvolution — reduce n_blocks
+        logger.warning(
+            "n_blocks=%d produces tiles smaller than PSF; falling back to "
+            "n_blocks=1 (no tiling).", n_blocks,
+        )
+        return deconvolve(image, psf, method=method, n_blocks=1, **kwargs)
+
+    tiles = _compute_tile_slices(image.shape, ny, nx, overlap)
+    logger.info(
+        "Tiled deconvolution: %d blocks (%d×%d grid), overlap=%d, margin=%d px",
+        n_blocks, ny, nx, overlap, margin,
+    )
+
+    Z, H, W = image.shape
+    # Accumulate with weighted blending
+    numerator = np.zeros_like(image, dtype=np.float64)
+    denominator = np.zeros(image.shape, dtype=np.float64)
+
+    for idx, desc in enumerate(tiles):
+        # --- expand extraction by margin to capture edge artifacts ---
+        _, ey, ex = desc["extract"]
+        y0_m = max(ey.start - margin, 0)
+        y1_m = min(ey.stop + margin, H)
+        x0_m = max(ex.start - margin, 0)
+        x1_m = min(ex.stop + margin, W)
+        ext_expanded = (slice(None), slice(y0_m, y1_m), slice(x0_m, x1_m))
+        tile_img = image[ext_expanded].copy()
+
+        logger.info(
+            "  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape,
+        )
+        tile_result = deconvolve(
+            tile_img, psf, method=method, n_blocks=1, **kwargs,
+        )
+
+        # Fix shape if backend returned a different size (e.g. pycudadecon)
+        if tile_result.shape != tile_img.shape:
+            logger.debug(
+                "  Tile result shape %s != input %s; padding to match.",
+                tile_result.shape, tile_img.shape,
+            )
+            tile_result = _pad_to_shape(tile_result, tile_img.shape)
+
+        # Crop margin back to the original extract region
+        crop_y0 = ey.start - y0_m
+        crop_y1 = crop_y0 + (ey.stop - ey.start)
+        crop_x0 = ex.start - x0_m
+        crop_x1 = crop_x0 + (ex.stop - ex.start)
+        tile_cropped = tile_result[:, crop_y0:crop_y1, crop_x0:crop_x1]
+
+        weighted, weight = _blend_tile(tile_cropped, desc)
+        # Place the full extended region back (extract slices)
+        ext = desc["extract"]
+        numerator[ext] += weighted.astype(np.float64)
+        denominator[ext] += weight[np.newaxis, :, :].astype(np.float64)
+
+    # Normalise
+    denominator = np.maximum(denominator, 1e-12)
+    result = (numerator / denominator).astype(np.float32)
+    return np.clip(result, 0, None)
 
 
 def deconvolve(
     image: np.ndarray,
     psf: np.ndarray,
-    method: str = "richardson_lucy",
+    method: str = "sdeconv_rl",
     *,
     # Richardson-Lucy parameters
     niter: int = 30,
@@ -582,11 +849,13 @@ def deconvolve(
     # pycudadecon-specific parameters
     dzdata: Optional[float] = None,
     dxdata: Optional[float] = None,
-    background: Union[int, str] = 0,
+    background: Union[int, str] = "auto",
     # Device override for sdeconv backend
     device: Optional[str] = None,
     # RLTV regularization (DeconvolutionLab2)
     tv_lambda: float = 1e-4,
+    # XY block-tiling for large images
+    n_blocks: Union[int, str] = "auto",
 ) -> np.ndarray:
     """Deconvolve an image using the specified method and PSF.
 
@@ -598,13 +867,14 @@ def deconvolve(
         Point spread function, same dimensionality as image.
     method : str
         Deconvolution algorithm:
-        - 'richardson_lucy' (default): Iterative RL via sdeconv (PyTorch).
+        - 'sdeconv_rl' (default): Iterative RL via sdeconv (PyTorch).
           Most memory-efficient iterative method. Good default.
-        - 'wiener': Wiener filter. Fastest, single-step, but may amplify
-          noise. Good for moderate SNR.
-        - 'spitfire': Sparse Hessian variational. Best quality for sparse
-          structures, but ~8x memory of image size. Avoid for very large 3D.
-        - 'richardson_lucy_cuda': CUDA-accelerated RL via pycudadecon.
+        - 'sdeconv_wiener': Wiener filter. Fastest, single-step, but may
+          amplify noise. Good for moderate SNR.
+        - 'sdeconv_spitfire': Sparse Hessian variational. Best quality for
+          sparse structures, but ~8x memory of image size. Avoid for very
+          large 3D.
+        - 'pycudadecon_rl_cuda': CUDA-accelerated RL via pycudadecon.
           Fastest for large 3D volumes. Requires NVIDIA GPU and pycudadecon.
     niter : int
         Number of iterations for Richardson-Lucy (default: 30).
@@ -624,10 +894,15 @@ def deconvolve(
     dxdata : float, optional
         XY pixel size in microns (for pycudadecon). Auto-detected if None.
     background : int or str
-        Background subtraction value (for pycudadecon, default: 0).
+        Background subtraction for pycudadecon (default: 'auto').
     device : str, optional
         Force device for sdeconv backend ('cpu' or 'cuda'). Auto-detected
         if None.
+    n_blocks : int or str
+        Number of XY tiles for deconvolution.  ``"auto"`` (default)
+        calculates the minimum block count so each tile stays within
+        MAX_TILE_XY (1024) pixels per side.  ``0`` or ``1`` disables
+        tiling.  Values > 1 set an explicit block count.
 
     Returns
     -------
@@ -639,7 +914,33 @@ def deconvolve(
             f"Unknown method '{method}'. Available: {list(METHODS.keys())}"
         )
 
-    if method == "richardson_lucy_cuda":
+    # --- XY block-tiling dispatch (before any backend) ---
+    n_blocks = _resolve_n_blocks(n_blocks, image.shape)
+    if n_blocks > 1 and image.ndim == 3:
+        return _deconvolve_tiled(
+            image, psf, n_blocks, method=method,
+            niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
+            plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
+            background=background, device=device, tv_lambda=tv_lambda,
+        )
+
+    # Crop PSF to image size when it is larger (e.g. n_defocus = 2*nz-1).
+    # The extra PSF extent beyond the image edges has no matching data, so
+    # centre-cropping is safe and prevents size-mismatch errors in backends.
+    if psf.ndim == image.ndim:
+        slices = []
+        for ax in range(psf.ndim):
+            if psf.shape[ax] > image.shape[ax]:
+                excess = psf.shape[ax] - image.shape[ax]
+                lo = excess // 2
+                slices.append(slice(lo, lo + image.shape[ax]))
+            else:
+                slices.append(slice(None))
+        if any(s != slice(None) for s in slices):
+            psf = psf[tuple(slices)].copy()
+            logger.info("PSF cropped to image size: %s", psf.shape)
+
+    if method == "pycudadecon_rl_cuda":
         return _deconvolve_pycudadecon(
             image, psf, niter=niter, dzdata=dzdata, dxdata=dxdata,
             background=background, plane_by_plane=plane_by_plane,
@@ -669,7 +970,7 @@ def deconvolve(
     if method == "skimage_rl":
         return _deconvolve_skimage_rl(image, psf, niter=niter)
 
-    if method == "cucim_rl":
+    if method == "skimage_cucim_rl":
         return _deconvolve_cucim_rl(image, psf, niter=niter)
 
     return _deconvolve_sdeconv(
@@ -697,11 +998,11 @@ def _deconvolve_sdeconv(
     psf_t = torch.from_numpy(psf).float().to(device)
 
     # Build the deconvolution filter
-    if method == "richardson_lucy":
+    if method == "sdeconv_rl":
         deconv_filter = SRichardsonLucy(psf_t, niter=niter, pad=pad)
-    elif method == "wiener":
+    elif method == "sdeconv_wiener":
         deconv_filter = SWiener(psf_t, beta=beta, pad=pad)
-    elif method == "spitfire":
+    elif method == "sdeconv_spitfire":
         delta = 1.0  # Z/XY resolution ratio (could be computed from metadata)
         deconv_filter = Spitfire(psf_t, weight=weight, reg=reg, pad=pad, delta=delta)
     else:
@@ -714,11 +1015,11 @@ def _deconvolve_sdeconv(
             center_z = psf.shape[0] // 2
             psf_2d = psf[center_z]
             psf_2d_t = torch.from_numpy(psf_2d).float().to(device)
-            if method == "richardson_lucy":
+            if method == "sdeconv_rl":
                 deconv_filter = SRichardsonLucy(psf_2d_t, niter=niter, pad=pad)
-            elif method == "wiener":
+            elif method == "sdeconv_wiener":
                 deconv_filter = SWiener(psf_2d_t, beta=beta, pad=pad)
-            elif method == "spitfire":
+            elif method == "sdeconv_spitfire":
                 deconv_filter = Spitfire(psf_2d_t, weight=weight, reg=reg, pad=pad)
 
         result_slices = []
@@ -1122,7 +1423,7 @@ def _deconvolve_cucim_rl(
 
 def deconvolve_image(
     path: Union[str, Path],
-    method: str = "richardson_lucy",
+    method: str = "sdeconv_rl",
     channels: Optional[Sequence[int]] = None,
     *,
     # Metadata overrides (Consideration 1)
@@ -1143,9 +1444,10 @@ def deconvolve_image(
     reg: float = 0.995,
     pad: Union[int, tuple] = 13,
     plane_by_plane: bool = False,
-    background: Union[int, str] = 0,
+    background: Union[int, str] = "auto",
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
+    n_blocks: Union[int, str] = "auto",
 ) -> dict[str, Any]:
     """Load, generate PSFs, and deconvolve all channels of an OME-TIFF image.
 
@@ -1228,6 +1530,7 @@ def deconvolve_image(
             niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
             plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
             background=background, device=device, tv_lambda=tv_lambda,
+            n_blocks=n_blocks,
         )
         results.append(result)
 
@@ -1372,6 +1675,7 @@ def save_result(
     output_path: Union[str, Path],
     *,
     compress: bool = True,
+    mip_only: bool = False,
 ) -> Path:
     """Save deconvolved images as OME-TIFF, preserving metadata.
 
@@ -1383,6 +1687,9 @@ def save_result(
         Output file path (.ome.tiff).
     compress : bool
         Whether to apply zlib compression (default: True).
+    mip_only : bool
+        If True, skip writing OME-TIFF files and only save MIP PNGs.
+        Useful for benchmark mode where TIFFs are not needed.
 
     Returns
     -------
@@ -1404,9 +1711,6 @@ def save_result(
         stack = np.stack(channels_data, axis=0)
         axes = "CYX"
 
-    # Build OME-TIFF metadata
-    ome_metadata: dict[str, Any] = {"axes": axes}
-
     px_x = metadata.get("pixel_size_x")
     px_y = metadata.get("pixel_size_y")
     px_z = metadata.get("pixel_size_z")
@@ -1417,31 +1721,31 @@ def save_result(
         resolution = (1.0 / px_x, 1.0 / px_y)
     resolution_unit = 1  # No standard unit in basic TIFF; OME handles it
 
-    tifffile.imwrite(
-        str(output_path),
-        stack.astype(np.float32),
-        ome=True,
-        photometric="minisblack",
-        compression="zlib" if compress else None,
-        resolution=resolution,
-        resolutionunit=resolution_unit,
-        metadata={
-            "axes": axes,
-            "PhysicalSizeX": px_x,
-            "PhysicalSizeY": px_y,
-            "PhysicalSizeZ": px_z,
-            "PhysicalSizeXUnit": "µm",
-            "PhysicalSizeYUnit": "µm",
-            "PhysicalSizeZUnit": "µm",
-            "Channel": {
-                "Name": [
-                    f"Ch{i}" for i in range(len(channels_data))
-                ]
+    if not mip_only:
+        tifffile.imwrite(
+            str(output_path),
+            stack.astype(np.float32),
+            ome=True,
+            photometric="minisblack",
+            compression="zlib" if compress else None,
+            resolution=resolution,
+            resolutionunit=resolution_unit,
+            metadata={
+                "axes": axes,
+                "PhysicalSizeX": px_x,
+                "PhysicalSizeY": px_y,
+                "PhysicalSizeZ": px_z,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeYUnit": "µm",
+                "PhysicalSizeZUnit": "µm",
+                "Channel": {
+                    "Name": [
+                        f"Ch{i}" for i in range(len(channels_data))
+                    ]
+                },
             },
-        },
-    )
-
-    logger.info("Saved deconvolved result to %s", output_path)
+        )
+        logger.info("Saved deconvolved result to %s", output_path)
 
     # Save maximum intensity projection for 3D results
     if axes == "CZYX":
@@ -1470,7 +1774,7 @@ def save_result(
         )
         logger.info("Saved MIP to %s", mip_path)
 
-        # Save colour PNG of MIP
+        # Save colour PNG of MIP (always — needed for montage)
         mip_png = mip_path.with_suffix(".png")
         save_mip_png(mip, mip_png, metadata)
 
@@ -1478,36 +1782,33 @@ def save_result(
     source_channels = result.get("source_channels")
     if source_channels and axes == "CZYX":
         src_mip_path = output_path.parent / "mip_source.ome.tiff"
-        if src_mip_path.exists():
-            logger.info("Source MIP already exists at %s — skipping", src_mip_path)
-        else:
-            src_stack = np.stack(source_channels, axis=0)  # (C, Z, Y, X)
-            src_mip = src_stack.max(axis=1)  # Project along Z → (C, Y, X)
-            tifffile.imwrite(
-                str(src_mip_path),
-                src_mip.astype(np.float32),
-                ome=True,
-                photometric="minisblack",
-                compression="zlib" if compress else None,
-                resolution=resolution,
-                resolutionunit=resolution_unit,
-                metadata={
-                    "axes": "CYX",
-                    "PhysicalSizeX": px_x,
-                    "PhysicalSizeY": px_y,
-                    "PhysicalSizeXUnit": "µm",
-                    "PhysicalSizeYUnit": "µm",
-                    "Channel": {
-                        "Name": [
-                            f"Ch{i}" for i in range(len(source_channels))
-                        ]
-                    },
+        src_stack = np.stack(source_channels, axis=0)  # (C, Z, Y, X)
+        src_mip = src_stack.max(axis=1)  # Project along Z → (C, Y, X)
+        tifffile.imwrite(
+            str(src_mip_path),
+            src_mip.astype(np.float32),
+            ome=True,
+            photometric="minisblack",
+            compression="zlib" if compress else None,
+            resolution=resolution,
+            resolutionunit=resolution_unit,
+            metadata={
+                "axes": "CYX",
+                "PhysicalSizeX": px_x,
+                "PhysicalSizeY": px_y,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeYUnit": "µm",
+                "Channel": {
+                    "Name": [
+                        f"Ch{i}" for i in range(len(source_channels))
+                    ]
                 },
-            )
-            logger.info("Saved source MIP to %s", src_mip_path)
+            },
+        )
+        logger.info("Saved source MIP to %s", src_mip_path)
 
-            # Save colour PNG of source MIP
-            src_mip_png = src_mip_path.with_suffix(".png")
-            save_mip_png(src_mip, src_mip_png, metadata)
+        # Save colour PNG of source MIP (always — needed for montage)
+        src_mip_png = src_mip_path.with_suffix(".png")
+        save_mip_png(src_mip, src_mip_png, metadata)
 
     return output_path
