@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --blocks @blocks --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop",
+  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image",
   "inputs": [
     {
       "id": "iterations",
@@ -22,12 +22,24 @@
       "maximum": 500
     },
     {
-      "id": "blocks",
-      "value-key": "@blocks",
-      "command-line-flag": "--blocks",
-      "name": "Tile blocks",
-      "description": "Block tiling mode. 'auto': calculate minimum blocks so each tile fits in memory. 0 or 1: no tiling. >1: explicit block count.",
-      "default-value": "auto",
+      "id": "tiling",
+      "value-key": "@tiling",
+      "command-line-flag": "--tiling",
+      "name": "Tiling",
+      "description": "XY tiling mode for large images. 'none': disable tiling. 'custom': use tile size limits from the Tile limits parameter.",
+      "default-value": "custom",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["none", "custom"]
+    },
+    {
+      "id": "tile_limits",
+      "value-key": "@tile_limits",
+      "command-line-flag": "--tile_limits",
+      "name": "Tile limits",
+      "description": "Maximum tile dimensions as 'max_xy, max_z'. Only used when Tiling is set to 'custom'. The image is split into the minimum number of XY tiles so each tile fits within these limits.",
+      "default-value": "512, 64",
       "set-by-server": false,
       "optional": true,
       "type": "String"
@@ -203,7 +215,18 @@
       "value-key": "@bench_crop",
       "command-line-flag": "--bench_crop",
       "name": "Benchmark crop",
-      "description": "If true, centre-crop images to tile-size limits before benchmarking (fast, avoids tiling). If false, process full-size images (may use tiling depending on block settings). Only used when Perform Benchmark is enabled.",
+      "description": "If true, centre-crop images to tile-size limits before benchmarking (fast, avoids tiling). If false, process full-size images (may use tiling depending on tiling settings). Only used when Perform Benchmark is enabled.",
+      "default-value": true,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "bench_one_image",
+      "value-key": "@bench_one_image",
+      "command-line-flag": "--bench_one_image",
+      "name": "Benchmark one image",
+      "description": "If true, benchmark only the first image (sorted by name) from the input folder. If false, benchmark all input images. Only used when Perform Benchmark is enabled.",
       "default-value": true,
       "set-by-server": false,
       "optional": true,

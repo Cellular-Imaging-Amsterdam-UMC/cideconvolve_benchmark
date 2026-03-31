@@ -1,7 +1,8 @@
 {
   "values": {
     "iterations": 40,
-    "blocks": "auto",
+    "tiling": "custom",
+    "tile_limits": "512, 64",
     "method": "sdeconv_rl",
     "device": "auto",
     "na": "auto",
@@ -12,9 +13,10 @@
     "excitation_wl": "auto",
     "projection": "none",
     "benchmark": true,
-    "bench_iterations": "40",
-    "bench_methods": "all",
-    "bench_crop": false
+    "bench_iterations": "20, 40, 60",
+    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda",
+    "bench_crop": true,
+    "bench_one_image": true
   },
   "folders": {
     "infolder": "C:\\rahoebe\\Python\\CIDeconvolve\\infolder",

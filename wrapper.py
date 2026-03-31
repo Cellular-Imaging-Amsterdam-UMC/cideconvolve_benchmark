@@ -402,7 +402,8 @@ def main(argv):
 
         # Extract parameters with defaults from descriptor.json
         iterations = int(getattr(parameters, "iterations", 40))
-        blocks_raw = getattr(parameters, "blocks", "auto")
+        tiling_raw = getattr(parameters, "tiling", "custom")
+        tile_limits_raw = str(getattr(parameters, "tile_limits", "512, 64"))
         method = getattr(parameters, "method", "sdeconv_rl")
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
@@ -438,12 +439,17 @@ def main(argv):
         bench_methods_key = str(getattr(parameters, "bench_methods", "fast")).lower()
         bench_methods = BENCH_METHOD_SETS.get(bench_methods_key, _BENCH_BASE)
         bench_crop = bool(getattr(parameters, "bench_crop", True))
+        bench_one_image = bool(getattr(parameters, "bench_one_image", True))
 
-        # Parse blocks
-        if isinstance(blocks_raw, str) and blocks_raw.strip().lower() == "auto":
-            n_blocks = "auto"
-        else:
-            n_blocks = max(int(blocks_raw), 0)
+        # Parse tiling
+        tiling = str(tiling_raw).strip().lower()
+        if tiling not in ("none", "custom"):
+            tiling = "none"  # fallback
+
+        # Parse tile limits (max_xy, max_z)
+        _lim_parts = [s.strip() for s in tile_limits_raw.split(",") if s.strip()]
+        max_tile_xy = int(_lim_parts[0]) if len(_lim_parts) >= 1 else MAX_TILE_XY
+        max_tile_z = int(_lim_parts[1]) if len(_lim_parts) >= 2 else MAX_TILE_Z
 
         print("=" * 70)
         print("CIDeconvolve — BIAFLOWS Workflow")
@@ -452,7 +458,9 @@ def main(argv):
         print(f"  Output dir   : {bj.output_dir}")
         print(f"  Method       : {method}")
         print(f"  Iterations   : {iterations}")
-        print(f"  Blocks       : {n_blocks}")
+        print(f"  Tiling       : {tiling}")
+        if tiling == "custom":
+            print(f"  Tile limits  : max_xy={max_tile_xy}, max_z={max_tile_z}")
         print(f"  Device       : {device_param}")
         print(f"  Benchmark    : {benchmark_mode}")
         print(f"  Projection   : {projection}")
@@ -475,6 +483,7 @@ def main(argv):
             print(f"  Bench iters  : {bench_iterations}")
             print(f"  Bench methods: {bench_methods_key} ({len(bench_methods)} methods)")
             print(f"  Bench crop   : {bench_crop}")
+            print(f"  Bench 1 image: {bench_one_image}")
 
         # Prepare data directories and collect input images
         in_imgs, _, in_path, _, out_path, tmp_path = prepare_data(
@@ -486,6 +495,12 @@ def main(argv):
             return
 
         print(f"\nFound {len(in_imgs)} input image(s).")
+
+        # In benchmark mode with bench_one_image, keep only the first image
+        if benchmark_mode and bench_one_image and len(in_imgs) > 1:
+            in_imgs_sorted = sorted(in_imgs, key=lambda r: r.filename)
+            in_imgs = [in_imgs_sorted[0]]
+            print(f"Benchmark one image: using {in_imgs[0].filename}")
 
         for img_resource in in_imgs:
             img_path = Path(in_path) / img_resource.filename
@@ -516,7 +531,9 @@ def main(argv):
                         bench_iterations=bench_iterations,
                         bench_methods=bench_methods,
                         bench_crop=bench_crop,
-                        n_blocks=n_blocks,
+                        tiling=tiling,
+                        max_tile_xy=max_tile_xy,
+                        max_tile_z=max_tile_z,
                         save_psf=save_psf,
                         na=na_override,
                         refractive_index=ri_override,
@@ -541,7 +558,9 @@ def main(argv):
                         img_path,
                         method=method,
                         niter=iterations,
-                        n_blocks=n_blocks,
+                        tiling=tiling,
+                        max_tile_xy=max_tile_xy,
+                        max_tile_z=max_tile_z,
                         device=device,
                         na=na_override,
                         refractive_index=ri_override,
@@ -979,7 +998,9 @@ def _run_benchmark(
     bench_iterations: list[int],
     bench_methods: list[str],
     bench_crop: bool,
-    n_blocks,
+    tiling: str,
+    max_tile_xy: int,
+    max_tile_z: int,
     save_psf: bool,
     na: float | None = None,
     refractive_index: float | None = None,
@@ -1044,12 +1065,12 @@ def _run_benchmark(
         for img in images:
             if img.ndim == 3:
                 Z, H, W = img.shape
-                nz, ny, nx = min(Z, MAX_TILE_Z), min(H, MAX_TILE_XY), min(W, MAX_TILE_XY)
+                nz, ny, nx = min(Z, max_tile_z), min(H, max_tile_xy), min(W, max_tile_xy)
                 z0, y0, x0 = (Z - nz) // 2, (H - ny) // 2, (W - nx) // 2
                 img = img[z0:z0+nz, y0:y0+ny, x0:x0+nx]
             elif img.ndim == 2:
                 H, W = img.shape
-                ny, nx = min(H, MAX_TILE_XY), min(W, MAX_TILE_XY)
+                ny, nx = min(H, max_tile_xy), min(W, max_tile_xy)
                 y0, x0 = (H - ny) // 2, (W - nx) // 2
                 img = img[y0:y0+ny, x0:x0+nx]
             cropped.append(img)
@@ -1147,7 +1168,8 @@ def _run_benchmark(
                     monitor.start()
                     result = deconvolve_image(
                         work_path, method=m, niter=nit,
-                        device=dev_val, n_blocks=n_blocks,
+                        device=dev_val,
+                        tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
                         **meta_overrides,
                     )
                     out_name = f"{stem}_{m}_{dev_val}_{nit}i.ome.tiff"
@@ -1168,7 +1190,7 @@ def _run_benchmark(
                     monitor.start()
                     result = deconvolve_image(
                         work_path, method=m, niter=nit,
-                        n_blocks=n_blocks,
+                        tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
                         **meta_overrides,
                     )
                     out_name = f"{stem}_{m}_{nit}i.ome.tiff"

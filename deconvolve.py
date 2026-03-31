@@ -606,12 +606,12 @@ METHODS = {
 
 
 # ---------------------------------------------------------------------------
-# XY block-tiling helpers (large image support)
+# XY tiling helpers (large image support)
 # ---------------------------------------------------------------------------
 
-# Maximum tile dimensions for the "auto" tiling mode.  When the image
-# exceeds these limits the auto-calculator splits it into the smallest
-# number of blocks that keeps every tile within bounds.
+# Default maximum tile dimensions for "custom" tiling mode.  When the
+# image exceeds these limits the auto-calculator splits it into the
+# smallest number of tiles that keeps every tile within bounds.
 # OpenCL device limits are [1024, 1024, 64].  We use smaller XY values
 # because the extracted tile includes overlap margins on each side
 # (core + 2*overlap must stay within 1024).
@@ -622,12 +622,12 @@ MAX_TILE_XY = 512
 TILE_MARGIN = 16
 
 
-def _auto_n_blocks(
+def _auto_n_tiles(
     shape: tuple[int, ...],
     max_z: int = MAX_TILE_Z,
     max_xy: int = MAX_TILE_XY,
 ) -> int:
-    """Return the minimum number of XY blocks so each tile fits within limits.
+    """Return the minimum number of XY tiles so each tile fits within limits.
 
     Only XY is tiled; Z is never split.  If the image already fits
     within *max_z* and *max_xy* the function returns 1 (no tiling).
@@ -639,45 +639,51 @@ def _auto_n_blocks(
     Z, H, W = shape[:3]
     ny = max(1, -(-H // max_xy))  # ceil division
     nx = max(1, -(-W // max_xy))
-    n_blocks = ny * nx
-    if n_blocks <= 1:
+    n_tiles = ny * nx
+    if n_tiles <= 1:
         return 1
-    return n_blocks
+    return n_tiles
 
 
-def _resolve_n_blocks(
-    n_blocks: Union[int, str],
+def _resolve_tiling(
+    tiling: str,
     shape: tuple[int, ...],
+    max_xy: int = MAX_TILE_XY,
+    max_z: int = MAX_TILE_Z,
 ) -> int:
-    """Resolve *n_blocks* to a concrete integer.
+    """Resolve *tiling* mode to a concrete tile count.
 
-    Accepted values: ``"auto"`` (compute from image shape), or an int
-    (0 and 1 both mean no tiling, >1 = explicit block count).
+    Accepted values: ``"none"`` (no tiling) or ``"custom"`` (compute
+    from image shape using *max_xy* / *max_z* limits).
     """
-    if isinstance(n_blocks, str):
-        if n_blocks.lower() == "auto":
-            return _auto_n_blocks(shape)
+    if isinstance(tiling, str):
+        mode = tiling.strip().lower()
+        if mode == "none":
+            return 1
+        if mode in ("custom", "auto"):
+            return _auto_n_tiles(shape, max_z=max_z, max_xy=max_xy)
         raise ValueError(
-            f"n_blocks must be 'auto' or an integer, got '{n_blocks}'"
+            f"tiling must be 'none' or 'custom', got '{tiling}'"
         )
-    return max(int(n_blocks), 1)  # 0 → 1 (no tiling)
+    # Legacy: accept integer (0/1 = none, >1 = explicit tile count)
+    return max(int(tiling), 1)
 
 
 def _compute_tile_grid(
-    shape_yx: tuple[int, int], n_blocks: int,
+    shape_yx: tuple[int, int], n_tiles: int,
 ) -> tuple[int, int]:
     """Return (ny, nx) tile counts that best cover *shape_yx*.
 
     Tries to keep tiles roughly square by minimising aspect-ratio skew.
     """
-    if n_blocks <= 1:
+    if n_tiles <= 1:
         return (1, 1)
-    best = (1, n_blocks)
+    best = (1, n_tiles)
     best_ratio = float("inf")
-    for ny in range(1, n_blocks + 1):
-        if n_blocks % ny != 0:
+    for ny in range(1, n_tiles + 1):
+        if n_tiles % ny != 0:
             continue
-        nx = n_blocks // ny
+        nx = n_tiles // ny
         tile_h = shape_yx[0] / ny
         tile_w = shape_yx[1] / nx
         ratio = max(tile_h, tile_w) / max(min(tile_h, tile_w), 1)
@@ -793,7 +799,7 @@ def _pad_to_shape(
 def _deconvolve_tiled(
     image: np.ndarray,
     psf: np.ndarray,
-    n_blocks: int,
+    n_tiles: int,
     method: str,
     **kwargs,
 ) -> np.ndarray:
@@ -801,20 +807,20 @@ def _deconvolve_tiled(
     overlap = max(psf.shape[-1], psf.shape[-2]) // 2
     margin = TILE_MARGIN
 
-    ny, nx = _compute_tile_grid(image.shape[1:], n_blocks)
+    ny, nx = _compute_tile_grid(image.shape[1:], n_tiles)
     min_tile_yx = min(image.shape[1] / ny, image.shape[2] / nx)
     if min_tile_yx < max(psf.shape[-2:]):
-        # Tiles too small for meaningful deconvolution — reduce n_blocks
+        # Tiles too small for meaningful deconvolution — fall back
         logger.warning(
-            "n_blocks=%d produces tiles smaller than PSF; falling back to "
-            "n_blocks=1 (no tiling).", n_blocks,
+            "n_tiles=%d produces tiles smaller than PSF; falling back to "
+            "no tiling.", n_tiles,
         )
-        return deconvolve(image, psf, method=method, n_blocks=1, **kwargs)
+        return deconvolve(image, psf, method=method, tiling="none", **kwargs)
 
     tiles = _compute_tile_slices(image.shape, ny, nx, overlap)
     logger.info(
-        "Tiled deconvolution: %d blocks (%d×%d grid), overlap=%d, margin=%d px",
-        n_blocks, ny, nx, overlap, margin,
+        "Tiled deconvolution: %d tiles (%d×%d grid), overlap=%d, margin=%d px",
+        n_tiles, ny, nx, overlap, margin,
     )
 
     Z, H, W = image.shape
@@ -836,7 +842,7 @@ def _deconvolve_tiled(
             "  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape,
         )
         tile_result = deconvolve(
-            tile_img, psf, method=method, n_blocks=1, **kwargs,
+            tile_img, psf, method=method, tiling="none", **kwargs,
         )
 
         # Fix shape if backend returned a different size (e.g. pycudadecon)
@@ -890,8 +896,10 @@ def deconvolve(
     device: Optional[str] = None,
     # RLTV regularization (DeconvolutionLab2)
     tv_lambda: float = 1e-4,
-    # XY block-tiling for large images
-    n_blocks: Union[int, str] = "auto",
+    # XY tiling for large images
+    tiling: str = "custom",
+    max_tile_xy: int = MAX_TILE_XY,
+    max_tile_z: int = MAX_TILE_Z,
 ) -> np.ndarray:
     """Deconvolve an image using the specified method and PSF.
 
@@ -934,11 +942,14 @@ def deconvolve(
     device : str, optional
         Force device for sdeconv backend ('cpu' or 'cuda'). Auto-detected
         if None.
-    n_blocks : int or str
-        Number of XY tiles for deconvolution.  ``"auto"`` (default)
-        calculates the minimum block count so each tile stays within
-        MAX_TILE_XY (1024) pixels per side.  ``0`` or ``1`` disables
-        tiling.  Values > 1 set an explicit block count.
+    tiling : str
+        Tiling mode.  ``"custom"`` (default) computes the minimum
+        number of XY tiles so each tile fits within *max_tile_xy*
+        pixels per side.  ``"none"`` disables tiling.
+    max_tile_xy : int
+        Maximum XY tile dimension (default: 512).
+    max_tile_z : int
+        Maximum Z tile dimension (default: 64).
 
     Returns
     -------
@@ -950,11 +961,11 @@ def deconvolve(
             f"Unknown method '{method}'. Available: {list(METHODS.keys())}"
         )
 
-    # --- XY block-tiling dispatch (before any backend) ---
-    n_blocks = _resolve_n_blocks(n_blocks, image.shape)
-    if n_blocks > 1 and image.ndim == 3:
+    # --- XY tiling dispatch (before any backend) ---
+    n_tiles = _resolve_tiling(tiling, image.shape, max_xy=max_tile_xy, max_z=max_tile_z)
+    if n_tiles > 1 and image.ndim == 3:
         return _deconvolve_tiled(
-            image, psf, n_blocks, method=method,
+            image, psf, n_tiles, method=method,
             niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
             plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
             background=background, device=device, tv_lambda=tv_lambda,
@@ -1486,7 +1497,9 @@ def deconvolve_image(
     background: Union[int, str] = "auto",
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
-    n_blocks: Union[int, str] = "auto",
+    tiling: str = "custom",
+    max_tile_xy: int = MAX_TILE_XY,
+    max_tile_z: int = MAX_TILE_Z,
 ) -> dict[str, Any]:
     """Load, generate PSFs, and deconvolve all channels of an OME-TIFF image.
 
@@ -1570,7 +1583,7 @@ def deconvolve_image(
             niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
             plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
             background=background, device=device, tv_lambda=tv_lambda,
-            n_blocks=n_blocks,
+            tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
         )
         results.append(result)
 

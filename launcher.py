@@ -214,6 +214,18 @@ class LauncherWindow(QMainWindow):
         restore_btn.clicked.connect(self._on_restore)
         btn_layout.addWidget(restore_btn)
 
+        load_btn = QPushButton("Load Settings")
+        load_btn.setStyleSheet("padding: 8px 16px;")
+        load_btn.setToolTip("Load parameter values from a JSON file")
+        load_btn.clicked.connect(self._on_load_settings)
+        btn_layout.addWidget(load_btn)
+
+        save_btn = QPushButton("Save Settings")
+        save_btn.setStyleSheet("padding: 8px 16px;")
+        save_btn.setToolTip("Save current parameter values to a JSON file")
+        save_btn.clicked.connect(self._on_save_settings)
+        btn_layout.addWidget(save_btn)
+
         btn_layout.addStretch()
 
         run_btn = QPushButton("Run")
@@ -326,14 +338,8 @@ class LauncherWindow(QMainWindow):
         except OSError:
             pass
 
-    def _on_restore(self):
-        """Load settings from .last_settings.json into the widgets."""
-        try:
-            with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return
-
+    def _apply_settings(self, data: dict):
+        """Apply a settings dict (values + folders) to the widgets."""
         # Restore folders
         for key, line in self.folder_widgets.items():
             saved = data.get("folders", {}).get(key)
@@ -357,6 +363,42 @@ class LauncherWindow(QMainWindow):
                     w.setCurrentIndex(idx)
             elif isinstance(w, QLineEdit):
                 w.setText(str(val))
+
+    def _on_restore(self):
+        """Load settings from .last_settings.json into the widgets."""
+        try:
+            with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        self._apply_settings(data)
+
+    def _on_save_settings(self):
+        """Save current settings to a user-chosen JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Settings", str(SCRIPT_DIR / "settings.json"),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        data = {"values": self._get_values(), "folders": self._get_folders()}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def _on_load_settings(self):
+        """Load settings from a user-chosen JSON file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Settings", str(SCRIPT_DIR),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        self._apply_settings(data)
 
     def _on_run(self):
         self._save_settings()

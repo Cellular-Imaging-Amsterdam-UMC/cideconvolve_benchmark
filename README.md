@@ -173,7 +173,8 @@ command line via `wrapper.py`:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--iterations` | 40 | Number of RL iterations |
-| `--blocks` | auto | Tile block mode (`auto`, `0`/`1` = no tiling, `>1` = explicit) |
+| `--tiling` | custom | Tiling mode (`none` or `custom`) |
+| `--tile_limits` | 512, 64 | Max tile dimensions `max_xy, max_z` (used when tiling = `custom`) |
 | `--method` | sdeconv_rl | Deconvolution backend — see [METHODS.md](METHODS.md) |
 | `--device` | auto | Compute device: `auto`, `cpu`, `cuda` |
 | `--na` | auto | Numerical aperture override |
@@ -187,6 +188,7 @@ command line via `wrapper.py`:
 | `--bench_iterations` | 20, 40, 60 | Iteration counts for benchmark |
 | `--bench_methods` | sdeconv_rl, pycudadecon_rl_cuda | Method set for benchmark |
 | `--bench_crop` | true | Centre-crop images before benchmarking |
+| `--bench_one_image` | true | Benchmark only the first image (sorted by name) |
 
 ---
 
