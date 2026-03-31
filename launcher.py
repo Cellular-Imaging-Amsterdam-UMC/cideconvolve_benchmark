@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -43,6 +44,7 @@ from PyQt6.QtWidgets import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 DESCRIPTOR_PATH = SCRIPT_DIR / "descriptor.json"
 ICON_PATH = SCRIPT_DIR / "icon.svg"
+LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
 
 
 class ToggleSwitch(QCheckBox):
@@ -102,9 +104,18 @@ def build_docker_command(descriptor: dict, values: dict, folders: dict) -> list[
         if val is None:
             continue
         if inp["type"] == "Boolean":
-            # argparse store_true: only pass the flag when True, omit when False
-            if val:
-                cmd.append(flag)
+            default_val = inp.get("default-value", False)
+            if default_val is True:
+                # Default-true booleans use --no-<id> in argparse (store_false)
+                # Only emit flag when user unchecks (wants False)
+                if not val:
+                    neg_flag = f"--no-{param_id.replace('_', '-')}"
+                    cmd.append(neg_flag)
+            else:
+                # Default-false booleans use --<flag> in argparse (store_true)
+                # Only emit flag when user checks (wants True)
+                if val:
+                    cmd.append(flag)
         else:
             cmd.extend([flag, str(val)])
 
@@ -141,19 +152,27 @@ class LauncherWindow(QMainWindow):
             desc_label.setStyleSheet("color: #666; margin-bottom: 8px;")
             layout.addWidget(desc_label)
 
-        # -- Data folder info (read-only) --
+        # -- Data folders with browse buttons --
         folder_group = QGroupBox("Data Folders")
         folder_layout = QFormLayout()
         folder_group.setLayout(folder_layout)
 
-        for label_text, folder_path in [
-            ("Input folder", str(SCRIPT_DIR / "infolder")),
-            ("Output folder", str(SCRIPT_DIR / "outfolder")),
+        self.folder_widgets: dict[str, QLineEdit] = {}
+        for key, label_text, default_path in [
+            ("infolder",  "Input folder",  str(SCRIPT_DIR / "infolder")),
+            ("outfolder", "Output folder", str(SCRIPT_DIR / "outfolder")),
         ]:
-            path_label = QLabel(folder_path)
-            path_label.setStyleSheet("color: #555;")
-            path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            folder_layout.addRow(label_text + ":", path_label)
+            row = QHBoxLayout()
+            line = QLineEdit(default_path)
+            line.setMinimumWidth(360)
+            line.textChanged.connect(self._update_preview)
+            browse_btn = QPushButton("Browse…")
+            browse_btn.setFixedWidth(80)
+            browse_btn.clicked.connect(lambda checked, le=line: self._browse_folder(le))
+            row.addWidget(line)
+            row.addWidget(browse_btn)
+            folder_layout.addRow(label_text + ":", row)
+            self.folder_widgets[key] = line
 
         layout.addWidget(folder_group)
 
@@ -187,6 +206,16 @@ class LauncherWindow(QMainWindow):
 
         # -- Buttons --
         btn_layout = QHBoxLayout()
+
+        restore_btn = QPushButton("Restore Last Settings")
+        restore_btn.setStyleSheet("padding: 8px 16px;")
+        restore_btn.setToolTip("Restore parameter values from the previous run")
+        restore_btn.setEnabled(LAST_SETTINGS_PATH.exists())
+        restore_btn.clicked.connect(self._on_restore)
+        btn_layout.addWidget(restore_btn)
+
+        btn_layout.addStretch()
+
         run_btn = QPushButton("Run")
         run_btn.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; "
@@ -199,7 +228,6 @@ class LauncherWindow(QMainWindow):
         close_btn.setStyleSheet("padding: 8px 24px;")
         close_btn.clicked.connect(self.close)
 
-        btn_layout.addStretch()
         btn_layout.addWidget(run_btn)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
@@ -270,10 +298,18 @@ class LauncherWindow(QMainWindow):
 
     def _get_folders(self) -> dict:
         return {
-            "infolder": str(SCRIPT_DIR / "infolder"),
-            "outfolder": str(SCRIPT_DIR / "outfolder"),
+            "infolder": self.folder_widgets["infolder"].text(),
+            "outfolder": self.folder_widgets["outfolder"].text(),
             "gtfolder": str(SCRIPT_DIR / "gtfolder"),
         }
+
+    def _browse_folder(self, line_edit: QLineEdit):
+        """Open a folder picker and update the given QLineEdit."""
+        current = line_edit.text()
+        start = current if Path(current).is_dir() else str(SCRIPT_DIR)
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder", start)
+        if folder:
+            line_edit.setText(folder)
 
     def _update_preview(self):
         cmd = build_docker_command(
@@ -281,7 +317,49 @@ class LauncherWindow(QMainWindow):
         )
         self.cmd_preview.setPlainText(" ".join(cmd))
 
+    def _save_settings(self):
+        """Persist current widget values and folders to .last_settings.json."""
+        data = {"values": self._get_values(), "folders": self._get_folders()}
+        try:
+            with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+    def _on_restore(self):
+        """Load settings from .last_settings.json into the widgets."""
+        try:
+            with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        # Restore folders
+        for key, line in self.folder_widgets.items():
+            saved = data.get("folders", {}).get(key)
+            if saved is not None:
+                line.setText(str(saved))
+
+        # Restore parameter values
+        saved_vals = data.get("values", {})
+        for inp in self.descriptor.get("inputs", []):
+            w = self.widgets.get(inp["id"])
+            val = saved_vals.get(inp["id"])
+            if w is None or val is None:
+                continue
+            if isinstance(w, QCheckBox):
+                w.setChecked(bool(val))
+            elif isinstance(w, QSpinBox):
+                w.setValue(int(val))
+            elif isinstance(w, QComboBox):
+                idx = w.findText(str(val))
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+            elif isinstance(w, QLineEdit):
+                w.setText(str(val))
+
     def _on_run(self):
+        self._save_settings()
         cmd = build_docker_command(
             self.descriptor, self._get_values(), self._get_folders()
         )

@@ -228,6 +228,7 @@ def load_image(
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
+    excitation_wavelengths: Optional[list[float]] = None,
     sample_refractive_index: float = 1.33,
 ) -> dict[str, Any]:
     """Load an OME-TIFF image and extract microscopy metadata.
@@ -250,6 +251,8 @@ def load_image(
         Override axial pixel size in micrometers.
     emission_wavelengths : list[float], optional
         Override emission wavelengths in nm, one per channel.
+    excitation_wavelengths : list[float], optional
+        Override excitation wavelengths in nm, one per channel.
     sample_refractive_index : float
         Refractive index of the sample medium (default 1.33 for aqueous).
 
@@ -370,9 +373,17 @@ def load_image(
         for i, wl in enumerate(emission_wavelengths):
             if i < len(meta["channels"]):
                 meta["channels"][i]["emission_wavelength"] = wl
+    if excitation_wavelengths is not None:
+        if "channels" not in meta:
+            meta["channels"] = [{} for _ in excitation_wavelengths]
+        for i, wl in enumerate(excitation_wavelengths):
+            if i < len(meta["channels"]):
+                meta["channels"][i]["excitation_wavelength"] = wl
 
     # Apply defaults for critical missing values (setdefault won't
     # replace an existing key whose value is None, so fix those too).
+    # Track which keys received a fallback default so callers can
+    # distinguish "from image metadata" vs "assumed default".
     _defaults = {
         "na": 1.4,
         "refractive_index": 1.515,
@@ -381,20 +392,29 @@ def load_image(
         "pixel_size_y": 0.1,
         "pixel_size_z": 0.3,
     }
+    _defaulted = set()
     for _k, _v in _defaults.items():
         if meta.get(_k) is None:
             meta[_k] = _v
+            _defaulted.add(_k)
+    meta["_defaulted_keys"] = _defaulted
     meta["sample_refractive_index"] = sample_refractive_index
     meta["n_channels"] = len(images)
 
     # Ensure channels list
+    _em_defaulted = False
     if "channels" not in meta or not meta["channels"]:
         meta["channels"] = [
             {"emission_wavelength": 520.0} for _ in range(len(images))
         ]
+        _em_defaulted = True
     # Fill in missing emission wavelengths with a default
     for ch in meta["channels"]:
-        ch.setdefault("emission_wavelength", 520.0)
+        if "emission_wavelength" not in ch:
+            ch["emission_wavelength"] = 520.0
+            _em_defaulted = True
+    if _em_defaulted:
+        _defaulted.add("emission_wavelength")
 
     logger.info(
         "Loaded %d channel(s), shape=%s, microscope=%s, NA=%.2f",
@@ -529,9 +549,25 @@ def generate_psf(
         # Scalar: shape (n_defocus, ny, nx)
         intensity = torch.abs(field) ** 2
 
-    # Confocal PSF approximation: square the intensity
+    # Confocal PSF: multiply emission × excitation PSFs when excitation
+    # wavelength is available; fall back to squaring the emission PSF.
     if is_confocal:
-        intensity = intensity ** 2
+        exc_wl = ch.get("excitation_wavelength")
+        if exc_wl is not None and exc_wl != wavelength_nm:
+            exc_kwargs = dict(propagator_kwargs)
+            exc_kwargs["wavelength"] = float(exc_wl)
+            exc_propagator = PropClass(**exc_kwargs)
+            exc_field = exc_propagator.compute_focus_field()
+            if exc_field.dim() == 4:
+                intensity_exc = (torch.abs(exc_field) ** 2).sum(dim=1)
+            else:
+                intensity_exc = torch.abs(exc_field) ** 2
+            intensity = intensity * intensity_exc
+            logger.info("  Confocal PSF: emission %.0f nm × excitation %.0f nm",
+                        wavelength_nm, exc_wl)
+        else:
+            intensity = intensity ** 2
+            logger.info("  Confocal PSF: squared (no excitation wavelength)")
 
     psf = intensity.cpu().numpy().astype(np.float32)
 
@@ -1048,7 +1084,10 @@ def _deconvolve_pycudadecon(
 ) -> np.ndarray:
     """Deconvolve using pycudadecon (CUDA-accelerated RL)."""
     try:
-        from pycudadecon import decon
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Unable to find function: camcor_interface")
+            from pycudadecon import decon
     except ImportError:
         raise ImportError(
             "pycudadecon is not installed. Install via: "
@@ -1076,8 +1115,7 @@ def _deconvolve_pycudadecon(
 
     if image.ndim != 3:
         raise ValueError(
-            "pycudadecon only supports 3D images. Use a sdeconv method for 2D, "
-            "or reshape your 2D image to (1, Y, X)."
+            "pycudadecon requires 3-D image (CUDA FFT requires Z > 1)."
         )
     if psf.ndim != 3:
         raise ValueError("PSF must be 3D for pycudadecon.")
@@ -1197,7 +1235,7 @@ def _deconvolve_deconwolf(
         )
 
     if image.ndim != 3 or psf.ndim != 3:
-        raise ValueError("deconwolf requires 3-D image and PSF arrays.")
+        raise ValueError("deconwolf requires 3-D image.")
 
     tmp = tempfile.mkdtemp(prefix="dw_")
     try:
@@ -1275,8 +1313,8 @@ def _deconvolve_deconvlab2(
     if not java:
         raise FileNotFoundError("java not found on PATH.")
 
-    if image.ndim != 3 or psf.ndim != 3:
-        raise ValueError("DeconvolutionLab2 requires 3-D image and PSF arrays.")
+    if image.ndim not in (2, 3) or psf.ndim not in (2, 3):
+        raise ValueError("DeconvolutionLab2 requires 2-D or 3-D image and PSF arrays.")
 
     tmp = tempfile.mkdtemp(prefix="dl2_")
     try:
@@ -1351,7 +1389,7 @@ def _deconvolve_redlionfish(
         ) from exc
 
     if image.ndim != 3 or psf.ndim != 3:
-        raise ValueError("RedLionfish requires 3-D image and PSF arrays.")
+        raise ValueError("RedLionfish requires 3-D image.")
 
     method = "gpu" if gpu else "cpu"
     result = rl.doRLDeconvolutionFromNpArrays(
@@ -1433,6 +1471,7 @@ def deconvolve_image(
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
+    excitation_wavelengths: Optional[list[float]] = None,
     sample_refractive_index: float = 1.33,
     # PSF options
     psf_size_xy: Optional[int] = None,
@@ -1485,6 +1524,7 @@ def deconvolve_image(
         pixel_size_xy=pixel_size_xy,
         pixel_size_z=pixel_size_z,
         emission_wavelengths=emission_wavelengths,
+        excitation_wavelengths=excitation_wavelengths,
         sample_refractive_index=sample_refractive_index,
     )
 
@@ -1786,8 +1826,13 @@ def save_result(
         logger.info("Saved deconvolved result to %s", output_path)
 
     # Save maximum intensity projection for 3D results
+    # For 2D results, save the image directly with mip_ prefix for montage
     if axes == "CZYX":
         mip = stack.max(axis=1)  # Project along Z → (C, Y, X)
+    else:
+        mip = stack  # Already (C, Y, X) — use as-is for montage
+
+    if mip is not None:
         mip_path = output_path.parent / ("mip_" + output_path.name)
         tifffile.imwrite(
             str(mip_path),
@@ -1817,11 +1862,15 @@ def save_result(
         save_mip_png(mip, mip_png, metadata)
 
     # Save maximum intensity projection of the source image for 3D data
+    # For 2D, save the source directly with mip_ prefix for montage
     source_channels = result.get("source_channels")
-    if source_channels and axes == "CZYX":
+    if source_channels:
         src_mip_path = output_path.parent / "mip_source.ome.tiff"
-        src_stack = np.stack(source_channels, axis=0)  # (C, Z, Y, X)
-        src_mip = src_stack.max(axis=1)  # Project along Z → (C, Y, X)
+        src_stack = np.stack(source_channels, axis=0)
+        if axes == "CZYX":
+            src_mip = src_stack.max(axis=1)  # Project along Z → (C, Y, X)
+        else:
+            src_mip = src_stack  # Already (C, Y, X)
         tifffile.imwrite(
             str(src_mip_path),
             src_mip.astype(np.float32),

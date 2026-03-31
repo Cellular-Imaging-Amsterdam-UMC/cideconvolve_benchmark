@@ -1,0 +1,18 @@
+services:
+  benchmark:
+    build: .
+    # Mount data (read-only) and output (writable)
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output
+    # Expose all NVIDIA driver capabilities (compute + OpenCL + utility)
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    # NVIDIA GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

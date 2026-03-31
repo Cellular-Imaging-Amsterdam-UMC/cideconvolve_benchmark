@@ -41,6 +41,10 @@ bin/
 VkFFT_kernelCache_*.binary
 fftw_wisdom_*.dat
 
+# Private build / push scripts
+run.cmd
+pushdocker.cmd
+
 # Misc build artifacts
 *.o
 *.so

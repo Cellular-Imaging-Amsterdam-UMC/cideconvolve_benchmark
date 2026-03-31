@@ -1,0 +1,24 @@
+{
+  "values": {
+    "iterations": 40,
+    "blocks": "auto",
+    "method": "sdeconv_rl",
+    "device": "auto",
+    "na": "auto",
+    "refractive_index": "auto",
+    "sample_ri": "auto",
+    "microscope_type": "auto",
+    "emission_wl": "auto",
+    "excitation_wl": "auto",
+    "projection": "none",
+    "benchmark": true,
+    "bench_iterations": "40",
+    "bench_methods": "all",
+    "bench_crop": false
+  },
+  "folders": {
+    "infolder": "C:\\rahoebe\\Python\\CIDeconvolve\\infolder",
+    "outfolder": "C:\\rahoebe\\Python\\CIDeconvolve\\outfolder",
+    "gtfolder": "C:\\rahoebe\\Python\\CIDeconvolve\\gtfolder"
+  }
+}

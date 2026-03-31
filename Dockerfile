@@ -9,7 +9,7 @@
 # BIAFLOWS convention: images in /data/in, results in /data/out,
 # ground truth in /data/gt.  The entrypoint is wrapper.py which
 # parses --infolder / --outfolder / --gtfolder and descriptor.json
-# parameters, then delegates to cidecon.py.
+# parameters, then delegates to deconvolve.py.
 # ===========================================================================
 
 FROM nvidia/cuda:12.6.0-devel-ubuntu22.04 AS builder
@@ -96,7 +96,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 # --- Application code ---
 COPY vendor/ /app/vendor/
 COPY deconvolve.py /app/deconvolve.py
-COPY cidecon.py /app/cidecon.py
 COPY bioflows_local.py /app/bioflows_local.py
 COPY wrapper.py /app/wrapper.py
 COPY descriptor.json /app/descriptor.json

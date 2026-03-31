@@ -1,18 +1,18 @@
 {
   "name": "W_CIDeconvolve",
-  "description": "3D Richardson-Lucy deconvolution for widefield and confocal microscopy images with multiple algorithm backends (sdeconv, pycudadecon, deconwolf, DeconvolutionLab2, redlionfish, scikit-image). Supports GPU acceleration via CUDA and OpenCL.",
+  "description": "3D/2D deconvolution for widefield and confocal microscopy images with multiple algorithm backends (sdeconv, pycudadecon, deconwolf, DeconvolutionLab2, redlionfish, scikit-image). Supports optional GPU acceleration via CUDA and OpenCL.",
   "container-image": {
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --blocks @blocks --method @method --device @device --benchmark @benchmark --projection @projection --psf @psf",
+  "command-line": "python wrapper.py --iterations @iterations --blocks @blocks --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop",
   "inputs": [
     {
       "id": "iterations",
       "value-key": "@iterations",
       "command-line-flag": "--iterations",
       "name": "RL iterations",
-      "description": "Number of Richardson-Lucy iterations to run",
+      "description": "Number of iterations to run",
       "default-value": 40,
       "set-by-server": false,
       "optional": true,
@@ -69,15 +69,82 @@
       "value-choices": ["auto", "cpu", "cuda"]
     },
     {
-      "id": "benchmark",
-      "value-key": "@benchmark",
-      "command-line-flag": "--benchmark",
-      "name": "Benchmark mode",
-      "description": "If true, centre-crop the image to tile-size limits and only save montage images.",
-      "default-value": false,
+      "id": "na",
+      "value-key": "@na",
+      "command-line-flag": "--na",
+      "name": "Numerical aperture",
+      "description": "Override objective numerical aperture. 'auto' uses value from image metadata (default 1.4 if missing).",
+      "default-value": "auto",
       "set-by-server": false,
       "optional": true,
-      "type": "Boolean"
+      "type": "String"
+    },
+    {
+      "id": "refractive_index",
+      "value-key": "@refractive_index",
+      "command-line-flag": "--refractive_index",
+      "name": "Immersion medium",
+      "description": "Immersion medium refractive index for PSF generation. 'auto' uses value from image metadata (default: oil 1.515).",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["auto", "air (1.0003)", "water (1.333)", "oil (1.515)"]
+    },
+    {
+      "id": "sample_ri",
+      "value-key": "@sample_ri",
+      "command-line-flag": "--sample_ri",
+      "name": "Sample / mounting medium",
+      "description": "Refractive index of the sample or mounting medium for PSF generation. 'auto' uses image metadata if available, otherwise defaults to Vectashield (1.45).",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "auto",
+        "water (1.333)",
+        "PBS (1.334)",
+        "culture medium (1.337)",
+        "vectashield (1.45)",
+        "glycerol (1.474)",
+        "prolong glass (1.52)",
+        "oil (1.515)"
+      ]
+    },
+    {
+      "id": "microscope_type",
+      "value-key": "@microscope_type",
+      "command-line-flag": "--microscope_type",
+      "name": "Microscope type",
+      "description": "Override microscope type for PSF model. 'auto' uses value from image metadata (default 'widefield' if missing). Confocal uses emission × excitation PSF when excitation wavelengths are provided.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": ["auto", "widefield", "confocal"]
+    },
+    {
+      "id": "emission_wl",
+      "value-key": "@emission_wl",
+      "command-line-flag": "--emission_wl",
+      "name": "Emission wavelengths",
+      "description": "Override emission wavelengths in nm, comma-separated (one per channel). 'auto' uses values from image metadata (default 520 nm if missing). Example: '520, 600'.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "excitation_wl",
+      "value-key": "@excitation_wl",
+      "command-line-flag": "--excitation_wl",
+      "name": "Excitation wavelengths",
+      "description": "Excitation wavelengths in nm, comma-separated (one per channel). Used for confocal PSF generation (emission × excitation model). 'auto' uses values from image metadata; falls back to squared emission PSF if unavailable. Example: '405, 488'.",
+      "default-value": "auto",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
     },
     {
       "id": "projection",
@@ -92,12 +159,52 @@
       "value-choices": ["none", "mip", "sum"]
     },
     {
-      "id": "psf",
-      "value-key": "@psf",
-      "command-line-flag": "--psf",
-      "name": "Save PSF",
-      "description": "If true, save PSF montage PNG (XY and XZ MIP) in the output folder.",
+      "id": "benchmark",
+      "value-key": "@benchmark",
+      "command-line-flag": "--benchmark",
+      "name": "Perform Benchmark",
+      "description": "If true, run multi-method benchmark instead of single deconvolution. Uses the benchmark iterations, methods and crop settings below.",
       "default-value": false,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "bench_iterations",
+      "value-key": "@bench_iterations",
+      "command-line-flag": "--bench_iterations",
+      "name": "Benchmark iterations",
+      "description": "Comma-separated list of iteration counts for benchmarking, e.g. '20, 40, 60'. Only used when Perform Benchmark is enabled.",
+      "default-value": "20, 40, 60",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String"
+    },
+    {
+      "id": "bench_methods",
+      "value-key": "@bench_methods",
+      "command-line-flag": "--bench_methods",
+      "name": "Benchmark methods",
+      "description": "Which set of methods to benchmark. Each tier adds methods to the previous. 'all' includes every available backend. Only used when Perform Benchmark is enabled.",
+      "default-value": "sdeconv_rl, pycudadecon_rl_cuda",
+      "set-by-server": false,
+      "optional": true,
+      "type": "String",
+      "value-choices": [
+        "sdeconv_rl, pycudadecon_rl_cuda",
+        "sdeconv_rl, pycudadecon_rl_cuda, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl",
+        "all"
+      ]
+    },
+    {
+      "id": "bench_crop",
+      "value-key": "@bench_crop",
+      "command-line-flag": "--bench_crop",
+      "name": "Benchmark crop",
+      "description": "If true, centre-crop images to tile-size limits before benchmarking (fast, avoids tiling). If false, process full-size images (may use tiling depending on block settings). Only used when Perform Benchmark is enabled.",
+      "default-value": true,
       "set-by-server": false,
       "optional": true,
       "type": "Boolean"

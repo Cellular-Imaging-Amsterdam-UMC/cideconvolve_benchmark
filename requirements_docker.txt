@@ -33,3 +33,7 @@ redlionfish==0.10
 # cuCIM GPU-accelerated Richardson-Lucy (Linux only, NVIDIA GPU)
 cucim-cu12==26.2.1
 cupy-cuda12x==14.0.1
+
+# System metrics during benchmark
+psutil==7.0.0
+nvidia-ml-py==12.575.51
