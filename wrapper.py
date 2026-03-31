@@ -786,14 +786,15 @@ def _make_benchmark_montage(
     max_w = max(img.size[0] for img in all_imgs)
     max_h = max(img.size[1] for img in all_imgs)
 
-    # Insert metadata panel next to Source in row 0
-    meta_panel = _make_metadata_panel(metadata, max_w, max_h, font)
-    loaded_rows[0].insert(1, (meta_panel, "PSF Parameters"))
-
     n_cols = max(len(row) for row in loaded_rows)
     n_rows = len(loaded_rows)
     cell_w = max_w + 2 * padding
     cell_h = max_h + label_height + 2 * padding
+
+    # Metadata panel spans all columns to the right of Source
+    span_cols = max(n_cols - 1, 1)
+    meta_w = span_cols * cell_w - 2 * padding
+    meta_panel = _make_metadata_panel(metadata, meta_w, max_h, font)
 
     montage_w = n_cols * cell_w
     montage_h = n_rows * cell_h
@@ -813,6 +814,17 @@ def _make_benchmark_montage(
             tx = x0 + (max_w - tw) // 2
             ty = y0 + max_h + padding
             draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
+
+    # Paste wide metadata panel at row 0, starting at column 1
+    meta_x = cell_w + padding
+    meta_y = padding
+    montage.paste(meta_panel, (meta_x, meta_y))
+    meta_label = "PSF Parameters"
+    bbox = draw.textbbox((0, 0), meta_label, font=font)
+    tw = bbox[2] - bbox[0]
+    tx = meta_x + (meta_w - tw) // 2
+    ty = meta_y + max_h + padding
+    draw.text((tx, ty), meta_label, fill=(255, 255, 255), font=font)
 
     montage_path = out_dir / f"decon_benchmark_{stem}.png"
     montage.save(str(montage_path))
@@ -934,14 +946,15 @@ def _make_per_channel_montages(
         max_w = max(img.size[0] for img in all_imgs)
         max_h = max(img.size[1] for img in all_imgs)
 
-        # Insert metadata panel next to Source in row 0
-        meta_panel = _make_metadata_panel(metadata, max_w, max_h, font)
-        panel_rows[0].insert(1, (meta_panel, "PSF Parameters"))
-
         n_cols = max(len(row) for row in panel_rows)
         n_grid_rows = len(panel_rows)
         cell_w = max_w + 2 * padding
         cell_h = max_h + label_height + 2 * padding
+
+        # Metadata panel spans all columns to the right of Source
+        span_cols = max(n_cols - 1, 1)
+        meta_w = span_cols * cell_w - 2 * padding
+        meta_panel = _make_metadata_panel(metadata, meta_w, max_h, font)
 
         montage_w = n_cols * cell_w
         montage_h = n_grid_rows * cell_h
@@ -961,6 +974,17 @@ def _make_per_channel_montages(
                 tx = x0 + (max_w - tw) // 2
                 ty = y0 + max_h + padding
                 draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
+
+        # Paste wide metadata panel at row 0, starting at column 1
+        meta_x = cell_w + padding
+        meta_y = padding
+        montage.paste(meta_panel, (meta_x, meta_y))
+        meta_label = "PSF Parameters"
+        bbox = draw.textbbox((0, 0), meta_label, font=font)
+        tw = bbox[2] - bbox[0]
+        tx = meta_x + (meta_w - tw) // 2
+        ty = meta_y + max_h + padding
+        draw.text((tx, ty), meta_label, fill=(255, 255, 255), font=font)
 
         ch_path = out_dir / f"decon_benchmark_{stem}_ch{ch_idx}.png"
         montage.save(str(ch_path))
