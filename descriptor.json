@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image",
+  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image --log @log",
   "inputs": [
     {
       "id": "iterations",
@@ -228,6 +228,17 @@
       "name": "Benchmark one image",
       "description": "If true, benchmark only the first image (sorted by name) from the input folder. If false, benchmark all input images. Only used when Perform Benchmark is enabled.",
       "default-value": true,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "log",
+      "value-key": "@log",
+      "command-line-flag": "--log",
+      "name": "Save console log",
+      "description": "If true, save a copy of the console output to a .log file in the output folder.",
+      "default-value": false,
       "set-by-server": false,
       "optional": true,
       "type": "Boolean"

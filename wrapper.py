@@ -30,6 +30,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+
+class _TeeWriter:
+    """Duplicate writes to the original stream and a log file."""
+
+    def __init__(self, original, log_file):
+        self._original = original
+        self._log_file = log_file
+
+    def write(self, data):
+        self._original.write(data)
+        try:
+            self._log_file.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        self._original.flush()
+        try:
+            self._log_file.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -442,6 +467,22 @@ def main(argv):
         benchmark_mode = _to_bool(getattr(parameters, "benchmark", False))
         projection = str(getattr(parameters, "projection", "none")).lower()
         save_psf = _to_bool(getattr(parameters, "psf", False))
+        log_to_file = _to_bool(getattr(parameters, "log", False))
+
+        # Set up console-to-file tee if requested
+        _log_fh = None
+        if log_to_file:
+            log_path = Path(bj.output_dir) / "cideconvolve.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            _log_fh = open(log_path, "w", encoding="utf-8")
+            sys.stdout = _TeeWriter(sys.__stdout__, _log_fh)
+            sys.stderr = _TeeWriter(sys.__stderr__, _log_fh)
+            # Also send logging module output to the file
+            _file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+            _file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+            ))
+            logging.getLogger().addHandler(_file_handler)
 
         # Benchmark-specific parameters
         bench_iter_raw = str(getattr(parameters, "bench_iterations", "20, 40, 60"))
@@ -638,6 +679,13 @@ def main(argv):
         print(f"\n{'=' * 70}")
         print("CIDeconvolve workflow complete.")
         print(f"{'=' * 70}")
+
+        # Close log file tee if active
+        if _log_fh is not None:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            _log_fh.close()
+            print(f"Console log saved to: {Path(bj.output_dir) / 'cideconvolve.log'}")
 
         # Clean up tmp folder
         if tmp_path and Path(tmp_path).exists():
