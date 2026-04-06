@@ -571,7 +571,7 @@ class DeconvolveCIWindow(QMainWindow):
         tiling_group.setLayout(tl)
 
         self._tiling_combo = QComboBox()
-        self._tiling_combo.addItems(["none", "custom"])
+        self._tiling_combo.addItems(["custom", "none"])
         self._tiling_combo.currentTextChanged.connect(self._on_tiling_changed)
         tl.addRow("Tiling:", self._tiling_combo)
 

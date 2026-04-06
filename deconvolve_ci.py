@@ -406,7 +406,7 @@ def ci_rl_deconvolve(
     rel_threshold: float = 0.001,
     check_every: int = 5,
     device: Optional[str] = None,
-    tiling: str = "none",
+    tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
     max_tile_z: int = MAX_TILE_Z,
 ) -> dict[str, Any]:
