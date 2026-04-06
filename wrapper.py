@@ -168,54 +168,6 @@ def _format_bytes(mb):
     return f"{mb:.0f} MB"
 
 
-# ---------------------------------------------------------------------------
-# Quality metrics (no ground truth required)
-# ---------------------------------------------------------------------------
-def _compute_quality_metrics(source_channels, result_channels):
-    """Compute quality metrics comparing deconvolved result to source.
-
-    Returns dict with:
-        sharpening_ratio : Laplacian-variance ratio (>1 = sharper)
-        peak_ratio       : max(result) / max(source)
-        i_divergence     : mean I-divergence (Csiszár 1991) between source
-                           and result
-    """
-    import numpy as np
-    from scipy.ndimage import laplace
-
-    sharp_ratios = []
-    peak_ratios = []
-    i_divs = []
-
-    for src, res in zip(source_channels, result_channels):
-        src_f = src.astype(np.float64)
-        res_f = res.astype(np.float64)
-
-        # Sharpening ratio: Laplacian-variance ratio
-        var_src = np.var(laplace(src_f))
-        var_res = np.var(laplace(res_f))
-        if var_src > 0:
-            sharp_ratios.append(var_res / var_src)
-
-        # Peak ratio
-        max_src = np.max(src_f)
-        if max_src > 0:
-            peak_ratios.append(np.max(res_f) / max_src)
-
-        # I-divergence (generalised KL for Poisson data)
-        eps = 1e-12
-        obs = np.clip(src_f, eps, None)
-        est = np.clip(res_f, eps, None)
-        div = obs * np.log(obs / est) - obs + est
-        i_divs.append(float(np.mean(div)))
-
-    return {
-        "sharpening_ratio": float(np.mean(sharp_ratios)) if sharp_ratios else 0.0,
-        "peak_ratio": float(np.mean(peak_ratios)) if peak_ratios else 0.0,
-        "i_divergence": float(np.mean(i_divs)) if i_divs else 0.0,
-    }
-
-
 def _method_device(method: str) -> str:
     """Return the compute device label for a benchmark method."""
     _GPU_METHODS = {
@@ -866,12 +818,8 @@ def _make_benchmark_montage(
 
             met = all_metrics.get(metrics_key)
             if met is not None:
-                sharp = met.get('sharpening_ratio', 0.0)
-                idiv = met.get('i_divergence', 0.0)
-                pkr = met.get('peak_ratio', 0.0)
                 label = (f"{label_name}\n"
-                         f"{nit} iter  {met['time_s']:.1f}s\n"
-                         f"Sharp {sharp:.2f}x  Peak {pkr:.1f}x  I-div {idiv:.4f}")
+                         f"{nit} iter  {met['time_s']:.1f}s")
             else:
                 label = f"{label_name}\n{nit} iter"
             row.append((out_dir / fname, label))
@@ -994,12 +942,8 @@ def _make_per_channel_montages(
 
             met = all_metrics.get(metrics_key)
             if met is not None:
-                sharp = met.get('sharpening_ratio', 0.0)
-                idiv = met.get('i_divergence', 0.0)
-                pkr = met.get('peak_ratio', 0.0)
                 label = (f"{label_name}\n"
-                         f"{nit} iter  {met['time_s']:.1f}s\n"
-                         f"Sharp {sharp:.2f}x  Peak {pkr:.1f}x  I-div {idiv:.4f}")
+                         f"{nit} iter  {met['time_s']:.1f}s")
             else:
                 label = f"{label_name}\n{nit} iter"
             row.append((label, out_dir / fname))
@@ -1105,17 +1049,14 @@ def _write_metrics_csv(csv_path: Path, all_metrics: dict[str, dict]):
         "gpu_total_mb", "gpu_mem_peak_mb", "gpu_mem_percent", "gpu_mem_avg_mb", "gpu_mem_delta_peak_mb",
         "torch_gpu_peak_mb", "torch_gpu_delta_mb",
         "gpu_spill_mb",
-        "sharpening_ratio", "peak_ratio", "i_divergence",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        _quality_fields = {"sharpening_ratio", "peak_ratio", "i_divergence"}
         for label, m in sorted(all_metrics.items()):
             row = {"label": label, "device": m.get("device", "")}
             for k in fieldnames[2:]:
-                fmt = ".6f" if k in _quality_fields else ".2f"
-                row[k] = f"{m.get(k, 0.0):{fmt}}"
+                row[k] = f"{m.get(k, 0.0):.2f}"
             writer.writerow(row)
     print(f"\n  Metrics CSV saved -> {csv_path}")
 
@@ -1312,16 +1253,12 @@ def _run_benchmark(
                     save_result(result, str(out_file), mip_only=True)
                     metrics = monitor.stop()
                     metrics["device"] = dev_val.upper()
-                    qm = _compute_quality_metrics(result["source_channels"], result["channels"])
-                    metrics.update(qm)
                     key = f"{m}_{dev_val}_{nit}i"
                     all_metrics[key] = metrics
                     gpu_d = metrics['torch_gpu_delta_mb']
                     print(f"    {dev_val}: {metrics['time_s']:.1f}s"
                           f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
                           f"  Alloc d{_format_bytes(gpu_d)}"
-                          f"  Sharp {qm['sharpening_ratio']:.2f}x"
-                          f"  I-div {qm['i_divergence']:.4f}"
                           f" -> {out_name}")
                     del result
                 else:
@@ -1337,14 +1274,10 @@ def _run_benchmark(
                     save_result(result, str(out_file), mip_only=True)
                     metrics = monitor.stop()
                     metrics["device"] = _method_device(m)
-                    qm = _compute_quality_metrics(result["source_channels"], result["channels"])
-                    metrics.update(qm)
                     all_metrics[label] = metrics
                     print(f"    {metrics['time_s']:.1f}s"
                           f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
                           f"  Alloc d{_format_bytes(metrics['gpu_mem_delta_peak_mb'])}"
-                          f"  Sharp {qm['sharpening_ratio']:.2f}x"
-                          f"  I-div {qm['i_divergence']:.4f}"
                           f" -> {out_name}")
                     del result
 
@@ -1384,8 +1317,7 @@ def _run_benchmark(
     if all_metrics:
         hdr = (f"  {'Method':<35} {'Device':>6} {'Time':>7} {'CPU%':>6}"
                f" {'RAM tot':>8} {'RAM pk':>8} {'RAM%':>5} {'RAM Δ':>8}"
-               f" {'GPU%':>6} {'VRAM tot':>9} {'VRAM pk':>8} {'VRAM%':>5} {'Alloc Δ':>8} {'Spill':>8}"
-               f" {'Sharp':>7} {'Peak':>6} {'I-div':>8}")
+               f" {'GPU%':>6} {'VRAM tot':>9} {'VRAM pk':>8} {'VRAM%':>5} {'Alloc Δ':>8} {'Spill':>8}")
         sep = f"  {'─' * len(hdr.strip())}"
         print(f"\n{sep}")
         print(f"  Benchmark metrics summary:")
@@ -1399,9 +1331,6 @@ def _run_benchmark(
             spill_str = _format_bytes(spill) if spill > 0 else "—"
             ram_pct = m.get('ram_percent', 0.0)
             gpu_pct = m.get('gpu_mem_percent', 0.0)
-            sharp = m.get('sharpening_ratio', 0.0)
-            pkr = m.get('peak_ratio', 0.0)
-            idiv = m.get('i_divergence', 0.0)
             print(f"  {label:<35} {m.get('device', '?'):>6}"
                   f" {m['time_s']:>6.1f}s"
                   f" {m['cpu_percent_avg']:>5.0f}%"
@@ -1414,10 +1343,7 @@ def _run_benchmark(
                   f" {_format_bytes(m['gpu_mem_peak_mb']):>8}"
                   f" {gpu_pct:>4.0f}%"
                   f" {_format_bytes(gpu_delta):>8}"
-                  f" {spill_str:>8}"
-                  f" {sharp:>6.2f}x"
-                  f" {pkr:>5.1f}x"
-                  f" {idiv:>8.4f}")
+                  f" {spill_str:>8}")
         print(f"{sep}")
 
     # --- CSV export ---
