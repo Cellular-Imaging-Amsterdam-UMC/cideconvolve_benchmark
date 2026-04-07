@@ -326,7 +326,7 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
    [doi:10.1109/TIP.2013.2291324](https://doi.org/10.1109/TIP.2013.2291324)
 
 4. <a id="ref4"></a>Bertero, M. & Boccacci, P. (2005). "A simple method for the reduction of boundary effects in the Richardson-Lucy approach to image deconvolution." *A&A* 437:369–374.\
-   [doi:10.1051/0004-6361:20042231](https://doi.org/10.1051/0004-6361:20042231)
+   [doi:10.1051/0004-6361:20052717](https://doi.org/10.1051/0004-6361:20052717)
 
 5. <a id="ref5"></a>Dey, N. et al. (2006). "Richardson-Lucy algorithm with total variation regularization for 3D confocal microscope deconvolution." *Microscopy Research and Technique* 69(4):260–266.\
    [doi:10.1002/jemt.20294](https://doi.org/10.1002/jemt.20294)
@@ -341,8 +341,8 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 8. <a id="ref8"></a>Gibson, S.F. & Lanni, F. (1991). "Experimental test of an analytical model of aberration in an oil-immersion objective lens used in three-dimensional light microscopy." *JOSA A* 8(10):1601–1613.\
    [doi:10.1364/JOSAA.8.001601](https://doi.org/10.1364/JOSAA.8.001601)
 
-9. <a id="ref9"></a>Aguet, F. (2009). "Super-Resolution Fluorescence Microscopy Based on Physical Models." *EPFL Thesis* no. 4555.\
-   [doi:10.5075/epfl-thesis-4555](https://doi.org/10.5075/epfl-thesis-4555)
+9. <a id="ref9"></a>Aguet, F. (2009). "Super-Resolution Fluorescence Microscopy Based on Physical Models." *EPFL Thesis* no. 4418.\
+   [doi:10.5075/epfl-thesis-4418](https://doi.org/10.5075/epfl-thesis-4418)
 
 10. <a id="ref10"></a>Csiszár, I. (1991). "Why least squares and maximum entropy? An axiomatic approach to inference for linear inverse problems." *Annals of Statistics* 19(4):2032–2066.\
     [doi:10.1214/aos/1176348385](https://doi.org/10.1214/aos/1176348385)
@@ -352,6 +352,9 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 
 12. <a id="ref12"></a>Conchello, J.-A. (1998). "Superresolution and convergence properties of the expectation-maximization algorithm for maximum-likelihood deconvolution of incoherent images." *JOSA A* 15(10):2609–2619.\
     [doi:10.1364/JOSAA.15.002609](https://doi.org/10.1364/JOSAA.15.002609)
+
+13. <a id="ref13"></a>Sage, D., Donati, L., Soulez, F., Fortun, D., Schmit, G., Seitz, A., Guiet, R., Vonesch, C. & Unser, M. (2017). "DeconvolutionLab2: An Open-Source Software for Deconvolution Microscopy." *Methods* 115:28–41.\
+    [doi:10.1016/j.ymeth.2016.12.015](https://doi.org/10.1016/j.ymeth.2016.12.015)
 
 ### Source Code Repositories
 
