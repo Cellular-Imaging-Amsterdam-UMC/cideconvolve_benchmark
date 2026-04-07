@@ -2,11 +2,11 @@
 
 ## Overview
 
-`deconvolve_ci.py` is a new, original PyTorch GPU-accelerated deconvolution and PSF generation
+`deconvolve_ci.py` is a PyTorch GPU-accelerated deconvolution and PSF generation
 module for CIDeconvolve. It combines the best mathematical ideas from multiple state-of-the-art
 implementations into a single, cohesive, fast engine.
 
-**New methods added**: `ci_rl` (accelerated RL) and `ci_rl_tv` (accelerated RL with Total Variation)
+**Methods**: `ci_rl` (accelerated RL) and `ci_rl_tv` (accelerated RL with Total Variation)
 
 ---
 
@@ -15,7 +15,7 @@ implementations into a single, cohesive, fast engine.
 ### `ci_rl` — Scaled Heavy Ball Accelerated Richardson-Lucy
 
 Standard Richardson-Lucy deconvolution enhanced with **Scaled Heavy Ball (SHB) momentum
-acceleration** (Wang & Miller 2014, IEEE TIP). The SHB technique applies Nesterov-style
+acceleration** ([Wang & Miller 2014](#ref3)). The SHB technique applies Nesterov-style
 momentum to the RL multiplicative update, achieving 5-10× faster convergence at no extra
 per-iteration cost.
 
@@ -50,7 +50,7 @@ Same as `ci_rl` but with an additional **Total Variation (TV) penalty** applied 
 RL update. TV regularization suppresses noise amplification (a well-known RL pathology at
 high iteration counts) while preserving edges.
 
-**TV factor computation** (following DeconvolutionLab2 RLTV):
+**TV factor computation** (following DeconvolutionLab2 RLTV, [Dey et al. 2006](#ref5)):
 
 1. Forward differences: ∇x, ∇y, ∇z
 2. Gradient magnitude: |∇| = √(gx² + gy² + gz² + ε)
@@ -62,13 +62,11 @@ Applied multiplicatively: x_{k+1} = x_{k+1} · tv(x_k)
 
 ---
 
-## Enhancements over Existing Methods
-
 ### 1. Scaled Heavy Ball Momentum Acceleration
-**Source**: deconwolf `method_shb.c` (Wernersson et al., Nature Methods 2024), based on
-Wang & Miller 2014 (IEEE Trans. Image Processing).
+**Source**: deconwolf [`method_shb.c`](https://github.com/elgw/deconwolf/blob/master/src/method_shb.c) ([Wernersson et al. 2024](#ref6)), based on
+[Wang & Miller 2014](#ref3).
 
-**What it does**: Adds a momentum term to RL that automatically accelerates convergence.
+**What it does**: Adds a momentum term to RL ([Richardson 1972](#ref1); [Lucy 1974](#ref2)) that automatically accelerates convergence.
 The acceleration factor α_k starts near 0 and grows toward 1, with an upper bound that
 guarantees convergence. This is the same mathematical framework as Nesterov's accelerated
 gradient descent, adapted for the multiplicative RL update.
@@ -77,7 +75,7 @@ gradient descent, adapted for the multiplicative RL update.
 SHB-RL typically matches 200-500 iterations of standard RL.
 
 ### 2. Bertero Boundary Weights
-**Source**: deconwolf `method_shb.c`, based on Bertero & Boccacci 2005.
+**Source**: deconwolf [`method_shb.c`](https://github.com/elgw/deconwolf/blob/master/src/method_shb.c), based on [Bertero & Boccacci 2005](#ref4).
 
 **What it does**: Instead of reflection padding (used by sdeconv) or zero-padding with
 no correction (DeconvolutionLab2), Bertero weights correct for the incomplete PSF energy
@@ -93,7 +91,7 @@ where values below threshold σ are zeroed.
 principled than reflection padding, which can introduce gradient discontinuities.
 
 ### 3. I-Divergence Convergence Monitoring
-**Source**: deconwolf, based on Csiszár 1991.
+**Source**: deconwolf, based on [Csiszár 1991](#ref10).
 
 **What it does**: Monitors the I-divergence (generalized Kullback-Leibler divergence):
 
@@ -109,7 +107,7 @@ for Poisson statistics). When I-divergence plateaus, further iterations are ampl
 - `convergence="auto"`: Stop when relative I-divergence change < `rel_threshold`
 
 ### 4. Total Variation Regularization
-**Source**: DeconvolutionLab2 `RichardsonLucyTV.java`, Dey et al. 2006.
+**Source**: DeconvolutionLab2 [`RichardsonLucyTV.java`](https://github.com/Biomedical-Imaging-Group/DeconvolutionLab2/blob/master/src/main/java/deconvolution/algorithm/RichardsonLucyTV.java), [Dey et al. 2006](#ref5).
 
 **What it does**: Applies a TV penalty as a multiplicative correction after each RL step.
 TV penalizes the total gradient magnitude, promoting piecewise-constant reconstructions
@@ -130,6 +128,58 @@ Can be overridden with `background=<float>` or disabled with `background=0`.
 Hermitian symmetry of real-valued data to store only half the complex spectrum. This
 halves the memory cost of all frequency-domain buffers compared to sdeconv's `torch.fft.fftn`.
 
+### 7. Noise-Gated Damping
+**Source**: [Laasmaa et al. 2011](#ref11); [Conchello 1998](#ref12).
+
+**What it does**: Attenuates the RL update in background (noisy) regions while leaving
+bright structures untouched. The multiplicative correction factor is raised to a per-voxel
+power γ ∈ (0, 1]:
+
+```
+correction_damped = correction ^ γ(x)
+γ(x) = 1 − exp(−(x − bg) / (damping · σ))
+```
+
+Where:
+- `x` is the current estimate at each voxel
+- `bg` is the estimated background level
+- `σ` is the noise standard deviation (estimated via MAD of the lowest 25% of voxels)
+- `damping` is the user-controlled strength parameter
+
+Pixels near the background floor are heavily damped (γ → 0, correction → 1, i.e. no
+change) while bright signal regions get the full RL update (γ → 1). The noise σ is
+estimated once using a robust MAD estimator: σ ≈ 1.4826 · median(|x − median(x)|)
+computed on the lowest quartile of voxels.
+
+**Modes**:
+- `damping=0` — disabled (default)
+- `damping="auto"` — automatic strength of 3.0
+- `damping=<float>` — manual strength (typical range: 1.0–10.0)
+
+### 8. XY Tiling (Large Image Support)
+**What it does**: Splits large images into overlapping XY tiles that are deconvolved
+independently and stitched back together. This allows processing images that are too
+large to fit in GPU memory as a single volume.
+
+**How it works**:
+1. The image is divided into a grid of tiles (`ny × nx`) in the YX plane
+2. Each tile is extracted with an overlap margin (default 16 pixels) on each side
+3. Each tile is deconvolved independently (including PSF generation, background
+   estimation, and full RL iteration)
+4. Results are stitched by taking only the core (non-overlap) region of each tile
+
+The overlap margin prevents boundary artefacts at tile edges. The tile grid is chosen
+to minimise the aspect ratio of individual tiles.
+
+**Modes**:
+- `tiling="none"` — no tiling, process the full image at once
+- `tiling="custom"` — automatic tiling based on `max_tile_xy` and `max_tile_z`
+  (default: 512 × 512 × 64)
+
+**Parameters**:
+- `max_tile_xy` (int, default 512): Maximum tile size in the XY dimensions
+- `max_tile_z` (int, default 64): Maximum tile size in the Z dimension
+
 ---
 
 ## PSF Generation
@@ -137,8 +187,8 @@ halves the memory cost of all frequency-domain buffers compared to sdeconv's `to
 ### `ci_generate_psf` — Vectorial/Scalar PSF with Gibson-Lanni Correction
 
 Generates a physically accurate Point Spread Function using either the **vectorial
-Richards-Wolf** model (for high-NA objectives, NA ≥ 0.9) or the **scalar Kirchhoff**
-model (for lower NA), with **Gibson-Lanni refractive index mismatch correction**.
+Richards-Wolf** model ([Richards & Wolf 1959](#ref7), for high-NA objectives, NA ≥ 0.9) or the **scalar Kirchhoff**
+model (for lower NA), with **Gibson-Lanni refractive index mismatch correction** ([Gibson & Lanni 1991](#ref8)).
 
 ### PSF Models
 
@@ -159,7 +209,7 @@ PSF(ρ,z) = |I|²
 ```
 
 ### Gibson-Lanni Aberration
-Optical path difference accounting for refractive index mismatches:
+Optical path difference accounting for refractive index mismatches ([Gibson & Lanni 1991](#ref8); [Aguet 2009](#ref9)):
 ```
 W(θ) = z_p · √(n_s² − NA²sin²θ)
       + t_i · √(n_i² − NA²sin²θ)
@@ -199,7 +249,7 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | Framework | PyTorch | Native CUDA GPU support, automatic differentiation available, widely installed in scientific Python |
 | FFT type | `rfftn`/`irfftn` | 2× memory savings over full complex FFT for real data |
 | Padding | Full (image+PSF-1) | Best quality (Bertero bq=2 equivalent); combined with boundary weights eliminates need for reflection padding |
-| Acceleration | SHB momentum | Proven convergence guarantees (Wang 2014), no extra FFTs per iteration, 5-10× speedup |
+| Acceleration | SHB momentum | Proven convergence guarantees ([Wang 2014](#ref3)), no extra FFTs per iteration, 5-10× speedup |
 | Boundary handling | Bertero weights | Mathematically rigorous, superior to reflection/zero padding |
 | Convergence metric | I-divergence | Natural for Poisson noise model underlying RL |
 | Regularization | TV (optional) | Well-understood, preserves edges, single parameter |
@@ -207,6 +257,8 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | PSF Aberration | Gibson-Lanni | Accounts for real-world RI mismatches; critical for accurate PSF at depth |
 | Pixel integration | Sub-pixel grid | Measurable accuracy gain, optional for speed |
 | Background | Auto-estimate | Mode of lowest 10% voxels — robust to outliers and signal |
+| Damping | Noise-gated (optional) | Per-voxel γ attenuates background noise; single parameter, auto mode available |
+| Tiling | XY overlap-stitch | Process arbitrarily large images within GPU memory; 16 px overlap removes boundary artefacts |
 | dtype | float32 (GPU) / float64 (CPU) | Optimal throughput on GPU; CPU can afford double precision |
 
 ---
@@ -222,11 +274,15 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 | `psf` | ndarray | required | Point Spread Function (same dimensionality as image) |
 | `niter` | int | 50 | Maximum number of iterations |
 | `tv_lambda` | float | 0.0 | TV regularization strength (0 = disabled) |
+| `damping` | str/float | 0.0 | Noise-gated damping: `0` (disabled), `"auto"` (strength 3.0), or float > 0 |
 | `background` | str/float | "auto" | Background level: "auto", float, or 0 |
-| `convergence` | str | "fixed" | "fixed" (exact niter) or "auto" (I-divergence stop) |
-| `rel_threshold` | float | 0.001 | Relative I-divergence change threshold for auto-stop |
+| `convergence` | str | "auto" | "fixed" (exact niter) or "auto" (I-divergence stop) |
+| `rel_threshold` | float | 0.005 | Relative I-divergence change threshold for auto-stop |
 | `check_every` | int | 5 | Check convergence every N iterations |
 | `device` | str/None | None | PyTorch device ("cuda", "cpu", or None=auto) |
+| `tiling` | str | "custom" | Tiling mode: "none" or "custom" (auto tile to fit GPU) |
+| `max_tile_xy` | int | 512 | Maximum tile size in XY (pixels) when tiling="custom" |
+| `max_tile_z` | int | 64 | Maximum tile size in Z (slices) when tiling="custom" |
 
 **Returns**: dict with keys:
 - `"result"` — deconvolved image as numpy ndarray (same shape as input)
@@ -260,16 +316,62 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 
 ## References
 
-1. Richardson, W.H. (1972). "Bayesian-based iterative method of image restoration." *JOSA* 62(1):55–59.
-2. Lucy, L.B. (1974). "An iterative technique for the rectification of observed distributions." *AJ* 79:745.
-3. Wang, C. & Miller, E.L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* 23(2):848–854.
-4. Bertero, M. & Boccacci, P. (2005). "A simple method for the reduction of boundary effects in the Richardson-Lucy approach to image deconvolution." *A&A* 437:369–374.
-5. Dey, N. et al. (2006). "Richardson-Lucy algorithm with total variation regularization for 3D confocal microscope deconvolution." *Microscopy Research and Technique* 69(4):260–266.
-6. Wernersson, E. et al. (2024). "deconwolf — Large-scale GPU deconvolution." *Nature Methods*.
-7. Richards, B. & Wolf, E. (1959). "Electromagnetic diffraction in optical systems, II." *Proc. Royal Society A* 253:358–379.
-8. Gibson, S.F. & Lanni, F. (1991). "Experimental test of an analytical model of aberration in an oil-immersion objective lens used in three-dimensional light microscopy." *JOSA A* 8(10):1601–1613.
-9. Aguet, F. (2009). "Super-Resolution Fluorescence Microscopy Based on Physical Models." *EPFL Thesis*.
-10. Csiszár, I. (1991). "Why least squares and maximum entropy? An axiomatic approach to inference for linear inverse problems." *Annals of Statistics* 19(4):2032–2066.
+<a id="ref1"></a>
+1. Richardson, W.H. (1972). "Bayesian-based iterative method of image restoration." *JOSA* 62(1):55–59.\
+   [doi:10.1364/JOSA.62.000055](https://doi.org/10.1364/JOSA.62.000055)
+
+<a id="ref2"></a>
+2. Lucy, L.B. (1974). "An iterative technique for the rectification of observed distributions." *AJ* 79:745.\
+   [doi:10.1086/111605](https://doi.org/10.1086/111605)
+
+<a id="ref3"></a>
+3. Wang, C. & Miller, E.L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* 23(2):848–854.\
+   [doi:10.1109/TIP.2013.2291324](https://doi.org/10.1109/TIP.2013.2291324)
+
+<a id="ref4"></a>
+4. Bertero, M. & Boccacci, P. (2005). "A simple method for the reduction of boundary effects in the Richardson-Lucy approach to image deconvolution." *A&A* 437:369–374.\
+   [doi:10.1051/0004-6361:20042231](https://doi.org/10.1051/0004-6361:20042231)
+
+<a id="ref5"></a>
+5. Dey, N. et al. (2006). "Richardson-Lucy algorithm with total variation regularization for 3D confocal microscope deconvolution." *Microscopy Research and Technique* 69(4):260–266.\
+   [doi:10.1002/jemt.20294](https://doi.org/10.1002/jemt.20294)
+
+<a id="ref6"></a>
+6. Wernersson, E. et al. (2024). "Deconwolf enables high-performance deconvolution of widefield fluorescence microscopy images." *Nature Methods* 21(7):1245–1256.\
+   [doi:10.1038/s41592-024-02294-7](https://doi.org/10.1038/s41592-024-02294-7) ·
+   Source code: [github.com/elgw/deconwolf](https://github.com/elgw/deconwolf)
+
+<a id="ref7"></a>
+7. Richards, B. & Wolf, E. (1959). "Electromagnetic diffraction in optical systems, II." *Proc. Royal Society A* 253:358–379.\
+   [doi:10.1098/rspa.1959.0200](https://doi.org/10.1098/rspa.1959.0200)
+
+<a id="ref8"></a>
+8. Gibson, S.F. & Lanni, F. (1991). "Experimental test of an analytical model of aberration in an oil-immersion objective lens used in three-dimensional light microscopy." *JOSA A* 8(10):1601–1613.\
+   [doi:10.1364/JOSAA.8.001601](https://doi.org/10.1364/JOSAA.8.001601)
+
+<a id="ref9"></a>
+9. Aguet, F. (2009). "Super-Resolution Fluorescence Microscopy Based on Physical Models." *EPFL Thesis* no. 4555.\
+   [doi:10.5075/epfl-thesis-4555](https://doi.org/10.5075/epfl-thesis-4555)
+
+<a id="ref10"></a>
+10. Csiszár, I. (1991). "Why least squares and maximum entropy? An axiomatic approach to inference for linear inverse problems." *Annals of Statistics* 19(4):2032–2066.\
+    [doi:10.1214/aos/1176348385](https://doi.org/10.1214/aos/1176348385)
+
+<a id="ref11"></a>
+11. Laasmaa, M. et al. (2011). "Application of regularized Richardson-Lucy algorithm for deconvolution of confocal microscopy images." *Journal of Microscopy* 243(2):124–140.\
+    [doi:10.1111/j.1365-2818.2011.03486.x](https://doi.org/10.1111/j.1365-2818.2011.03486.x)
+
+<a id="ref12"></a>
+12. Conchello, J.-A. (1998). "Superresolution and convergence properties of the expectation-maximization algorithm for maximum-likelihood deconvolution of incoherent images." *JOSA A* 15(10):2609–2619.\
+    [doi:10.1364/JOSAA.15.002609](https://doi.org/10.1364/JOSAA.15.002609)
+
+### Source Code Repositories
+
+| Project | Repository |
+|---------|------------|
+| deconwolf | [github.com/elgw/deconwolf](https://github.com/elgw/deconwolf) |
+| DeconvolutionLab2 | [github.com/Biomedical-Imaging-Group/DeconvolutionLab2](https://github.com/Biomedical-Imaging-Group/DeconvolutionLab2) |
+| sdeconv | [github.com/sylvainprigent/sdeconv](https://github.com/sylvainprigent/sdeconv) |
 
 ---
 
@@ -287,6 +389,12 @@ deconvolve_ci.py
 ├── ci_rl_deconvolve()             — public deconvolution
 │   ├── _prepare_otf()             — PSF → OTF with padding
 │   ├── _bertero_weights()         — boundary correction
+│   ├── _estimate_noise_sigma()    — MAD-based noise σ (lowest 25%)
+│   ├── _damping_map()             — per-voxel γ for noise-gated damping
+│   ├── _resolve_tiling()          — tiling mode → tile count
+│   ├── _ci_deconvolve_tiled()     — tiled deconvolution dispatcher
+│   │   ├── _compute_tile_grid()   — optimal ny×nx layout
+│   │   └── _compute_tile_slices() — tile extents with overlap
 │   ├── _shb_rl_loop()            — main iteration loop
 │   │   ├── _rl_update()          — single RL step on momentum point
 │   │   └── _tv_penalty()         — optional TV correction

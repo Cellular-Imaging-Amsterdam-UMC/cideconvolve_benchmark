@@ -12,8 +12,12 @@ Usage:
 
 from __future__ import annotations
 
+import gc
+import json
 import logging
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -36,6 +40,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
@@ -61,6 +66,15 @@ log = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ICON_PATH = SCRIPT_DIR / "icon.svg"
+LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
+
+def _default_settings_dir() -> str:
+    """Return Documents folder (Windows) or HOME (Linux) as default dir."""
+    if sys.platform == "win32":
+        docs = Path.home() / "Documents"
+        if docs.is_dir():
+            return str(docs)
+    return str(Path.home())
 
 # ---------------------------------------------------------------------------
 # Channel colour helpers (same scheme as deconvolve.save_mip_png)
@@ -225,17 +239,20 @@ class ZoomableImageView(QGraphicsView):
 # ---------------------------------------------------------------------------
 
 def _composite_to_pixmap(
-    slices: list[tuple[np.ndarray, tuple[int, int, int]]],
+    slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]],
     width: int = 0,
 ) -> QPixmap:
-    """Build an RGB composite from (2-D array, colour) pairs → QPixmap."""
+    """Build an RGB composite from (2-D array, colour, (lo, hi)) triples → QPixmap.
+
+    The (lo, hi) pair should be the global min/max across the full 3-D
+    volume so that contrast is consistent across Z-slices.
+    """
     if not slices:
         return QPixmap()
     h, w_ = slices[0][0].shape
     canvas = np.zeros((h, w_, 3), dtype=np.float64)
-    for arr, rgb in slices:
+    for arr, rgb, (lo, hi) in slices:
         ch_img = arr.astype(np.float64)
-        lo, hi = float(ch_img.min()), float(ch_img.max())
         if hi - lo > 0:
             ch_img = (ch_img - lo) / (hi - lo)
         else:
@@ -405,6 +422,330 @@ def _load_image(path_str: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Live resource monitor (CPU / RAM / GPU / VRAM)
+# ---------------------------------------------------------------------------
+
+class _ResourceMonitor(QThread):
+    """Background QThread that polls CPU/RAM/GPU metrics every 500 ms.
+
+    Emits ``metrics_updated`` with a dict containing:
+        cpu_pct, ram_used_gb, ram_total_gb, ram_swap_gb,
+        gpu_pct, vram_used_gb, vram_total_gb, vram_spill_gb, has_gpu
+    """
+
+    metrics_updated = pyqtSignal(dict)
+    _POLL_S = 0.5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = threading.Event()
+
+        # psutil
+        self._psutil = None
+        self._proc = None
+        try:
+            import psutil as _ps
+            self._psutil = _ps
+            self._proc = _ps.Process()
+        except ImportError:
+            pass
+
+        # pynvml
+        self._pynvml = None
+        self._nvml_handle = None
+        try:
+            import pynvml as _nv
+            _nv.nvmlInit()
+            self._nvml_handle = _nv.nvmlDeviceGetHandleByIndex(0)
+            self._pynvml = _nv
+        except Exception:
+            pass
+
+        # nvidia-smi fallback for GPU utilisation on Windows
+        import shutil
+        self._nvsmi = shutil.which("nvidia-smi")
+
+        # torch GPU available?
+        self._torch_cuda = False
+        try:
+            import torch
+            self._torch_cuda = torch.cuda.is_available()
+        except Exception:
+            pass
+
+    def run(self):
+        self._stop.clear()
+        # Prime cpu_percent (first call always returns 0)
+        if self._proc:
+            try:
+                self._proc.cpu_percent()
+            except Exception:
+                pass
+        while not self._stop.is_set():
+            self.metrics_updated.emit(self._poll())
+            self._stop.wait(self._POLL_S)
+
+    def _poll(self) -> dict:
+        m: dict = {
+            "cpu_pct": 0.0,
+            "ram_used_gb": 0.0,
+            "ram_total_gb": 0.0,
+            "ram_swap_gb": 0.0,
+            "ram_swap_total_gb": 0.0,
+            "gpu_pct": 0.0,
+            "vram_used_gb": 0.0,
+            "vram_total_gb": 0.0,
+            "vram_spill_gb": 0.0,
+            "has_gpu": False,
+        }
+        if self._psutil:
+            try:
+                # System-wide RAM (more meaningful than process RSS)
+                vm = self._psutil.virtual_memory()
+                m["ram_used_gb"] = vm.used / (1024 ** 3)
+                m["ram_total_gb"] = vm.total / (1024 ** 3)
+                # Swap / pagefile
+                sw = self._psutil.swap_memory()
+                m["ram_swap_gb"] = sw.used / (1024 ** 3)
+                m["ram_swap_total_gb"] = sw.total / (1024 ** 3)
+            except Exception:
+                pass
+            if self._proc:
+                try:
+                    m["cpu_pct"] = self._proc.cpu_percent()
+                except Exception:
+                    pass
+        # --- GPU utilisation & VRAM ---
+        gpu_pct_set = False
+
+        # 1) Try pynvml (most reliable when available)
+        if self._nvml_handle:
+            try:
+                util = self._pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                m["gpu_pct"] = float(util.gpu)
+                gpu_pct_set = True
+                mi = self._pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                m["vram_used_gb"] = mi.used / (1024 ** 3)
+                m["vram_total_gb"] = mi.total / (1024 ** 3)
+                m["has_gpu"] = True
+            except Exception:
+                pass
+
+        # 2) nvidia-smi subprocess fallback for GPU % (works on Windows
+        #    even when pynvml fails to report utilisation)
+        if not gpu_pct_set and self._nvsmi:
+            try:
+                import subprocess
+                out = subprocess.check_output(
+                    [self._nvsmi,
+                     "--query-gpu=utilization.gpu,memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    timeout=2,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                parts = out.decode().strip().split(",")
+                if len(parts) >= 3:
+                    m["gpu_pct"] = float(parts[0].strip())
+                    gpu_pct_set = True
+                    m["vram_used_gb"] = float(parts[1].strip()) / 1024
+                    m["vram_total_gb"] = float(parts[2].strip()) / 1024
+                    m["has_gpu"] = True
+            except Exception:
+                pass
+
+        # 3) torch.cuda fallback (VRAM only, no utilisation %)
+        if self._torch_cuda:
+            try:
+                import torch
+                if not m["has_gpu"]:
+                    m["has_gpu"] = True
+                    props = torch.cuda.get_device_properties(0)
+                    m["vram_total_gb"] = props.total_memory / (1024 ** 3)
+                    m["vram_used_gb"] = torch.cuda.memory_allocated() / (1024 ** 3)
+                if not gpu_pct_set:
+                    m["gpu_pct"] = -1.0  # sentinel: "unknown"
+
+                # VRAM spill: torch reserved memory exceeds physical VRAM
+                # (Windows spills into pagefile/shared GPU memory)
+                reserved_gb = torch.cuda.memory_reserved() / (1024 ** 3)
+                if m["vram_total_gb"] > 0 and reserved_gb > m["vram_total_gb"]:
+                    m["vram_spill_gb"] = reserved_gb - m["vram_total_gb"]
+            except Exception:
+                pass
+
+        return m
+
+    def request_stop(self):
+        """Signal the polling loop to stop and wait up to 2 s."""
+        self._stop.set()
+        self.wait(2000)
+
+
+# ---------------------------------------------------------------------------
+# Single-metric horizontal bar widget (label | progress | value text)
+# ---------------------------------------------------------------------------
+
+class _MetricWidget(QWidget):
+    """Compact bar displaying one resource metric."""
+
+    _COLORS = {"ok": "#4CAF50", "warn": "#FF9800", "crit": "#F44336"}
+
+    def __init__(self, label: str, bar_width: int = 80, val_width: int = 88, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(1, 0, 1, 0)
+        layout.setSpacing(2)
+
+        lbl = QLabel(label)
+        lbl.setFixedWidth(36)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        f = lbl.font()
+        f.setPointSize(8)
+        lbl.setFont(f)
+        layout.addWidget(lbl)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setFixedWidth(bar_width)
+        self._bar.setFixedHeight(13)
+        self._bar.setTextVisible(False)
+        self._bar.setStyleSheet(self._style("#4CAF50"))
+        layout.addWidget(self._bar)
+
+        self._val = QLabel("—")
+        self._val.setFixedWidth(val_width)
+        f2 = self._val.font()
+        f2.setPointSize(8)
+        self._val.setFont(f2)
+        layout.addWidget(self._val)
+
+    @staticmethod
+    def _style(color: str) -> str:
+        return (
+            f"QProgressBar {{ border: 1px solid #555; border-radius: 3px; "
+            f"background-color: #2a2a2a; }}"
+            f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}"
+        )
+
+    def set_value(self, pct: float, text: str):
+        self._bar.setValue(int(min(max(pct, 0), 100)))
+        self._val.setText(text)
+        color = (
+            self._COLORS["crit"] if pct >= 90
+            else self._COLORS["warn"] if pct >= 70
+            else self._COLORS["ok"]
+        )
+        self._bar.setStyleSheet(self._style(color))
+
+
+# ---------------------------------------------------------------------------
+# Composite status-bar panel showing all resource metrics
+# ---------------------------------------------------------------------------
+
+class ResourceMonitorBar(QWidget):
+    """Status-bar widget with live CPU / RAM / GPU / VRAM bars."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 1, 2, 1)
+        layout.setSpacing(2)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep)
+
+        self._cpu_bar = _MetricWidget("CPU", bar_width=70, val_width=44)
+        layout.addWidget(self._cpu_bar)
+
+        self._ram_bar = _MetricWidget("RAM", bar_width=70, val_width=100)
+        layout.addWidget(self._ram_bar)
+
+        self._swap_bar = _MetricWidget("SWAP", bar_width=50, val_width=58)
+        self._swap_bar.setToolTip("System swap / pagefile in use (RAM spillover)")
+        layout.addWidget(self._swap_bar)
+
+        # GPU / VRAM — always visible; show N/A when not available
+        self._gpu_bar = _MetricWidget("GPU", bar_width=70, val_width=44)
+        layout.addWidget(self._gpu_bar)
+
+        self._vram_bar = _MetricWidget("VRAM", bar_width=70, val_width=100)
+        layout.addWidget(self._vram_bar)
+
+        self._vspill_bar = _MetricWidget("SPILL", bar_width=50, val_width=58)
+        self._vspill_bar.setToolTip(
+            "VRAM spillover — GPU memory reserved by PyTorch that exceeds\n"
+            "physical VRAM (spills into system RAM / pagefile on Windows)"
+        )
+        layout.addWidget(self._vspill_bar)
+
+        self._dot = QLabel("●")
+        self._dot.setStyleSheet("color: #4CAF50; font-size: 9pt; padding: 0 2px;")
+        self._dot.setToolTip("Deconvolution running")
+        self._dot.setVisible(False)
+        layout.addWidget(self._dot)
+
+        self._has_gpu: bool = False
+
+    def update_metrics(self, m: dict):
+        """Slot — called from main thread via signal."""
+        # CPU
+        self._cpu_bar.set_value(m["cpu_pct"], f"{m['cpu_pct']:.0f}%")
+
+        # System RAM
+        if m["ram_total_gb"] > 0:
+            ram_pct = m["ram_used_gb"] / m["ram_total_gb"] * 100
+            self._ram_bar.set_value(
+                ram_pct,
+                f"{m['ram_used_gb']:.1f}/{m['ram_total_gb']:.0f} GB",
+            )
+
+        # RAM swap / pagefile (always visible)
+        swap = m.get("ram_swap_gb", 0.0)
+        swap_total = m.get("ram_swap_total_gb", 0.0)
+        if swap_total > 0:
+            swap_pct = swap / swap_total * 100
+            self._swap_bar.set_value(swap_pct, f"{swap:.1f} GB")
+        else:
+            self._swap_bar.set_value(0, f"{swap:.1f} GB")
+
+        # GPU / VRAM
+        has_gpu = bool(m.get("has_gpu"))
+        if has_gpu != self._has_gpu:
+            self._has_gpu = has_gpu
+        gpu_pct = m.get("gpu_pct", 0.0)
+        if has_gpu:
+            if gpu_pct < 0:
+                self._gpu_bar.set_value(0, "N/A %")
+            else:
+                self._gpu_bar.set_value(gpu_pct, f"{gpu_pct:.0f}%")
+            if m["vram_total_gb"] > 0:
+                vram_pct = m["vram_used_gb"] / m["vram_total_gb"] * 100
+                self._vram_bar.set_value(
+                    vram_pct,
+                    f"{m['vram_used_gb']:.1f}/{m['vram_total_gb']:.0f} GB",
+                )
+        else:
+            self._gpu_bar.set_value(0, "no GPU")
+            self._vram_bar.set_value(0, "no GPU")
+
+        # VRAM spill (always visible) — max is half system RAM on Windows
+        vspill = m.get("vram_spill_gb", 0.0)
+        spill_max = m.get("ram_total_gb", 0) / 2
+        if spill_max > 0:
+            spill_pct = min(vspill / spill_max * 100, 100)
+            self._vspill_bar.set_value(spill_pct, f"{vspill:.1f} GB")
+        else:
+            self._vspill_bar.set_value(0, f"{vspill:.1f} GB")
+
+    def set_active(self, active: bool):
+        """Show/hide the green activity dot (deconvolution running)."""
+        self._dot.setVisible(active)
+
+
+# ---------------------------------------------------------------------------
 # Worker thread for deconvolution
 # ---------------------------------------------------------------------------
 
@@ -444,6 +785,9 @@ class _DeconvolveWorker(QThread):
             p = self.params
 
             for ci, ch_data in enumerate(self.channels):
+                if self.isInterruptionRequested():
+                    self.finished.emit(RuntimeError("Stopped by user"))
+                    return
                 self.progress.emit(f"Processing channel {ci + 1}/{n_ch} …")
 
                 # Per-channel wavelengths from GUI
@@ -504,14 +848,32 @@ class _DeconvolveWorker(QThread):
                         start = (pz - iz) // 2
                         psf = psf[start : start + iz]
 
+                # Release any GPU memory used by PSF generation before decon
+                gc.collect()
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+                # Per-channel iteration count
+                niter_list = p["niter_list"]
+                niter = niter_list[ci] if ci < len(niter_list) else niter_list[-1]
+
+                if self.isInterruptionRequested():
+                    self.finished.emit(RuntimeError("Stopped by user"))
+                    return
+
                 self.progress.emit(
-                    f"  Deconvolving (ch {ci + 1}, {p['niter']} iter) …"
+                    f"  Deconvolving (ch {ci + 1}, {niter} iter) …"
                 )
                 out = ci_rl_deconvolve(
                     ch_data,
                     psf,
-                    niter=p["niter"],
+                    niter=niter,
                     tv_lambda=p["tv_lambda"],
+                    damping=p["damping"],
                     background=p["background"],
                     convergence=p["convergence"],
                     rel_threshold=p["rel_threshold"],
@@ -522,6 +884,20 @@ class _DeconvolveWorker(QThread):
                     max_tile_z=p["max_tile_z"],
                 )
                 results.append(out["result"].copy())
+
+                # ---- Release GPU and system memory for this channel ----
+                del psf
+                del out
+                gc.collect()
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                self.progress.emit(
+                    f"  Ch {ci + 1}/{n_ch} done — GPU/CPU memory released"
+                )
 
             self.finished.emit(results)
         except Exception as exc:
@@ -562,11 +938,22 @@ class DeconvolveCIWindow(QMainWindow):
         self._input_channels: list[np.ndarray] = []
         self._output_channels: list[np.ndarray] = []
         self._metadata: dict = {}
+        self._pct_cache: dict = {}  # (side, ch, pct_lo, pct_hi, mode) → (lo, hi)
         self._worker: Optional[_DeconvolveWorker] = None
+        self._monitor: Optional[_ResourceMonitor] = None
         self._input_path: Optional[Path] = None
+        self._last_open_dir: str = _default_settings_dir()
+        self._last_zarr_dir: str = _default_settings_dir()
+        self._last_save_dir: str = _default_settings_dir()
+        self._last_settings_dir: str = _default_settings_dir()
 
         self._build_ui()
         self._update_viewer()
+
+        # Start the resource monitor immediately and keep it running
+        self._monitor = _ResourceMonitor(parent=self)
+        self._monitor.metrics_updated.connect(self._monitor_bar.update_metrics)
+        self._monitor.start()
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -579,7 +966,6 @@ class DeconvolveCIWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter, stretch=1)
 
         # ---- Left: controls (scrollable) ----
         scroll = QScrollArea()
@@ -607,10 +993,12 @@ class DeconvolveCIWindow(QMainWindow):
         self._method_combo.currentTextChanged.connect(self._on_method_changed)
         ml.addRow("Method:", self._method_combo)
 
-        self._sp_niter = QSpinBox()
-        self._sp_niter.setRange(1, 10000)
-        self._sp_niter.setValue(50)
-        ml.addRow("Iterations:", self._sp_niter)
+        self._le_niter = QLineEdit("150")
+        self._le_niter.setToolTip(
+            "Iterations per channel, comma-separated.\n"
+            "E.g. '50' for all channels, or '50, 80' for ch1=50, ch2=80."
+        )
+        ml.addRow("Iterations:", self._le_niter)
 
         self._sp_tv_lambda = QDoubleSpinBox()
         self._sp_tv_lambda.setRange(0.0, 1.0)
@@ -632,6 +1020,19 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_bg_value.setValue(0.0)
         self._sp_bg_value.setEnabled(False)
         ml.addRow("BG value:", self._sp_bg_value)
+
+        self._damping_combo = QComboBox()
+        self._damping_combo.addItems(["none", "auto", "manual"])
+        self._damping_combo.currentTextChanged.connect(self._on_damping_changed)
+        ml.addRow("Damping:", self._damping_combo)
+
+        self._sp_damping = QDoubleSpinBox()
+        self._sp_damping.setRange(0.1, 10.0)
+        self._sp_damping.setDecimals(1)
+        self._sp_damping.setSingleStep(0.1)
+        self._sp_damping.setValue(1.0)
+        self._sp_damping.setEnabled(False)
+        ml.addRow("Damp value:", self._sp_damping)
 
         self._conv_combo = QComboBox()
         self._conv_combo.addItems(["auto", "fixed"])
@@ -740,25 +1141,43 @@ class DeconvolveCIWindow(QMainWindow):
         self._sp_ri_imm.setValue(1.515)
         rl.addRow("RI immersion:", self._sp_ri_imm)
 
+        # Embedding / mounting medium combo
+        _MEDIUM_RI = {
+            "water (1.333)": 1.333,
+            "PBS (1.334)": 1.334,
+            "culture medium (1.337)": 1.337,
+            "vectashield (1.45)": 1.45,
+            "prolong gold (1.47)": 1.47,
+            "glycerol (1.474)": 1.474,
+            "oil (1.515)": 1.515,
+            "prolong glass (1.52)": 1.52,
+        }
+        self._medium_ri_map = _MEDIUM_RI
+        self._medium_combo = QComboBox()
+        self._medium_combo.addItems(list(_MEDIUM_RI.keys()))
+        self._medium_combo.setCurrentText("prolong gold (1.47)")
+        self._medium_combo.currentTextChanged.connect(self._on_medium_changed)
+        rl.addRow("Emb. medium:", self._medium_combo)
+
         self._sp_ri_sample = QDoubleSpinBox()
         self._sp_ri_sample.setRange(1.0, 2.0)
         self._sp_ri_sample.setDecimals(4)
         self._sp_ri_sample.setSingleStep(0.001)
-        self._sp_ri_sample.setValue(1.33)
+        self._sp_ri_sample.setValue(1.47)
         rl.addRow("RI sample:", self._sp_ri_sample)
 
         self._sp_ri_cover = QDoubleSpinBox()
         self._sp_ri_cover.setRange(1.0, 2.0)
         self._sp_ri_cover.setDecimals(4)
         self._sp_ri_cover.setSingleStep(0.001)
-        self._sp_ri_cover.setValue(1.5255)
+        self._sp_ri_cover.setValue(1.518)
         rl.addRow("RI coverslip:", self._sp_ri_cover)
 
         self._sp_ri_cover_d = QDoubleSpinBox()
         self._sp_ri_cover_d.setRange(1.0, 2.0)
         self._sp_ri_cover_d.setDecimals(4)
         self._sp_ri_cover_d.setSingleStep(0.001)
-        self._sp_ri_cover_d.setValue(1.5255)
+        self._sp_ri_cover_d.setValue(1.518)
         rl.addRow("RI coverslip (design):", self._sp_ri_cover_d)
 
         self._sp_ri_imm_d = QDoubleSpinBox()
@@ -887,11 +1306,31 @@ class DeconvolveCIWindow(QMainWindow):
         nav.addWidget(QLabel("View:"))
         nav.addWidget(self._proj_combo)
 
+        nav.addWidget(QLabel("Lo%:"))
+        self._sp_pct_lo = QDoubleSpinBox()
+        self._sp_pct_lo.setRange(0.0, 50.0)
+        self._sp_pct_lo.setDecimals(2)
+        self._sp_pct_lo.setSingleStep(0.01)
+        self._sp_pct_lo.setValue(0.10)
+        self._sp_pct_lo.setFixedWidth(90)
+        self._sp_pct_lo.valueChanged.connect(self._update_viewer)
+        nav.addWidget(self._sp_pct_lo)
+
+        nav.addWidget(QLabel("Hi%:"))
+        self._sp_pct_hi = QDoubleSpinBox()
+        self._sp_pct_hi.setRange(50.0, 100.0)
+        self._sp_pct_hi.setDecimals(3)
+        self._sp_pct_hi.setSingleStep(0.001)
+        self._sp_pct_hi.setValue(100.0)
+        self._sp_pct_hi.setFixedWidth(110)
+        self._sp_pct_hi.valueChanged.connect(self._update_viewer)
+        nav.addWidget(self._sp_pct_hi)
+
         vl.addLayout(nav)
 
-        # --- Bottom panel: Open / Run / Save ---
+        # --- Top toolbar: Open / Run / Save ---
         bottom = QHBoxLayout()
-        bottom.setContentsMargins(0, 4, 0, 0)
+        bottom.setContentsMargins(0, 0, 0, 4)
 
         btn_open = QPushButton("Open\u2026")
         btn_open.clicked.connect(self._on_open)
@@ -919,17 +1358,39 @@ class DeconvolveCIWindow(QMainWindow):
         self._btn_save.clicked.connect(self._on_save)
         bottom.addWidget(self._btn_save)
 
+        # --- Settings buttons ---
+        self._btn_restore = QPushButton("Restore")
+        self._btn_restore.setToolTip("Restore parameter values from the previous run")
+        self._btn_restore.setEnabled(LAST_SETTINGS_PATH.exists())
+        self._btn_restore.clicked.connect(self._on_restore_settings)
+        bottom.addWidget(self._btn_restore)
+
+        btn_save_settings = QPushButton("Save Settings\u2026")
+        btn_save_settings.setToolTip("Save current parameter values to a JSON file")
+        btn_save_settings.clicked.connect(self._on_save_settings)
+        bottom.addWidget(btn_save_settings)
+
+        btn_load_settings = QPushButton("Load Settings\u2026")
+        btn_load_settings.setToolTip("Load parameter values from a JSON file")
+        btn_load_settings.clicked.connect(self._on_load_settings)
+        bottom.addWidget(btn_load_settings)
+
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)  # indeterminate
         self._progress.setVisible(False)
         self._progress.setMaximumWidth(120)
         bottom.addWidget(self._progress)
 
-        root.addLayout(bottom)
+        root.insertLayout(0, bottom)
+        root.addWidget(splitter, stretch=1)
 
         # Status bar
         self._status = QStatusBar()
         self.setStatusBar(self._status)
+
+        # Resource monitor bar (permanent widget on the right side)
+        self._monitor_bar = ResourceMonitorBar()
+        self._status.addPermanentWidget(self._monitor_bar)
 
         # Splitter proportions
         splitter.setStretchFactor(0, 0)
@@ -954,6 +1415,9 @@ class DeconvolveCIWindow(QMainWindow):
     def _on_bg_changed(self, text: str):
         self._sp_bg_value.setEnabled(text == "manual")
 
+    def _on_damping_changed(self, text: str):
+        self._sp_damping.setEnabled(text == "manual")
+
     def _on_conv_changed(self, text: str):
         auto = text == "auto"
         self._sp_rel_thresh.setEnabled(auto)
@@ -961,6 +1425,17 @@ class DeconvolveCIWindow(QMainWindow):
 
     def _on_micro_changed(self, text: str):
         self._le_excitation.setEnabled(text == "confocal")
+        # Auto-set iterations: 50 for confocal, 150 for widefield
+        if text == "confocal":
+            self._le_niter.setText("50")
+        else:
+            self._le_niter.setText("150")
+
+    def _on_medium_changed(self, text: str):
+        """Set RI sample spinbox from embedding medium combo selection."""
+        ri = self._medium_ri_map.get(text)
+        if ri is not None:
+            self._sp_ri_sample.setValue(ri)
 
     def _on_tiling_changed(self, text: str):
         enabled = text == "custom"
@@ -979,17 +1454,19 @@ class DeconvolveCIWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Image",
-            "",
+            self._last_open_dir,
             "Images (*.ome.tiff *.ome.tif *.tiff *.tif *.nd2 *.czi);;All Files (*)",
         )
         if path:
+            self._last_open_dir = str(Path(path).parent)
             self._do_load(path)
 
     def _on_open_zarr(self):
         path = QFileDialog.getExistingDirectory(
-            self, "Open OME-Zarr Folder", "",
+            self, "Open OME-Zarr Folder", self._last_zarr_dir,
         )
         if path:
+            self._last_zarr_dir = str(Path(path).parent)
             self._do_load(path)
 
     def _do_load(self, path: str):
@@ -1001,6 +1478,7 @@ class DeconvolveCIWindow(QMainWindow):
             self._input_channels = data["images"]
             self._metadata = data["metadata"]
             self._output_channels = []
+            self._pct_cache = {}  # clear percentile cache on new data
             self._input_path = Path(path)
 
             # Populate UI from metadata
@@ -1035,6 +1513,11 @@ class DeconvolveCIWindow(QMainWindow):
                 idx = self._micro_combo.findText(micro)
                 if idx >= 0:
                     self._micro_combo.setCurrentIndex(idx)
+                # Auto-set iterations based on microscope type
+                if micro == "confocal":
+                    self._le_niter.setText("50")
+                else:
+                    self._le_niter.setText("150")
             self._micro_combo.setStyleSheet(_bg("microscope_type" in from_file))
 
             # Per-channel wavelengths
@@ -1098,14 +1581,33 @@ class DeconvolveCIWindow(QMainWindow):
         if bg_text == "manual":
             background = self._sp_bg_value.value()
 
+        damp_text = self._damping_combo.currentText()
+        damping: str | float = 0.0
+        if damp_text == "auto":
+            damping = "auto"
+        elif damp_text == "manual":
+            damping = self._sp_damping.value()
+
         em_list = [float(s.strip()) for s in self._le_emission.text().split(",")
                    if s.strip()]
         ex_list = [float(s.strip()) for s in self._le_excitation.text().split(",")
                    if s.strip()]
 
+        niter_list = []
+        for s in self._le_niter.text().split(","):
+            s = s.strip()
+            if s:
+                try:
+                    niter_list.append(max(1, int(s)))
+                except ValueError:
+                    pass
+        if not niter_list:
+            niter_list = [50]
+
         return {
-            "niter": self._sp_niter.value(),
+            "niter_list": niter_list,
             "tv_lambda": self._sp_tv_lambda.value(),
+            "damping": damping,
             "background": background,
             "convergence": self._conv_combo.currentText(),
             "rel_threshold": self._sp_rel_thresh.value(),
@@ -1135,13 +1637,30 @@ class DeconvolveCIWindow(QMainWindow):
         }
 
     def _on_run(self):
+        # --- Stop mode: cancel running worker ---
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self._btn_run.setEnabled(False)
+            self._status.showMessage("Stopping …")
+            return
+
         if not self._input_channels:
             return
 
-        self._btn_run.setEnabled(False)
+        self._btn_run.setText("Stop")
+        self._btn_run.setStyleSheet(
+            "QPushButton { background-color: #e53935; color: white; "
+            "font-weight: bold; padding: 8px; }"
+        )
         self._btn_save.setEnabled(False)
         self._progress.setVisible(True)
         self._status.showMessage("Running deconvolution …")
+
+        # Signal that deconvolution is active (dot indicator)
+        self._monitor_bar.set_active(True)
+
+        # Auto-save settings before each run
+        self._save_last_settings()
 
         params = self._collect_params()
         self._worker = _DeconvolveWorker(
@@ -1153,17 +1672,29 @@ class DeconvolveCIWindow(QMainWindow):
         self._worker.start()
 
     def _on_deconv_done(self, result):
+        self._monitor_bar.set_active(False)
+
         self._progress.setVisible(False)
+        self._btn_run.setText("Run Deconvolution")
+        self._btn_run.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; "
+            "font-weight: bold; padding: 8px; }"
+        )
         self._btn_run.setEnabled(True)
 
         if isinstance(result, Exception):
             self._worker = None
-            QMessageBox.critical(self, "Deconvolution Error", str(result))
-            self._status.showMessage("Deconvolution failed", 5000)
+            msg = str(result)
+            if "Stopped by user" in msg:
+                self._status.showMessage("Deconvolution stopped", 5000)
+            else:
+                QMessageBox.critical(self, "Deconvolution Error", msg)
+                self._status.showMessage("Deconvolution failed", 5000)
             return
 
         try:
             self._output_channels = result
+            self._pct_cache = {}  # clear percentile cache for output
             self._btn_save.setEnabled(True)
             self._update_viewer()
             self._status.showMessage("Deconvolution complete", 5000)
@@ -1183,17 +1714,18 @@ class DeconvolveCIWindow(QMainWindow):
 
         stem = self._input_path.stem if self._input_path else "deconvolved"
         method = self._method_combo.currentText()
-        niter = self._sp_niter.value()
-        suggested = f"{stem}_{method}_{niter}i.ome.tiff"
+        niter_text = self._le_niter.text().strip().replace(", ", "-").replace(",", "-")
+        suggested = f"{stem}_{method}_{niter_text}i.ome.tiff"
 
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Deconvolved Image",
-            suggested,
+            str(Path(self._last_save_dir) / suggested),
             "OME-TIFF (*.ome.tiff);;TIFF (*.tiff *.tif)",
         )
         if not path:
             return
+        self._last_save_dir = str(Path(path).parent)
 
         try:
             from bioio.writers import OmeTiffWriter
@@ -1235,6 +1767,178 @@ class DeconvolveCIWindow(QMainWindow):
             self._status.showMessage(f"Saved → {Path(path).name}", 5000)
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
+
+    # -----------------------------------------------------------------------
+    # Settings Save / Load / Restore
+    # -----------------------------------------------------------------------
+
+    def _settings_to_dict(self) -> dict:
+        """Collect all UI parameter values into a JSON-serializable dict."""
+        return {
+            "method": self._method_combo.currentText(),
+            "iterations": self._le_niter.text(),
+            "tv_lambda": self._sp_tv_lambda.value(),
+            "background": self._bg_combo.currentText(),
+            "background_value": self._sp_bg_value.value(),
+            "damping": self._damping_combo.currentText(),
+            "damping_value": self._sp_damping.value(),
+            "convergence": self._conv_combo.currentText(),
+            "rel_threshold": self._sp_rel_thresh.value(),
+            "check_every": self._sp_check_every.value(),
+            "device": self._device_combo.currentText(),
+            "tiling": self._tiling_combo.currentText(),
+            "max_tile_xy": self._sp_max_tile_xy.value(),
+            "max_tile_z": self._sp_max_tile_z.value(),
+            "na": self._sp_na.value(),
+            "emission_wavelengths": self._le_emission.text(),
+            "excitation_wavelengths": self._le_excitation.text(),
+            "pixel_size_xy_nm": self._sp_px_xy.value(),
+            "pixel_size_z_nm": self._sp_px_z.value(),
+            "ri_immersion": self._sp_ri_imm.value(),
+            "ri_sample": self._sp_ri_sample.value(),
+            "embedding_medium": self._medium_combo.currentText(),
+            "ri_coverslip": self._sp_ri_cover.value(),
+            "ri_coverslip_design": self._sp_ri_cover_d.value(),
+            "ri_immersion_design": self._sp_ri_imm_d.value(),
+            "t_g": self._sp_tg.value(),
+            "t_g0": self._sp_tg0.value(),
+            "t_i0": self._sp_ti0.value(),
+            "z_p": self._sp_zp.value(),
+            "microscope_type": self._micro_combo.currentText(),
+            "integrate_pixels": self._cb_integrate.isChecked(),
+            "n_subpixels": self._sp_subpixels.value(),
+            "n_pupil": self._sp_n_pupil.value(),
+            "pct_lo": self._sp_pct_lo.value(),
+            "pct_hi": self._sp_pct_hi.value(),
+        }
+
+    def _apply_settings(self, data: dict):
+        """Populate UI widgets from a settings dict."""
+        def _combo(combo: QComboBox, key: str):
+            val = data.get(key)
+            if val is not None:
+                idx = combo.findText(str(val))
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        def _spin(spin, key: str):
+            val = data.get(key)
+            if val is not None:
+                spin.setValue(type(spin.value())(val))
+
+        def _line(le: QLineEdit, key: str):
+            val = data.get(key)
+            if val is not None:
+                le.setText(str(val))
+
+        _combo(self._method_combo, "method")
+        _line(self._le_niter, "iterations")
+        _spin(self._sp_tv_lambda, "tv_lambda")
+        _combo(self._bg_combo, "background")
+        _spin(self._sp_bg_value, "background_value")
+        _combo(self._damping_combo, "damping")
+        _spin(self._sp_damping, "damping_value")
+        _combo(self._conv_combo, "convergence")
+        _spin(self._sp_rel_thresh, "rel_threshold")
+        _spin(self._sp_check_every, "check_every")
+        _combo(self._device_combo, "device")
+        _combo(self._tiling_combo, "tiling")
+        _spin(self._sp_max_tile_xy, "max_tile_xy")
+        _spin(self._sp_max_tile_z, "max_tile_z")
+        _spin(self._sp_na, "na")
+        _line(self._le_emission, "emission_wavelengths")
+        _line(self._le_excitation, "excitation_wavelengths")
+        _spin(self._sp_px_xy, "pixel_size_xy_nm")
+        _spin(self._sp_px_z, "pixel_size_z_nm")
+        _spin(self._sp_ri_imm, "ri_immersion")
+        _spin(self._sp_ri_sample, "ri_sample")
+        # Try to match combo to the loaded RI value; value is leading
+        ri_val = data.get("ri_sample")
+        if ri_val is not None:
+            matched = False
+            for name, ri in self._medium_ri_map.items():
+                if abs(ri - float(ri_val)) < 1e-4:
+                    self._medium_combo.blockSignals(True)
+                    self._medium_combo.setCurrentText(name)
+                    self._medium_combo.blockSignals(False)
+                    matched = True
+                    break
+            if not matched:
+                # No exact match — just leave combo as-is
+                emb = data.get("embedding_medium")
+                if emb is not None:
+                    idx = self._medium_combo.findText(str(emb))
+                    if idx >= 0:
+                        self._medium_combo.blockSignals(True)
+                        self._medium_combo.setCurrentIndex(idx)
+                        self._medium_combo.blockSignals(False)
+        _spin(self._sp_ri_cover, "ri_coverslip")
+        _spin(self._sp_ri_cover_d, "ri_coverslip_design")
+        _spin(self._sp_ri_imm_d, "ri_immersion_design")
+        _spin(self._sp_tg, "t_g")
+        _spin(self._sp_tg0, "t_g0")
+        _spin(self._sp_ti0, "t_i0")
+        _spin(self._sp_zp, "z_p")
+        _combo(self._micro_combo, "microscope_type")
+        _spin(self._sp_subpixels, "n_subpixels")
+        _spin(self._sp_n_pupil, "n_pupil")
+        _spin(self._sp_pct_lo, "pct_lo")
+        _spin(self._sp_pct_hi, "pct_hi")
+
+        # integrate_pixels checkbox
+        val = data.get("integrate_pixels")
+        if val is not None:
+            self._cb_integrate.setChecked(bool(val))
+
+    def _save_last_settings(self):
+        """Auto-save settings to .last_settings.json."""
+        try:
+            with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._settings_to_dict(), f, indent=2)
+            self._btn_restore.setEnabled(True)
+        except OSError:
+            pass
+
+    def _on_restore_settings(self):
+        """Restore settings from .last_settings.json."""
+        try:
+            with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        self._apply_settings(data)
+        self._status.showMessage("Settings restored", 3000)
+
+    def _on_save_settings(self):
+        """Save current settings to a user-chosen JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Settings", str(Path(self._last_settings_dir) / "settings.json"),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        self._last_settings_dir = str(Path(path).parent)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._settings_to_dict(), f, indent=2)
+        self._status.showMessage(f"Settings saved → {Path(path).name}", 3000)
+
+    def _on_load_settings(self):
+        """Load settings from a user-chosen JSON file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Settings", self._last_settings_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        self._last_settings_dir = str(Path(path).parent)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Load Error", str(exc))
+            return
+        self._apply_settings(data)
+        self._status.showMessage(f"Settings loaded from {Path(path).name}", 3000)
 
     # -----------------------------------------------------------------------
     # Viewer
@@ -1297,13 +2001,31 @@ class DeconvolveCIWindow(QMainWindow):
             return None
         n_ch = len(channels)
         colors = _resolve_channel_colors(self._metadata, n_ch)
-        slices: list[tuple[np.ndarray, tuple[int, int, int]]] = []
+        pct_lo = self._sp_pct_lo.value()
+        pct_hi = self._sp_pct_hi.value()
+        slices: list[tuple[np.ndarray, tuple[int, int, int], tuple[float, float]]] = []
+        mode = self._proj_combo.currentText()
+        side = "in" if channels is self._input_channels else "out"
         for i in range(n_ch):
             if i < len(self._ch_toggles) and not self._ch_toggles[i].isChecked():
                 continue
             s = self._get_slice(channels, i)
             if s is not None:
-                slices.append((s, colors[i]))
+                cache_key = (side, i, pct_lo, pct_hi, mode)
+                if cache_key in self._pct_cache:
+                    lo, hi = self._pct_cache[cache_key]
+                else:
+                    # For Slice mode use the full volume for global contrast;
+                    # for MIP/SUM the projected values differ in range, so
+                    # compute percentiles on the 2-D projection itself.
+                    if mode == "Slice" and channels[i].ndim == 3:
+                        src = channels[i]
+                    else:
+                        src = s
+                    lo = float(np.percentile(src, pct_lo))
+                    hi = float(np.percentile(src, pct_hi))
+                    self._pct_cache[cache_key] = (lo, hi)
+                slices.append((s, colors[i], (lo, hi)))
         if not slices:
             return None
         return _composite_to_pixmap(slices)
@@ -1337,6 +2059,13 @@ class DeconvolveCIWindow(QMainWindow):
         super().resizeEvent(event)
         self._view_input.fit_in_view()
         self._view_output.fit_in_view()
+
+    def closeEvent(self, event):
+        """Ensure background threads are stopped before the window closes."""
+        if self._monitor is not None:
+            self._monitor.request_stop()
+            self._monitor = None
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------

@@ -198,6 +198,46 @@ def _estimate_background(image: torch.Tensor) -> float:
     # Approximate mode via median of lowest decile (robust)
     return float(lowest.median())
 
+
+def _estimate_noise_sigma(image: torch.Tensor) -> float:
+    """Robust noise σ via MAD of the lowest quartile of voxel intensities.
+
+    Uses the Median Absolute Deviation (MAD) estimator, which is robust
+    against signal outliers:  σ ≈ 1.4826 · median(|x − median(x)|).
+    Only the lowest 25 % of voxels are considered so that bright signal
+    regions do not inflate the estimate.
+    """
+    flat = image.flatten()
+    n = max(int(flat.numel() * 0.25), 1)
+    lowest, _ = torch.topk(flat, n, largest=False)
+    med = lowest.median()
+    mad = (lowest - med).abs().median()
+    sigma = float(mad) * 1.4826
+    return max(sigma, 1e-12)
+
+
+def _damping_map(
+    estimate: torch.Tensor,
+    sigma: float,
+    damping: float,
+    background: float = 0.0,
+) -> torch.Tensor:
+    """Per-voxel damping exponent γ ∈ (0, 1] for noise-gated RL.
+
+    γ(x) = 1 − exp(−(x − bg) / (damping · σ))
+
+    The signal above background *(x − bg)* determines the damping
+    strength.  Pixels near the background floor are heavily damped
+    (γ → 0) while bright structures get the full RL update (γ → 1).
+
+    References: Laasmaa et al. 2011; Conchello 1998.
+    """
+    scale = damping * sigma
+    signal = (estimate - background).clamp(min=0.0)
+    gamma = 1.0 - torch.exp(-signal / scale)
+    return gamma.clamp(min=1e-3, max=1.0)
+
+
 # ---------------------------------------------------------------------------
 # XY tiling helpers (large image support)
 # ---------------------------------------------------------------------------
@@ -401,6 +441,7 @@ def ci_rl_deconvolve(
     *,
     niter: int = 50,
     tv_lambda: float = 0.0,
+    damping: Union[str, float] = 0.0,
     background: Union[str, float] = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
@@ -422,6 +463,11 @@ def ci_rl_deconvolve(
         Maximum number of iterations.
     tv_lambda : float
         Total-Variation regularisation strength (0 = disabled).
+    damping : ``0.0``, ``"auto"``, or float > 0
+        Noise-gated damping strength.  When > 0 the RL correction factor
+        is raised to a per-voxel power γ ∈ (0,1] that attenuates the
+        update in background (noisy) regions while leaving bright
+        structures untouched.  ``"auto"`` uses 1.0.  ``0`` = disabled.
     background : ``"auto"`` or float
         Background level used as positivity floor and safe-division epsilon.
     convergence : ``"fixed"`` or ``"auto"``
@@ -447,7 +493,8 @@ def ci_rl_deconvolve(
     if n_tiles > 1:
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
-            niter=niter, tv_lambda=tv_lambda, background=background,
+            niter=niter, tv_lambda=tv_lambda, damping=damping,
+            background=background,
             convergence=convergence, rel_threshold=rel_threshold,
             check_every=check_every, device=device,
             max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
@@ -457,9 +504,17 @@ def ci_rl_deconvolve(
     dtype = _pick_dtype(dev)
     ndim = image.ndim
 
+    # Resolve damping
+    if damping == "auto":
+        damp_strength = 3.0
+    else:
+        damp_strength = max(float(damping), 0.0)
+    use_damping = damp_strength > 0.0
+
     log.info("ci_rl_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
-             "tv_lambda=%.4g  convergence=%s", dev, dtype, image.shape, niter,
-             tv_lambda, convergence)
+             "tv_lambda=%.4g  damping=%.4g  convergence=%s",
+             dev, dtype, image.shape, niter, tv_lambda, damp_strength,
+             convergence)
 
     # Move data to device
     img_t = _to_tensor(image.astype(np.float64), dev, dtype)
@@ -471,6 +526,11 @@ def ci_rl_deconvolve(
     else:
         bg = max(float(background), 1e-6)
     log.info("  background=%.4g", bg)
+
+    # Noise sigma for damping (estimated once from the input image)
+    if use_damping:
+        noise_sigma = _estimate_noise_sigma(img_t)
+        log.info("  noise_sigma=%.4g  damping=%.4g", noise_sigma, damp_strength)
 
     # Work shape = image + psf - 1  (full linear convolution)
     work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
@@ -514,6 +574,11 @@ def ci_rl_deconvolve(
         # --- Back-project: IFFT(FFT(r) * conj(H)) ---
         R_fft = _rfft(r)
         corr = _irfft(R_fft * otf_conj, work_shape)
+
+        # --- Noise-gated damping (attenuate correction in noisy regions) ---
+        if use_damping:
+            gamma = _damping_map(p, noise_sigma, damp_strength, bg)
+            corr = corr.clamp(min=1e-12) ** gamma
 
         # --- Multiplicative update with Bertero weights ---
         x_new = p * corr * W
