@@ -332,8 +332,7 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
    [doi:10.1002/jemt.20294](https://doi.org/10.1002/jemt.20294)
 
 6. <a id="ref6"></a>Wernersson, E. et al. (2024). "Deconwolf enables high-performance deconvolution of widefield fluorescence microscopy images." *Nature Methods* 21(7):1245–1256.\
-   [doi:10.1038/s41592-024-02294-7](https://doi.org/10.1038/s41592-024-02294-7) ·
-   Source code: [github.com/elgw/deconwolf](https://github.com/elgw/deconwolf)
+   [doi:10.1038/s41592-024-02294-7](https://doi.org/10.1038/s41592-024-02294-7)
 
 7. <a id="ref7"></a>Richards, B. & Wolf, E. (1959). "Electromagnetic diffraction in optical systems, II." *Proc. Royal Society A* 253:358–379.\
    [doi:10.1098/rspa.1959.0200](https://doi.org/10.1098/rspa.1959.0200)
