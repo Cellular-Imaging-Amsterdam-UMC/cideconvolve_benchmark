@@ -355,6 +355,33 @@ Simpson's rule quadrature with configurable number of pupil samples (default 129
 13. <a id="ref13"></a>Sage, D., Donati, L., Soulez, F., Fortun, D., Schmit, G., Seitz, A., Guiet, R., Vonesch, C. & Unser, M. (2017). "DeconvolutionLab2: An Open-Source Software for Deconvolution Microscopy." *Methods* 115:28–41.\
     [doi:10.1016/j.ymeth.2016.12.015](https://doi.org/10.1016/j.ymeth.2016.12.015)
 
+14. <a id="ref14"></a>Sibarita, J.-B. (2005). "Deconvolution Microscopy." *Advances in Biochemical Engineering/Biotechnology* 95:201–243.\
+    [doi:10.1007/b102215](https://doi.org/10.1007/b102215)
+
+15. <a id="ref15"></a>van Kempen, G.M.P., van Vliet, L.J., Verveer, P.J. & van der Voort, H.T.M. (1997). "A quantitative comparison of image restoration methods for confocal microscopy." *Journal of Microscopy* 185(3):354–365.\
+    [doi:10.1046/j.1365-2818.1997.d01-629.x](https://doi.org/10.1046/j.1365-2818.1997.d01-629.x)
+
+16. <a id="ref16"></a>Prigent, S., Nguyen, H.N., Leconte, L. et al. (2023). "SPITFIR(e): a supermaneuverable algorithm for fast denoising and deconvolution of 3D fluorescence microscopy images and videos." *Scientific Reports* 13:1489.\
+    [doi:10.1038/s41598-022-26178-y](https://doi.org/10.1038/s41598-022-26178-y)
+
+17. <a id="ref17"></a>McNally, J.G., Karpova, T., Cooper, J. & Conchello, J.A. (1999). "Three-Dimensional Imaging by Deconvolution Microscopy." *Methods* 19(3):373–385.\
+    [doi:10.1006/meth.1999.0873](https://doi.org/10.1006/meth.1999.0873)
+
+18. <a id="ref18"></a>Wallace, W., Schaefer, L.H. & Swedlow, J.R. (2001). "A workingperson's guide to deconvolution in light microscopy." *BioTechniques* 31(5):1076–1097.\
+    [doi:10.2144/01315bi01](https://doi.org/10.2144/01315bi01)
+
+19. <a id="ref19"></a>Sarder, P. & Nehorai, A. (2006). "Deconvolution methods for 3-D fluorescence microscopy images." *IEEE Signal Processing Magazine* 23(3):32–45.\
+    [doi:10.1109/MSP.2006.1628876](https://doi.org/10.1109/MSP.2006.1628876)
+
+20. <a id="ref20"></a>Bertero, M., Boccacci, P., Desiderà, G. & Vicidomini, G. (2009). "Image deblurring with Poisson data: from cells to galaxies." *Inverse Problems* 25(12):123006.\
+    [doi:10.1088/0266-5611/25/12/123006](https://doi.org/10.1088/0266-5611/25/12/123006)
+
+21. <a id="ref21"></a>Kirshner, H., Aguet, F., Sage, D. & Unser, M. (2013). "3-D PSF fitting for fluorescence microscopy: implementation and localization application." *Journal of Microscopy* 249(1):13–25.\
+    [doi:10.1111/j.1365-2818.2012.03675.x](https://doi.org/10.1111/j.1365-2818.2012.03675.x)
+
+22. <a id="ref22"></a>Vonesch, C. & Unser, M. (2008). "A fast thresholded Landweber algorithm for wavelet-regularized multidimensional deconvolution." *IEEE Transactions on Image Processing* 17(4):539–549.\
+    [doi:10.1109/TIP.2008.917106](https://doi.org/10.1109/TIP.2008.917106)
+
 ### Source Code Repositories
 
 | Project | Repository |
