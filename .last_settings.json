@@ -1,6 +1,6 @@
 {
   "values": {
-    "iterations": 40,
+    "iterations": 20,
     "tiling": "custom",
     "tile_limits": "512, 64",
     "method": "sdeconv_rl",
@@ -13,15 +13,15 @@
     "excitation_wl": "auto",
     "projection": "none",
     "benchmark": true,
-    "bench_iterations": "20, 40",
-    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
+    "bench_iterations": "20, 40, 60",
+    "bench_methods": "all",
     "bench_crop": true,
     "bench_one_image": true,
     "log": false
   },
   "folders": {
-    "infolder": "C:\\rahoebe\\Python\\CIDeconvolve\\infolder",
-    "outfolder": "C:\\rahoebe\\Python\\CIDeconvolve\\outfolder",
-    "gtfolder": "C:\\rahoebe\\Python\\CIDeconvolve\\gtfolder"
+    "infolder": "C:\\rahoebe\\Python\\cideconvolve_benchmark\\infolder",
+    "outfolder": "C:\\rahoebe\\Python\\cideconvolve_benchmark\\outfolder",
+    "gtfolder": "C:\\rahoebe\\Python\\cideconvolve_benchmark\\gtfolder"
   }
 }

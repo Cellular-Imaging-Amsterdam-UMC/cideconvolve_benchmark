@@ -1,6 +1,6 @@
 # CIDeconvolve — Deconvolution Methods
 
-CIDeconvolve bundles **13 deconvolution methods** from 7 independent
+CIDeconvolve bundles **14 deconvolution methods** from 7 independent
 libraries.  Each method generates a theoretically correct PSF on-the-fly
 using metadata extracted from the input OME-TIFF (NA, refractive indices,
 wavelengths, voxel spacing, microscope type) and then applies the chosen
@@ -29,9 +29,10 @@ deconvolution algorithm.
 | 8 | `deconvlab2_rltv` | RL + Total Variation | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
 | 9 | `redlionfish_rl` | Richardson–Lucy | RedLionfish | OpenCL / CPU | ❌ | ✅ | 🟢 GPU | 🟢 GPU | 🟡 CPU |
 | 10 | `skimage_rl` | Richardson–Lucy | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 11 | `skimage_cucim_rl` | Richardson–Lucy | scikit-image + cuCIM | CUDA | ✅ | ✅ | 🟢 GPU | ❌ | 🟢 GPU |
-| 12 | `ci_rl` | SHB-accelerated RL | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
-| 13 | `ci_rl_tv` | SHB-accelerated RL + TV | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
+| 11 | `skimage_unsupervised_wiener` | Unsupervised Wiener–Hunt | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
+| 12 | `skimage_cucim_rl` | Richardson–Lucy | scikit-image + cuCIM | CUDA | ✅ | ✅ | 🟢 GPU | ❌ | 🟢 GPU |
+| 13 | `ci_rl` | SHB-accelerated RL | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
+| 14 | `ci_rl_tv` | SHB-accelerated RL + TV | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
 
 > 🟢 **GPU** = runs with GPU acceleration.  🟡 **CPU** = runs but CPU-only.
 > **❌** = not available on that platform.  
@@ -143,7 +144,20 @@ easy to install.
 - **2-D support:** ✅ Yes
 - **GPU:** None (CPU only)
 
-### 11. scikit-image + cuCIM — `skimage_cucim_rl`
+### 11. scikit-image Unsupervised Wiener — `skimage_unsupervised_wiener`
+
+The `restoration.unsupervised_wiener` implementation from scikit-image.
+A blind Wiener–Hunt deconvolution that jointly estimates the deconvolved
+image and the noise/regularisation parameters — no manual tuning of a
+regularisation weight required.  CPU-only.
+
+- **Source:** [scikit-image.org](https://scikit-image.org/)
+- **Publication:** [van der Walt et al. (2014)](https://doi.org/10.7717/peerj.453)
+  *"scikit-image: image processing in Python."* PeerJ **2**, e453.
+- **2-D support:** ✅ Yes
+- **GPU:** None (CPU only)
+
+### 12. scikit-image + cuCIM — `skimage_cucim_rl`
 
 Uses NVIDIA's [cuCIM](https://github.com/rapidsai/cucim) library (part of
 the RAPIDS ecosystem) as a drop-in GPU-accelerated backend for the
@@ -154,7 +168,7 @@ scikit-image Richardson–Lucy implementation.
 - **GPU:** CUDA (required)
 - **Platform note:** Linux only — cuCIM does not support Windows.
 
-### 12–13. CIDeconvolve — `ci_rl`, `ci_rl_tv`
+### 13–14. CIDeconvolve — `ci_rl`, `ci_rl_tv`
 
 Native CI methods developed in-house and maintained in the companion
 [cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
