@@ -1,6 +1,6 @@
 # CIDeconvolve
 
-**3-D / 2-D microscopy deconvolution with 18 algorithm backends.**
+**3-D / 2-D microscopy deconvolution with 16 algorithm backends.**
 
 CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
 workflow that deconvolves widefield and confocal fluorescence microscopy
@@ -17,7 +17,7 @@ repository and bundled here as `deconvolve_ci.py`.
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
 | **Version** | v0.1.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Available methods** | 18 — see [METHODS.md](METHODS.md) |
+| **Available methods** | 16 — see [METHODS.md](METHODS.md) |
 | **Benchmark** | built-in multi-method benchmark with no-reference quality and provenance outputs |
 
 ---
@@ -177,7 +177,7 @@ command line via `wrapper.py`:
 
 ```
 wrapper.py            BIAFLOWS entrypoint — parameter parsing, benchmark runner, provenance export
-deconvolve.py         Core deconvolution engine with all 18 backends + PSF generation
+deconvolve.py         Core deconvolution engine with all 16 backends + PSF generation
 launcher.py           PyQt6 GUI launcher
 descriptor.json       BIAFLOWS/BIOMERO parameter descriptor
 bioflows_local.py     Local BIAFLOWS compatibility shim

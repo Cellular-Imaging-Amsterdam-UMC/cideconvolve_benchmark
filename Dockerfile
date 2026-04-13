@@ -104,10 +104,6 @@ COPY bioflows_local.py /app/bioflows_local.py
 COPY wrapper.py /app/wrapper.py
 COPY descriptor.json /app/descriptor.json
 
-# --- Set ImageJ JAR path for deconvolve.py ---
-RUN mkdir -p /root/.m2/repository/net/imagej/ij/1.51h \
-    && ln -sf /app/bin/ij-1.51h.jar /root/.m2/repository/net/imagej/ij/1.51h/ij-1.51h.jar
-
 # --- BIAFLOWS data directories ---
 RUN mkdir -p /data/in /data/out /data/gt
 

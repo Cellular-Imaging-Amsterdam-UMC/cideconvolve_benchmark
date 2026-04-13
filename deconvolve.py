@@ -568,8 +568,6 @@ METHODS = {
     "deconvlab2_rl": {"memory_factor": 4, "description": "DeconvolutionLab2 Richardson-Lucy (CLI)"},
     "deconvlab2_rltv": {"memory_factor": 4, "description": "DeconvolutionLab2 RL-Total Variation (CLI)"},
     "deconvlab2_landweber": {"memory_factor": 4, "description": "DeconvolutionLab2 Landweber (CLI)"},
-    "deconvlab2_tikhonov_miller": {"memory_factor": 4, "description": "DeconvolutionLab2 Tikhonov-Miller (CLI)"},
-    "deconvlab2_fista": {"memory_factor": 4, "description": "DeconvolutionLab2 FISTA wavelet deconvolution (CLI)"},
     "deconvlab2_ista": {"memory_factor": 4, "description": "DeconvolutionLab2 ISTA wavelet deconvolution (CLI)"},
     "redlionfish_rl": {"memory_factor": 4, "description": "RedLionfish RL (OpenCL GPU + CPU fallback)"},
     "skimage_rl": {"memory_factor": 4, "description": "scikit-image Richardson-Lucy (CPU)"},
@@ -989,8 +987,6 @@ def deconvolve(
             "deconvlab2_rl": ("RL", None),
             "deconvlab2_rltv": ("RLTV", {"tv_lambda": tv_lambda}),
             "deconvlab2_landweber": ("LW", {"step": 1.0}),
-            "deconvlab2_tikhonov_miller": ("TM", {"step": 1.0, "regularization": 0.1}),
-            "deconvlab2_fista": ("FISTA", {"step": 1.0, "regularization": 0.1, "wavelet": "Haar", "scale": 3}),
             "deconvlab2_ista": ("ISTA", {"step": 1.0, "regularization": 0.1, "wavelet": "Haar", "scale": 3}),
         }
         dl2_algo, dl2_kwargs = dl2_algorithms[method]

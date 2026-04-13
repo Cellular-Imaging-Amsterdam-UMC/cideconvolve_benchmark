@@ -101,9 +101,16 @@ _BENCH_BASE_DW_DL2_RLF = _BENCH_BASE_DW_RLF + [
     "deconvlab2_rl",
     "deconvlab2_rltv",
     "deconvlab2_landweber",
-    "deconvlab2_tikhonov_miller",
-    "deconvlab2_fista",
     "deconvlab2_ista",
+]
+_BENCH_FAST = [
+    "sdeconv_wiener",
+    "pycudadecon_rl_cuda",
+    "ci_rl",
+    "ci_rl_tv",
+    "sdeconv_rl",
+    "skimage_cucim_rl",
+    "deconvlab2_landweber",
 ]
 _BENCH_ALL = list(METHODS.keys())
 
@@ -111,7 +118,7 @@ BENCH_METHOD_SETS = {
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv": _BENCH_BASE,
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl": _BENCH_BASE_RLF,
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, deconvlab2_landweber, deconvlab2_tikhonov_miller, deconvlab2_fista, deconvlab2_ista, redlionfish_rl": _BENCH_BASE_DW_DL2_RLF,
+    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
     "all": _BENCH_ALL,
 }
 
@@ -409,8 +416,7 @@ def _method_device(method: str) -> str:
     _CPU_METHODS = {
         "skimage_rl", "skimage_unsupervised_wiener",
         "deconvlab2_rl", "deconvlab2_rltv",
-        "deconvlab2_landweber", "deconvlab2_tikhonov_miller",
-        "deconvlab2_fista", "deconvlab2_ista",
+        "deconvlab2_landweber", "deconvlab2_ista",
         "deconwolf_rl", "deconwolf_shb",
     }
     if method in _GPU_METHODS:

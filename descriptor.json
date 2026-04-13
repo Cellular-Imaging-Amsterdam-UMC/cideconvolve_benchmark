@@ -66,8 +66,6 @@
         "deconvlab2_rl",
         "deconvlab2_rltv",
         "deconvlab2_landweber",
-        "deconvlab2_tikhonov_miller",
-        "deconvlab2_fista",
         "deconvlab2_ista",
         "redlionfish_rl",
         "skimage_rl",
@@ -214,7 +212,7 @@
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl",
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl",
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, deconvlab2_landweber, deconvlab2_tikhonov_miller, deconvlab2_fista, deconvlab2_ista, redlionfish_rl",
+        "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber",
         "all"
       ]
     },

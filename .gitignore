@@ -34,9 +34,6 @@ outfolder/
 # Local data folder
 localdata/
 
-# Cloned reference repos (large, not part of this project)
-gitclones/
-
 # Pre-built binaries (optional — uncomment to track them)
 bin/
 

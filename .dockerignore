@@ -1,11 +1,11 @@
-# Large cloned repos (not needed in image)
-gitclones/
-
-# Output is mounted at runtime, not baked in
-output/
+# Runtime inputs/outputs are mounted, not baked in
+outfolder/
+infolder/
+gtfolder/
 
 # Data is mounted at runtime, not baked in
 data/
+localdata/
 
 # Windows binaries (Linux builds deconwolf from source)
 bin/dw.exe
@@ -17,13 +17,17 @@ bin/dl2_sources.txt
 
 # Git and IDE
 .git/
+.gitignore
 .vscode/
 .idea/
+.codex/
 
 # Python caches
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
 
 # vcpkg build artifacts
 vcpkg/
@@ -36,3 +40,10 @@ fftw_wisdom_*.dat
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Local app/editor state
+.last_settings.json
+
+# Local helper assets not used by the image build
+tests/
+scripts/

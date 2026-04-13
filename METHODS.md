@@ -1,6 +1,6 @@
 # CIDeconvolve — Deconvolution Methods
 
-CIDeconvolve bundles **18 deconvolution methods** from 7 independent
+CIDeconvolve bundles **16 deconvolution methods** from 7 independent
 libraries.  Each method generates a theoretically correct PSF on-the-fly
 using metadata extracted from the input OME-TIFF (NA, refractive indices,
 wavelengths, voxel spacing, microscope type) and then applies the chosen
@@ -28,15 +28,13 @@ deconvolution algorithm.
 | 7 | `deconvlab2_rl` | Richardson–Lucy | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
 | 8 | `deconvlab2_rltv` | RL + Total Variation | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
 | 9 | `deconvlab2_landweber` | Landweber | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 10 | `deconvlab2_tikhonov_miller` | Tikhonov-Miller | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 11 | `deconvlab2_fista` | FISTA wavelet deconvolution | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 12 | `deconvlab2_ista` | ISTA wavelet deconvolution | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 13 | `redlionfish_rl` | Richardson–Lucy | RedLionfish | OpenCL / CPU | ❌ | ✅ | 🟢 GPU | 🟢 GPU | 🟡 CPU |
-| 14 | `skimage_rl` | Richardson–Lucy | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 15 | `skimage_unsupervised_wiener` | Unsupervised Wiener–Hunt | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
-| 16 | `skimage_cucim_rl` | Richardson–Lucy | scikit-image + cuCIM | CUDA | ✅ | ✅ | 🟢 GPU | ❌ | 🟢 GPU |
-| 17 | `ci_rl` | SHB-accelerated RL | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
-| 18 | `ci_rl_tv` | SHB-accelerated RL + TV | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
+| 10 | `deconvlab2_ista` | ISTA wavelet deconvolution | DeconvolutionLab2 | CPU (Java) | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
+| 11 | `redlionfish_rl` | Richardson–Lucy | RedLionfish | OpenCL / CPU | ❌ | ✅ | 🟢 GPU | 🟢 GPU | 🟡 CPU |
+| 12 | `skimage_rl` | Richardson–Lucy | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
+| 13 | `skimage_unsupervised_wiener` | Unsupervised Wiener–Hunt | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
+| 14 | `skimage_cucim_rl` | Richardson–Lucy | scikit-image + cuCIM | CUDA | ✅ | ✅ | 🟢 GPU | ❌ | 🟢 GPU |
+| 15 | `ci_rl` | SHB-accelerated RL | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
+| 16 | `ci_rl_tv` | SHB-accelerated RL + TV | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
 
 > 🟢 **GPU** = runs with GPU acceleration.  🟡 **CPU** = runs but CPU-only.
 > **❌** = not available on that platform.  
@@ -117,7 +115,7 @@ multi-threaded CPU execution.
   [releases page](https://github.com/elgw/deconwolf/releases)), and WSL2
   (CPU only — no OpenCL GPU passthrough).
 
-### 7–12. DeconvolutionLab2 — `deconvlab2_rl`, `deconvlab2_rltv`, `deconvlab2_landweber`, `deconvlab2_tikhonov_miller`, `deconvlab2_fista`, `deconvlab2_ista`
+### 7–10. DeconvolutionLab2 — `deconvlab2_rl`, `deconvlab2_rltv`, `deconvlab2_landweber`, `deconvlab2_ista`
 
 A widely-used Java/ImageJ-based deconvolution toolbox from EPFL.  Runs
 headless via a command-line interface using the bundled ImageJ JAR.
@@ -125,8 +123,6 @@ headless via a command-line interface using the bundled ImageJ JAR.
 - **RL** — standard Richardson–Lucy.
 - **RLTV** — Richardson–Lucy with Total Variation regularisation.
 - **Landweber** — classic gradient-descent deconvolution.
-- **Tikhonov-Miller** — iterative deconvolution with quadratic smoothness regularisation.
-- **FISTA** — accelerated iterative shrinkage-thresholding with wavelet sparsity prior.
 - **ISTA** — non-accelerated iterative shrinkage-thresholding with wavelet sparsity prior.
 
 CPU-only, but well-tested and supports both 2-D and 3-D images.
@@ -137,9 +133,9 @@ CPU-only, but well-tested and supports both 2-D and 3-D images.
   Methods **115**, 28–41.
 - **2-D support:** ✅ Yes
 - **GPU:** None (CPU only, multi-threaded via Java)
-- **Implementation note:** The added Landweber / Tikhonov-Miller / FISTA / ISTA variants use DeconvolutionLab2's built-in default step, regularization, and wavelet settings except for the shared iteration count.
+- **Implementation note:** The added Landweber / ISTA variants use DeconvolutionLab2's built-in default step, regularization, and wavelet settings except for the shared iteration count.
 
-### 13. RedLionfish — `redlionfish_rl`
+### 11. RedLionfish — `redlionfish_rl`
 
 OpenCL-accelerated Richardson–Lucy deconvolution developed at the
 Rosalind Franklin Institute.
@@ -148,7 +144,7 @@ Rosalind Franklin Institute.
 - **2-D support:** ❌ 3-D only
 - **GPU:** OpenCL (with CPU fallback)
 
-### 14. scikit-image — `skimage_rl`
+### 12. scikit-image — `skimage_rl`
 
 The `restoration.richardson_lucy` implementation from scikit-image.  Pure
 Python/NumPy/SciPy — no GPU acceleration but universally available and
@@ -160,7 +156,7 @@ easy to install.
 - **2-D support:** ✅ Yes
 - **GPU:** None (CPU only)
 
-### 15. scikit-image Unsupervised Wiener — `skimage_unsupervised_wiener`
+### 13. scikit-image Unsupervised Wiener — `skimage_unsupervised_wiener`
 
 The `restoration.unsupervised_wiener` implementation from scikit-image.
 A blind Wiener–Hunt deconvolution that jointly estimates the deconvolved
@@ -173,7 +169,7 @@ regularisation weight required.  CPU-only.
 - **2-D support:** ✅ Yes
 - **GPU:** None (CPU only)
 
-### 16. scikit-image + cuCIM — `skimage_cucim_rl`
+### 14. scikit-image + cuCIM — `skimage_cucim_rl`
 
 Uses NVIDIA's [cuCIM](https://github.com/rapidsai/cucim) library (part of
 the RAPIDS ecosystem) as a drop-in GPU-accelerated backend for the
@@ -184,7 +180,7 @@ scikit-image Richardson–Lucy implementation.
 - **GPU:** CUDA (required)
 - **Platform note:** Linux only — cuCIM does not support Windows.
 
-### 17–18. CIDeconvolve — `ci_rl`, `ci_rl_tv`
+### 15–16. CIDeconvolve — `ci_rl`, `ci_rl_tv`
 
 Native CI methods developed in-house and maintained in the companion
 [cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
