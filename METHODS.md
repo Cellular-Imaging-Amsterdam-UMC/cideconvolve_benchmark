@@ -1,6 +1,6 @@
 # CIDeconvolve — Deconvolution Methods
 
-CIDeconvolve bundles **11 deconvolution methods** from 6 independent
+CIDeconvolve bundles **13 deconvolution methods** from 7 independent
 libraries.  Each method generates a theoretically correct PSF on-the-fly
 using metadata extracted from the input OME-TIFF (NA, refractive indices,
 wavelengths, voxel spacing, microscope type) and then applies the chosen
@@ -30,6 +30,8 @@ deconvolution algorithm.
 | 9 | `redlionfish_rl` | Richardson–Lucy | RedLionfish | OpenCL / CPU | ❌ | ✅ | 🟢 GPU | 🟢 GPU | 🟡 CPU |
 | 10 | `skimage_rl` | Richardson–Lucy | scikit-image | CPU | ✅ | ✅ | 🟡 CPU | 🟡 CPU | 🟡 CPU |
 | 11 | `skimage_cucim_rl` | Richardson–Lucy | scikit-image + cuCIM | CUDA | ✅ | ✅ | 🟢 GPU | ❌ | 🟢 GPU |
+| 12 | `ci_rl` | SHB-accelerated RL | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
+| 13 | `ci_rl_tv` | SHB-accelerated RL + TV | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
 
 > 🟢 **GPU** = runs with GPU acceleration.  🟡 **CPU** = runs but CPU-only.
 > **❌** = not available on that platform.  
@@ -152,6 +154,32 @@ scikit-image Richardson–Lucy implementation.
 - **GPU:** CUDA (required)
 - **Platform note:** Linux only — cuCIM does not support Windows.
 
+### 12–13. CIDeconvolve — `ci_rl`, `ci_rl_tv`
+
+Native CI methods developed in-house and maintained in the companion
+[cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
+repository.  The implementation is bundled here as `deconvolve_ci.py`.
+
+- **`ci_rl`** — Richardson–Lucy accelerated with the
+  **Scaled Heavy Ball (SHB)** momentum scheme of Wang & Miller (2014),
+  giving faster convergence than standard RL.  Boundary artefacts are
+  suppressed with Bertero–Boccacci edge-weight tapering.  I-divergence
+  is monitored at every iteration as a convergence criterion.
+- **`ci_rl_tv`** — Same as `ci_rl` with an additional
+  **Total Variation (TV)** regularisation term (Dey et al. 2006) to
+  suppress noise amplification at high iteration counts.
+
+Both methods generate a physically accurate PSF on-the-fly (vectorial
+Richards–Wolf model for high-NA objectives, scalar Kirchhoff otherwise,
+with Gibson–Lanni RI-mismatch correction) and run on CUDA GPUs via
+PyTorch with automatic CPU fallback.
+
+- **Source:** [Cellular-Imaging-Amsterdam-UMC/cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
+- **2-D support:** ✅ Yes
+- **GPU:** CUDA via PyTorch (CPU fallback)
+- **References:** Wang & Miller (2014), Bertero & Boccacci (2005), Dey et al. (2006),
+  Richards & Wolf (1959), Gibson & Lanni (1991)
+
 ---
 
 ## Platform notes — Linux vs Windows vs WSL2
@@ -186,6 +214,10 @@ for Docker GPU passthrough setup.
 6. Wernersson, E. et al. (2024). "Deconwolf enables high-performance deconvolution of widefield fluorescence microscopy images." *Nat Methods*. [doi:10.1038/s41592-024-02294-7](https://doi.org/10.1038/s41592-024-02294-7)
 7. van der Walt, S. et al. (2014). "scikit-image: image processing in Python." *PeerJ* **2**, e453. [doi:10.7717/peerj.453](https://doi.org/10.7717/peerj.453)
 8. Gibson, S. F. & Lanni, F. (1992). "Experimental test of an analytical model of aberration in an oil-immersion objective lens…" *JOSA A* **9**(1), 154–166. [doi:10.1364/JOSAA.9.000154](https://doi.org/10.1364/JOSAA.9.000154)
+9. Wang, H. & Miller, E. L. (2014). "Scaled Heavy-Ball Acceleration of the Richardson-Lucy Algorithm for 3D Microscopy Image Restoration." *IEEE TIP* **23**(2), 848–854. [doi:10.1109/TIP.2013.2291324](https://doi.org/10.1109/TIP.2013.2291324)
+10. Bertero, M. & Boccacci, P. (2005). "Image restoration methods for the Large Binocular Telescope." *A&A* **437**, 369–374. [doi:10.1051/0004-6361:20042279](https://doi.org/10.1051/0004-6361:20042279)
+11. Dey, N. et al. (2006). "Richardson–Lucy algorithm with total variation regularization for 3D confocal microscope deconvolution." *Microsc. Res. Tech.* **69**(4), 260–266. [doi:10.1002/jemt.20294](https://doi.org/10.1002/jemt.20294)
+12. Richards, B. & Wolf, E. (1959). "Electromagnetic diffraction in optical systems II." *Proc. R. Soc. A* **253**, 358–379. [doi:10.1098/rspa.1959.0200](https://doi.org/10.1098/rspa.1959.0200)
 
 ---
 

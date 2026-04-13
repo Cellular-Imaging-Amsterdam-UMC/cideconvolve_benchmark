@@ -1,6 +1,6 @@
 # CIDeconvolve
 
-**3-D / 2-D microscopy deconvolution with 11 algorithm backends.**
+**3-D / 2-D microscopy deconvolution with 13 algorithm backends.**
 
 CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
 workflow that deconvolves widefield and confocal fluorescence microscopy
@@ -8,12 +8,16 @@ images.  It generates a theoretically correct PSF from OME-TIFF metadata
 and applies a user-selected deconvolution method — ranging from fast CUDA
 GPU implementations to portable CPU-only fall-backs.
 
+The two native CI methods (`ci_rl`, `ci_rl_tv`) are developed and maintained
+in the companion [cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
+repository and bundled here as `deconvolve_ci.py`.
+
 | | |
 |---|---|
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
 | **Version** | v0.1.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Available methods** | 11 — see [METHODS.md](METHODS.md) |
+| **Available methods** | 13 — see [METHODS.md](METHODS.md) |
 | **Benchmark** | built-in multi-method benchmark — see [BENCHMARK.md](BENCHMARK.md) |
 
 ---
@@ -55,21 +59,6 @@ into this framework.
 > For full BIOMERO setup instructions see the
 > [BIOMERO documentation](https://nl-bioimaging.github.io/biomero/)
 > and the [NL-BIOMERO deployment repo](https://github.com/NL-BioImaging/NL-BIOMERO).
-
-### SLURM job script
-
-A ready-made SLURM script is provided for manual cluster submission
-(outside of BIOMERO):
-
-```bash
-sbatch cideconvolve.slurm \
-    --infolder /data/myimages \
-    --outfolder /data/results \
-    -- --method sdeconv_rl --iterations 40 --benchmark True \
-       --bench_methods all
-```
-
-See `cideconvolve.slurm` for full usage and resource settings.
 
 ---
 
@@ -127,44 +116,6 @@ docker run --rm --gpus all \
 
 ---
 
-## Running locally without Docker
-
-### Requirements
-
-- Python 3.10 or 3.11
-- PyTorch with CUDA support (see `requirements.txt` for install instructions)
-- Java 17+ (for DeconvolutionLab2 methods)
-- Optional: pycudadecon via conda, deconwolf binary on `$PATH`
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install -r requirements.txt
-```
-
-### CLI
-
-```bash
-python wrapper.py \
-    --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder \
-    --method sdeconv_rl --iterations 40 \
-    --na auto --refractive_index auto --sample_ri auto
-```
-
-### Launcher (GUI)
-
-A PyQt6-based launcher provides a graphical interface with parameter
-controls, folder pickers, and a live command preview:
-
-```bash
-pip install PyQt6
-python launcher.py
-```
-
-The launcher saves your last-used settings and can restore them on next
-launch via the **Restore Last Settings** button.
-
----
-
 ## Parameters
 
 All parameters are defined in `descriptor.json` and exposed on the
@@ -202,7 +153,6 @@ descriptor.json       BIAFLOWS/BIOMERO parameter descriptor
 bioflows_local.py     Local BIAFLOWS compatibility shim
 cideconvolve.slurm    SLURM job script for HPC execution
 Dockerfile            Multi-stage Docker build
-requirements.txt      Python dependencies (local install)
 requirements_docker.txt  Pinned dependencies for Docker
 vendor/               Vendored libraries (sdeconv, psf_generator)
 docs/                 Benchmark output images and CSV
@@ -225,4 +175,4 @@ For benchmark results and metrics see [BENCHMARK.md](BENCHMARK.md).
 
 ## License
 
-See individual library licenses in `vendor/` and `gitclones/`.
+See individual library licenses in `vendor/` 
