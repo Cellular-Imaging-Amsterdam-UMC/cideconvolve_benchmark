@@ -567,6 +567,10 @@ METHODS = {
     "deconwolf_shb": {"memory_factor": 4, "description": "deconwolf Scaled Heavy Ball (CLI)"},
     "deconvlab2_rl": {"memory_factor": 4, "description": "DeconvolutionLab2 Richardson-Lucy (CLI)"},
     "deconvlab2_rltv": {"memory_factor": 4, "description": "DeconvolutionLab2 RL-Total Variation (CLI)"},
+    "deconvlab2_landweber": {"memory_factor": 4, "description": "DeconvolutionLab2 Landweber (CLI)"},
+    "deconvlab2_tikhonov_miller": {"memory_factor": 4, "description": "DeconvolutionLab2 Tikhonov-Miller (CLI)"},
+    "deconvlab2_fista": {"memory_factor": 4, "description": "DeconvolutionLab2 FISTA wavelet deconvolution (CLI)"},
+    "deconvlab2_ista": {"memory_factor": 4, "description": "DeconvolutionLab2 ISTA wavelet deconvolution (CLI)"},
     "redlionfish_rl": {"memory_factor": 4, "description": "RedLionfish RL (OpenCL GPU + CPU fallback)"},
     "skimage_rl": {"memory_factor": 4, "description": "scikit-image Richardson-Lucy (CPU)"},
     "skimage_unsupervised_wiener": {"memory_factor": 3, "description": "scikit-image Unsupervised Wiener-Hunt (CPU)"},
@@ -981,9 +985,18 @@ def deconvolve(
         )
 
     if method.startswith("deconvlab2_"):
-        dl2_algo = method.split("_", 1)[1].upper()  # "RL" or "RLTV"
+        dl2_algorithms = {
+            "deconvlab2_rl": ("RL", None),
+            "deconvlab2_rltv": ("RLTV", {"tv_lambda": tv_lambda}),
+            "deconvlab2_landweber": ("LW", {"step": 1.0}),
+            "deconvlab2_tikhonov_miller": ("TM", {"step": 1.0, "regularization": 0.1}),
+            "deconvlab2_fista": ("FISTA", {"step": 1.0, "regularization": 0.1, "wavelet": "Haar", "scale": 3}),
+            "deconvlab2_ista": ("ISTA", {"step": 1.0, "regularization": 0.1, "wavelet": "Haar", "scale": 3}),
+        }
+        dl2_algo, dl2_kwargs = dl2_algorithms[method]
         return _deconvolve_deconvlab2(
             image, psf, algorithm=dl2_algo, niter=niter, tv_lambda=tv_lambda,
+            **(dl2_kwargs or {}),
         )
 
     if method == "redlionfish_rl":
@@ -1327,6 +1340,10 @@ def _deconvolve_deconvlab2(
     algorithm: str = "RL",
     niter: int = 30,
     tv_lambda: float = 1e-4,
+    step: float = 1.0,
+    regularization: float = 0.1,
+    wavelet: str = "Haar",
+    scale: int = 3,
 ) -> np.ndarray:
     """Deconvolve a single 3-D volume using DeconvolutionLab2 CLI.
 
@@ -1357,6 +1374,14 @@ def _deconvolve_deconvlab2(
         # Build algorithm spec
         if algorithm == "RLTV":
             algo_spec = f"RLTV {niter} {tv_lambda}"
+        elif algorithm in ("LW", "LANDWEBER"):
+            algo_spec = f"LW {niter} {step}"
+        elif algorithm in ("TM", "TIKHONOV_MILLER"):
+            algo_spec = f"TM {niter} {step} {regularization}"
+        elif algorithm == "FISTA":
+            algo_spec = f"FISTA {niter} {step} {regularization} {wavelet} {scale}"
+        elif algorithm == "ISTA":
+            algo_spec = f"ISTA {niter} {step} {regularization} {wavelet} {scale}"
         else:
             algo_spec = f"{algorithm} {niter}"
 

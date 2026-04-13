@@ -1,6 +1,6 @@
 # CIDeconvolve
 
-**3-D / 2-D microscopy deconvolution with 14 algorithm backends.**
+**3-D / 2-D microscopy deconvolution with 18 algorithm backends.**
 
 CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
 workflow that deconvolves widefield and confocal fluorescence microscopy
@@ -17,8 +17,8 @@ repository and bundled here as `deconvolve_ci.py`.
 | **Docker image** | `cellularimagingcf/w_cideconvolve` |
 | **Version** | v0.1.0 |
 | **Container type** | Singularity (pulled from Docker Hub) |
-| **Available methods** | 14 — see [METHODS.md](METHODS.md) |
-| **Benchmark** | built-in multi-method benchmark — see [BENCHMARK.md](BENCHMARK.md) |
+| **Available methods** | 18 — see [METHODS.md](METHODS.md) |
+| **Benchmark** | built-in multi-method benchmark with no-reference quality and provenance outputs |
 
 ---
 
@@ -53,7 +53,7 @@ into this framework.
 3. On submission, BIOMERO pulls the Singularity image from Docker Hub,
    transfers the selected images, and executes the workflow on the cluster.
 
-4. Results (deconvolved images, benchmark montages, metrics CSV) are
+4. Results (deconvolved images, benchmark CSV/JSON outputs, optional montages) are
    automatically uploaded back into OMERO.
 
 > For full BIOMERO setup instructions see the
@@ -91,9 +91,8 @@ The Dockerfile uses a multi-stage build:
 docker run --rm --gpus all \
     -v /path/to/input:/data/in \
     -v /path/to/output:/data/out \
-    -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
-    --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
+    --infolder /data/in --outfolder /data/out \
     --method sdeconv_rl --iterations 40 \
     --na auto --refractive_index auto --sample_ri auto \
     --microscope_type auto --emission_wl auto --excitation_wl auto
@@ -108,11 +107,41 @@ pass-through.  Omit it to force CPU-only execution.
 docker run --rm --gpus all \
     -v /path/to/input:/data/in \
     -v /path/to/output:/data/out \
-    -v /tmp/gt:/data/gt \
     cellularimagingcf/w_cideconvolve \
-    --infolder /data/in --outfolder /data/out --gtfolder /data/gt \
+    --infolder /data/in --outfolder /data/out \
     --benchmark True --bench_methods all --bench_iterations "20, 40, 60"
 ```
+
+---
+
+## Benchmark outputs
+
+Benchmark mode now produces structured outputs instead of relying on a
+static checked-in report:
+
+- `benchmark_metrics_<image>.csv` — the authoritative benchmark table
+- `benchmark_provenance_<image>.json` — dataset, platform, version, and PSF provenance
+- `decon_benchmark_<image>.png` and `decon_benchmark_<image>_ch<N>.png` — optional montage images
+
+The CSV includes one row per attempted method/iteration pair, including
+successful runs, skips, and errors. Each row records:
+
+- dataset and method identifiers
+- crop/full-volume and tiling settings
+- performance metrics
+- quality metrics
+- status and skip/error reason
+
+### Quality metrics
+
+Benchmark quality is no-reference only:
+
+- `sharpness_mean` — mean variance of the Laplacian after per-channel normalization. Higher values usually mean crisper edges and finer structure, but they can also increase when noise is amplified.
+- `contrast_mean` — mean robust intensity range after normalization, computed as the 99th percentile minus the 1st percentile. Higher values usually mean stronger separation between dim and bright structures.
+- `noise_proxy_mean` — mean interquartile range after normalization, computed as the 75th percentile minus the 25th percentile. This is a rough spread/noise indicator: higher values can reflect richer texture, but also more residual background or noise.
+
+These three metrics should be interpreted together with the montage images.
+None of them is a true biological or ground-truth accuracy score on its own.
 
 ---
 
@@ -135,19 +164,20 @@ command line via `wrapper.py`:
 | `--emission_wl` | auto | Emission wavelengths in nm (comma-separated) |
 | `--excitation_wl` | auto | Excitation wavelengths in nm (for confocal PSF) |
 | `--projection` | none | Z-projection: `none`, `mip`, `sum` |
-| `--benchmark` | false | Run multi-method benchmark |
+| `--benchmark` | false | Run the benchmark suite instead of single deconvolution |
 | `--bench_iterations` | 20, 40, 60 | Iteration counts for benchmark |
-| `--bench_methods` | sdeconv_rl, pycudadecon_rl_cuda | Method set for benchmark |
+| `--bench_methods` | sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv | Method set for benchmark |
 | `--bench_crop` | true | Centre-crop images before benchmarking |
 | `--bench_one_image` | true | Benchmark only the first image (sorted by name) |
+| `--bench_montage` | true | Generate optional montage PNGs in addition to CSV/JSON outputs |
 
 ---
 
 ## Project structure
 
 ```
-wrapper.py            BIAFLOWS entrypoint — parameter parsing, benchmark runner, montage
-deconvolve.py         Core deconvolution engine with all 11 backends + PSF generation
+wrapper.py            BIAFLOWS entrypoint — parameter parsing, benchmark runner, provenance export
+deconvolve.py         Core deconvolution engine with all 18 backends + PSF generation
 launcher.py           PyQt6 GUI launcher
 descriptor.json       BIAFLOWS/BIOMERO parameter descriptor
 bioflows_local.py     Local BIAFLOWS compatibility shim
@@ -155,7 +185,6 @@ cideconvolve.slurm    SLURM job script for HPC execution
 Dockerfile            Multi-stage Docker build
 requirements_docker.txt  Pinned dependencies for Docker
 vendor/               Vendored libraries (sdeconv, psf_generator)
-docs/                 Benchmark output images and CSV
 ```
 
 ---
@@ -168,8 +197,7 @@ docs/                 Benchmark output images and CSV
 - **Gibson–Lanni model:** Gibson, S. F. & Lanni, F. (1992). [doi:10.1364/JOSAA.9.000154](https://doi.org/10.1364/JOSAA.9.000154)
 - **OMERO:** Allan, C. et al. (2012). "OMERO: flexible, model-driven data management for experimental biology." *Nat Methods* **9**, 245–253. [doi:10.1038/nmeth.1896](https://doi.org/10.1038/nmeth.1896)
 
-For method-specific references see [METHODS.md](METHODS.md).
-For benchmark results and metrics see [BENCHMARK.md](BENCHMARK.md).
+For method-specific references and platform notes see [METHODS.md](METHODS.md).
 
 ---
 

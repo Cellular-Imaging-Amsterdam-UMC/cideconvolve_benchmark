@@ -1,11 +1,11 @@
 {
-  "name": "W_CIDeconvolve",
+  "name": "W_CIDeconvolve_benchmark",
   "description": "3D/2D deconvolution for widefield and confocal microscopy images with multiple algorithm backends (sdeconv, CI SHB-RL, pycudadecon, deconwolf, DeconvolutionLab2, redlionfish, scikit-image). Supports optional GPU acceleration via CUDA and OpenCL.",
   "container-image": {
-    "image": "cellularimagingcf/w_cideconvolve",
+    "image": "cellularimagingcf/w_cideconvolve_benchmark",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image --log @log",
+  "command-line": "python wrapper.py --iterations @iterations --tiling @tiling --tile_limits @tile_limits --method @method --device @device --na @na --refractive_index @refractive_index --sample_ri @sample_ri --microscope_type @microscope_type --emission_wl @emission_wl --excitation_wl @excitation_wl --benchmark @benchmark --projection @projection --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image --bench_montage @bench_montage --log @log",
   "inputs": [
     {
       "id": "iterations",
@@ -65,8 +65,13 @@
         "deconwolf_shb",
         "deconvlab2_rl",
         "deconvlab2_rltv",
+        "deconvlab2_landweber",
+        "deconvlab2_tikhonov_miller",
+        "deconvlab2_fista",
+        "deconvlab2_ista",
         "redlionfish_rl",
         "skimage_rl",
+        "skimage_unsupervised_wiener",
         "skimage_cucim_rl"
       ]
     },
@@ -178,7 +183,7 @@
       "value-key": "@benchmark",
       "command-line-flag": "--benchmark",
       "name": "Perform Benchmark",
-      "description": "If true, run multi-method benchmark instead of single deconvolution. Uses the benchmark iterations, methods and crop settings below.",
+      "description": "If true, run the benchmark suite instead of single deconvolution. The benchmark records performance metrics, writes structured CSV + provenance outputs, and adds quality metrics when ground-truth images are available.",
       "default-value": false,
       "set-by-server": false,
       "optional": true,
@@ -200,7 +205,7 @@
       "value-key": "@bench_methods",
       "command-line-flag": "--bench_methods",
       "name": "Benchmark methods",
-      "description": "Which set of methods to benchmark. Each tier adds methods to the previous. 'all' includes every available backend. Only used when Perform Benchmark is enabled.",
+      "description": "Which set of methods to benchmark. Each tier adds methods to the previous. 'all' includes every public backend. Methods that are unsupported on the current machine are written to the CSV as skipped with a reason.",
       "default-value": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
       "set-by-server": false,
       "optional": true,
@@ -209,7 +214,7 @@
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl",
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl",
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, deconvlab2_landweber, deconvlab2_tikhonov_miller, deconvlab2_fista, deconvlab2_ista, redlionfish_rl",
         "all"
       ]
     },
@@ -230,6 +235,17 @@
       "command-line-flag": "--bench_one_image",
       "name": "Benchmark one image",
       "description": "If true, benchmark only the first image (sorted by name) from the input folder. If false, benchmark all input images. Only used when Perform Benchmark is enabled.",
+      "default-value": true,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Boolean"
+    },
+    {
+      "id": "bench_montage",
+      "value-key": "@bench_montage",
+      "command-line-flag": "--bench_montage",
+      "name": "Benchmark montage",
+      "description": "If true, generate visual montage PNGs in addition to the benchmark CSV and provenance JSON. If false, only structured benchmark outputs are written.",
       "default-value": true,
       "set-by-server": false,
       "optional": true,

@@ -48,6 +48,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
 # --- Register NVIDIA OpenCL ICD ---
 RUN mkdir -p /etc/OpenCL/vendors \
     && echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
@@ -103,7 +106,7 @@ COPY descriptor.json /app/descriptor.json
 
 # --- Set ImageJ JAR path for deconvolve.py ---
 RUN mkdir -p /root/.m2/repository/net/imagej/ij/1.51h \
-    && ln -s /app/bin/ij-1.51h.jar /root/.m2/repository/net/imagej/ij/1.51h/ij-1.51h.jar
+    && ln -sf /app/bin/ij-1.51h.jar /root/.m2/repository/net/imagej/ij/1.51h/ij-1.51h.jar
 
 # --- BIAFLOWS data directories ---
 RUN mkdir -p /data/in /data/out /data/gt

@@ -14,8 +14,10 @@ Usage (local):
 """
 import csv
 import glob
+import json
 import logging
 import os
+import platform
 import shutil
 import sys
 import tempfile
@@ -23,6 +25,8 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+from importlib import metadata as importlib_metadata
 
 # Configure logging so deconvolve.py INFO messages are visible
 logging.basicConfig(
@@ -96,6 +100,10 @@ _BENCH_BASE_DW_RLF = _BENCH_BASE_RLF + [
 _BENCH_BASE_DW_DL2_RLF = _BENCH_BASE_DW_RLF + [
     "deconvlab2_rl",
     "deconvlab2_rltv",
+    "deconvlab2_landweber",
+    "deconvlab2_tikhonov_miller",
+    "deconvlab2_fista",
+    "deconvlab2_ista",
 ]
 _BENCH_ALL = list(METHODS.keys())
 
@@ -103,7 +111,7 @@ BENCH_METHOD_SETS = {
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv": _BENCH_BASE,
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl": _BENCH_BASE_RLF,
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl": _BENCH_BASE_DW_DL2_RLF,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, deconvlab2_landweber, deconvlab2_tikhonov_miller, deconvlab2_fista, deconvlab2_ista, redlionfish_rl": _BENCH_BASE_DW_DL2_RLF,
     "all": _BENCH_ALL,
 }
 
@@ -128,6 +136,42 @@ _SAMPLE_RI = {
 
 # Default sample RI when "auto" is chosen and metadata has no value
 _SAMPLE_RI_DEFAULT = 1.45  # Vectashield
+
+BENCHMARK_CSV_FIELDS = [
+    "dataset_id",
+    "image_filename",
+    "method",
+    "iterations",
+    "device",
+    "status",
+    "status_reason",
+    "crop_mode",
+    "tiling_mode",
+    "tile_limits",
+    "time_s",
+    "cpu_percent_avg",
+    "cpu_percent_peak",
+    "ram_total_mb",
+    "ram_peak_mb",
+    "ram_percent",
+    "ram_avg_mb",
+    "ram_delta_peak_mb",
+    "gpu_util_avg",
+    "gpu_util_peak",
+    "gpu_total_mb",
+    "gpu_mem_peak_mb",
+    "gpu_mem_percent",
+    "gpu_mem_avg_mb",
+    "gpu_mem_delta_peak_mb",
+    "torch_gpu_peak_mb",
+    "torch_gpu_delta_mb",
+    "gpu_spill_mb",
+    "channels_compared",
+    "sharpness_mean",
+    "contrast_mean",
+    "noise_proxy_mean",
+    "result_shape",
+]
 
 
 def _to_bool(value) -> bool:
@@ -168,6 +212,195 @@ def _format_bytes(mb):
     return f"{mb:.0f} MB"
 
 
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _shape_to_str(images: list[np.ndarray]) -> str:
+    return " | ".join("x".join(str(dim) for dim in img.shape) for img in images)
+
+
+def _normalise_image(arr: np.ndarray) -> np.ndarray:
+    img = np.asarray(arr, dtype=np.float64)
+    lo = float(np.min(img))
+    hi = float(np.max(img))
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.float64)
+    return (img - lo) / (hi - lo)
+
+
+def _mean_or_zero(values: list[float]) -> float:
+    return float(np.mean(values)) if values else 0.0
+
+
+def _no_reference_metrics(arr: np.ndarray) -> dict[str, float]:
+    img = _normalise_image(arr)
+    p1 = float(np.percentile(img, 1))
+    p99 = float(np.percentile(img, 99))
+    q1 = float(np.percentile(img, 25))
+    q3 = float(np.percentile(img, 75))
+
+    try:
+        from scipy import ndimage
+
+        if img.ndim == 3:
+            lap_vars = [float(np.var(ndimage.laplace(z))) for z in img]
+            sharpness = float(np.mean(lap_vars)) if lap_vars else 0.0
+        else:
+            sharpness = float(np.var(ndimage.laplace(img)))
+    except ImportError:
+        grads = np.gradient(img.astype(np.float64))
+        sharpness = float(np.mean([np.var(g) for g in grads])) if grads else 0.0
+
+    return {
+        "sharpness": sharpness,
+        "contrast": p99 - p1,
+        "noise_proxy": q3 - q1,
+    }
+
+
+def _quality_metrics(
+    result_channels: list[np.ndarray],
+) -> dict[str, float | int]:
+    sharpness_vals: list[float] = []
+    contrast_vals: list[float] = []
+    noise_vals: list[float] = []
+
+    for result in result_channels:
+        nr = _no_reference_metrics(result)
+        sharpness_vals.append(nr["sharpness"])
+        contrast_vals.append(nr["contrast"])
+        noise_vals.append(nr["noise_proxy"])
+    return {
+        "channels_compared": len(result_channels),
+        "sharpness_mean": _mean_or_zero(sharpness_vals),
+        "contrast_mean": _mean_or_zero(contrast_vals),
+        "noise_proxy_mean": _mean_or_zero(noise_vals),
+    }
+
+
+def _stem(filename: str) -> str:
+    name = filename
+    for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif", ".png", ".jpg", ".jpeg", ".bmp", ".npy", ".zarr"):
+        if name.lower().endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(name).stem
+
+
+def _collect_run_provenance(
+    *,
+    img_path: Path,
+    data: dict,
+    meta_overrides: dict,
+    cli_overrides: set[str],
+    bench_crop: bool,
+    tiling: str,
+    max_tile_xy: int,
+    max_tile_z: int,
+    benchmark_rows: list[dict],
+) -> dict:
+    meta = data["metadata"]
+
+    cpu_name = platform.processor() or platform.machine()
+    try:
+        import psutil
+
+        ram_total_gb = round(psutil.virtual_memory().total / (1024 ** 3), 2)
+    except Exception:
+        ram_total_gb = 0.0
+
+    gpu_name = ""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(gpu_name, bytes):
+            gpu_name = gpu_name.decode("utf-8", errors="replace")
+    except Exception:
+        gpu_name = ""
+
+    versions = {}
+    for pkg in ("numpy", "scipy", "scikit-image", "torch", "tifffile"):
+        try:
+            versions[pkg] = importlib_metadata.version(pkg)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+
+    descriptor_image = ""
+    try:
+        descriptor = json.loads(Path(__file__).with_name("descriptor.json").read_text(encoding="utf-8"))
+        descriptor_image = descriptor.get("container-image", {}).get("image", "")
+    except Exception:
+        pass
+
+    version_txt = ""
+    try:
+        version_txt = Path(__file__).with_name("version.txt").read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+
+    defaulted = set(meta.get("_defaulted_keys", set()))
+    psf_fields = {}
+    for field in (
+        "na",
+        "refractive_index",
+        "sample_refractive_index",
+        "microscope_type",
+        "pixel_size_x",
+        "pixel_size_y",
+        "pixel_size_z",
+    ):
+        source = "image_metadata"
+        if field in cli_overrides:
+            source = "cli_override"
+        elif field in defaulted:
+            source = "fallback_default"
+        psf_fields[field] = {"value": meta.get(field), "source": source}
+
+    psf_fields["emission_wavelengths"] = {
+        "value": [ch.get("emission_wavelength") for ch in meta.get("channels", [])],
+        "source": "cli_override" if "emission_wavelength" in cli_overrides else (
+            "fallback_default" if "emission_wavelength" in defaulted else "image_metadata"
+        ),
+    }
+    psf_fields["excitation_wavelengths"] = {
+        "value": [ch.get("excitation_wavelength") for ch in meta.get("channels", [])],
+        "source": "cli_override" if "excitation_wavelength" in cli_overrides else "image_metadata",
+    }
+
+    return {
+        "benchmark_version": 1,
+        "repo_version": version_txt,
+        "container_image": descriptor_image,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "python": platform.python_version(),
+            "cpu": cpu_name,
+            "gpu": gpu_name,
+            "ram_total_gb": ram_total_gb,
+        },
+        "package_versions": versions,
+        "dataset": {
+            "image_filename": img_path.name,
+            "shape": _shape_to_str(data["images"]),
+            "n_channels": len(data["images"]),
+            "is_3d": bool(data["images"] and data["images"][0].ndim == 3),
+            "crop_mode": "center_crop" if bench_crop else "full_volume",
+            "tiling_mode": tiling,
+            "tile_limits": {"max_xy": max_tile_xy, "max_z": max_tile_z},
+        },
+        "psf_parameters": psf_fields,
+        "meta_overrides": meta_overrides,
+        "benchmark_rows": len(benchmark_rows),
+    }
+
+
 def _method_device(method: str) -> str:
     """Return the compute device label for a benchmark method."""
     _GPU_METHODS = {
@@ -176,6 +409,8 @@ def _method_device(method: str) -> str:
     _CPU_METHODS = {
         "skimage_rl", "skimage_unsupervised_wiener",
         "deconvlab2_rl", "deconvlab2_rltv",
+        "deconvlab2_landweber", "deconvlab2_tikhonov_miller",
+        "deconvlab2_fista", "deconvlab2_ista",
         "deconwolf_rl", "deconwolf_shb",
     }
     if method in _GPU_METHODS:
@@ -497,6 +732,7 @@ def main(argv):
         bench_methods = BENCH_METHOD_SETS.get(bench_methods_key, _BENCH_BASE)
         bench_crop = _to_bool(getattr(parameters, "bench_crop", True))
         bench_one_image = _to_bool(getattr(parameters, "bench_one_image", True))
+        bench_montage = _to_bool(getattr(parameters, "bench_montage", True))
 
         # Parse tiling
         tiling = str(tiling_raw).strip().lower()
@@ -541,6 +777,7 @@ def main(argv):
             print(f"  Bench methods: {bench_methods_key} ({len(bench_methods)} methods)")
             print(f"  Bench crop   : {bench_crop}")
             print(f"  Bench 1 image: {bench_one_image}")
+            print(f"  Bench montage: {bench_montage}")
 
         # Prepare data directories and collect input images
         in_imgs, _, in_path, _, out_path, tmp_path = prepare_data(
@@ -584,10 +821,14 @@ def main(argv):
                 if benchmark_mode:
                     # ----- Benchmark path -----
                     _run_benchmark(
-                        img_path, data, str(tmp_work), stem=_stem(img_resource.filename),
+                        img_path,
+                        data,
+                        str(tmp_work),
+                        stem=_stem(img_resource.filename),
                         bench_iterations=bench_iterations,
                         bench_methods=bench_methods,
                         bench_crop=bench_crop,
+                        bench_montage=bench_montage,
                         tiling=tiling,
                         max_tile_xy=max_tile_xy,
                         max_tile_z=max_tile_z,
@@ -608,6 +849,10 @@ def main(argv):
                     for csvf in tmp_work.glob("benchmark_metrics_*.csv"):
                         dest = Path(out_path) / csvf.name
                         shutil.move(str(csvf), str(dest))
+                        print(f"  -> {dest.name}")
+                    for meta_json in tmp_work.glob("benchmark_provenance_*.json"):
+                        dest = Path(out_path) / meta_json.name
+                        shutil.move(str(meta_json), str(dest))
                         print(f"  -> {dest.name}")
                 else:
                     # ----- Normal single-method path -----
@@ -697,18 +942,6 @@ def main(argv):
         if tmp_path and Path(tmp_path).exists():
             shutil.rmtree(tmp_path, ignore_errors=True)
             print(f"Cleaned up tmp folder: {tmp_path}")
-
-
-def _stem(filename: str) -> str:
-    """Derive a clean output stem from an image filename."""
-    stem = Path(filename).stem
-    # Strip layered suffixes: .ome.tiff.zarr → .ome.tiff → .ome → clean
-    for ext in (".tiff", ".tif", ".ome"):
-        if stem.lower().endswith(ext):
-            stem = stem[: -len(ext)]
-    return stem
-
-
 def _make_metadata_panel(meta, width, height, font):
     """Create an image panel showing PSF-relevant metadata.
 
@@ -1039,26 +1272,56 @@ def _make_per_channel_montages(
         print(f"    Ch{ch_idx}: {ch_path}  ({montage_w}x{montage_h})")
 
 
-def _write_metrics_csv(csv_path: Path, all_metrics: dict[str, dict]):
+def _blank_benchmark_row(
+    *,
+    dataset_id: str,
+    image_filename: str,
+    method: str,
+    iterations: int,
+    crop_mode: str,
+    tiling_mode: str,
+    tile_limits: str,
+) -> dict:
+    row = {key: "" for key in BENCHMARK_CSV_FIELDS}
+    row.update(
+        {
+            "dataset_id": dataset_id,
+            "image_filename": image_filename,
+            "method": method,
+            "iterations": iterations,
+            "crop_mode": crop_mode,
+            "tiling_mode": tiling_mode,
+            "tile_limits": tile_limits,
+            "status": "pending",
+        }
+    )
+    return row
+
+
+def _write_metrics_csv(csv_path: Path, rows: list[dict]):
     """Write benchmark metrics to a CSV file."""
-    fieldnames = [
-        "label", "device", "time_s",
-        "cpu_percent_avg", "cpu_percent_peak",
-        "ram_total_mb", "ram_peak_mb", "ram_percent", "ram_avg_mb", "ram_delta_peak_mb",
-        "gpu_util_avg", "gpu_util_peak",
-        "gpu_total_mb", "gpu_mem_peak_mb", "gpu_mem_percent", "gpu_mem_avg_mb", "gpu_mem_delta_peak_mb",
-        "torch_gpu_peak_mb", "torch_gpu_delta_mb",
-        "gpu_spill_mb",
-    ]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=BENCHMARK_CSV_FIELDS)
         writer.writeheader()
-        for label, m in sorted(all_metrics.items()):
-            row = {"label": label, "device": m.get("device", "")}
-            for k in fieldnames[2:]:
-                row[k] = f"{m.get(k, 0.0):.2f}"
-            writer.writerow(row)
+        for row in rows:
+            serialized = {}
+            for key in BENCHMARK_CSV_FIELDS:
+                value = row.get(key, "")
+                if isinstance(value, float):
+                    serialized[key] = f"{value:.6f}"
+                elif value is None:
+                    serialized[key] = ""
+                else:
+                    serialized[key] = value
+            writer.writerow(serialized)
     print(f"\n  Metrics CSV saved -> {csv_path}")
+
+
+def _write_provenance_json(json_path: Path, payload: dict) -> None:
+    with json_path.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    print(f"  Benchmark provenance saved -> {json_path}")
 
 
 def _run_benchmark(
@@ -1070,6 +1333,7 @@ def _run_benchmark(
     bench_iterations: list[int],
     bench_methods: list[str],
     bench_crop: bool,
+    bench_montage: bool,
     tiling: str,
     max_tile_xy: int,
     max_tile_z: int,
@@ -1082,18 +1346,18 @@ def _run_benchmark(
     excitation_wavelengths: list[float] | None = None,
 ):
     """Run multi-method × multi-iteration benchmark for a single image."""
+    del save_psf
     import gc
     import torch
     import tifffile
 
     meta = data["metadata"]
     images = data["images"]
-    all_metrics: dict[str, dict] = {}
+    benchmark_rows: list[dict] = []
     meta_overrides: dict = {}
-    work_path = img_path  # may be replaced with cropped file
+    work_path = img_path
+    dataset_id = _stem(img_path.name)
 
-    # Record which PSF params were explicitly set via CLI so the montage
-    # panel can distinguish "from image", "CLI override" and "default".
     _cli_set: set[str] = set()
     if na is not None:
         _cli_set.add("na")
@@ -1112,8 +1376,6 @@ def _run_benchmark(
         sample_refractive_index = _SAMPLE_RI_DEFAULT
         meta["sample_refractive_index"] = sample_refractive_index
 
-    # Write CLI overrides into meta so the montage panel shows the actual
-    # values used (not the original file/default values from load_image).
     if na is not None:
         meta["na"] = na
     if refractive_index is not None:
@@ -1128,27 +1390,28 @@ def _run_benchmark(
         for i, wl in enumerate(excitation_wavelengths):
             if i < len(meta.get("channels", [])):
                 meta["channels"][i]["excitation_wavelength"] = wl
-
     meta["_cli_overrides"] = _cli_set
 
-    # --- Optional centre-crop ---
     if bench_crop:
         cropped = []
+        crop_slices = []
         for img in images:
             if img.ndim == 3:
-                Z, H, W = img.shape
-                nz, ny, nx = min(Z, max_tile_z), min(H, max_tile_xy), min(W, max_tile_xy)
-                z0, y0, x0 = (Z - nz) // 2, (H - ny) // 2, (W - nx) // 2
-                img = img[z0:z0+nz, y0:y0+ny, x0:x0+nx]
-            elif img.ndim == 2:
-                H, W = img.shape
-                ny, nx = min(H, max_tile_xy), min(W, max_tile_xy)
-                y0, x0 = (H - ny) // 2, (W - nx) // 2
-                img = img[y0:y0+ny, x0:x0+nx]
+                z, h, w = img.shape
+                nz, ny, nx = min(z, max_tile_z), min(h, max_tile_xy), min(w, max_tile_xy)
+                z0, y0, x0 = (z - nz) // 2, (h - ny) // 2, (w - nx) // 2
+                crop_slices.append((slice(z0, z0 + nz), slice(y0, y0 + ny), slice(x0, x0 + nx)))
+                img = img[z0:z0 + nz, y0:y0 + ny, x0:x0 + nx]
+            else:
+                h, w = img.shape
+                ny, nx = min(h, max_tile_xy), min(w, max_tile_xy)
+                y0, x0 = (h - ny) // 2, (w - nx) // 2
+                crop_slices.append((slice(y0, y0 + ny), slice(x0, x0 + nx)))
+                img = img[y0:y0 + ny, x0:x0 + nx]
             cropped.append(img)
+
         print(f"  Benchmark crop: {images[0].shape} -> {cropped[0].shape}")
 
-        # Write cropped OME-TIFF with full metadata
         stack = np.stack(cropped, axis=0)
         axes = "CZYX" if cropped[0].ndim == 3 else "CYX"
         px_x = meta.get("pixel_size_x")
@@ -1157,7 +1420,8 @@ def _run_benchmark(
         resolution = (1.0 / px_x, 1.0 / px_y) if px_x and px_y else None
         crop_path = Path(out_path) / f"_bench_crop_{stem}.ome.tiff"
         tifffile.imwrite(
-            str(crop_path), stack,
+            str(crop_path),
+            stack,
             ome=True,
             photometric="minisblack",
             resolution=resolution,
@@ -1173,18 +1437,11 @@ def _run_benchmark(
                 "Channel": {
                     k: v
                     for k, v in {
-                        "Name": [
-                            ch.get("name", f"Ch{i}")
-                            for i, ch in enumerate(meta.get("channels", []))
-                        ],
-                        "EmissionWavelength": [
-                            ch.get("emission_wavelength")
-                            for ch in meta.get("channels", [])
-                        ] if all(ch.get("emission_wavelength") is not None for ch in meta.get("channels", [])) else None,
-                        "ExcitationWavelength": [
-                            ch.get("excitation_wavelength")
-                            for ch in meta.get("channels", [])
-                        ] if all(ch.get("excitation_wavelength") is not None for ch in meta.get("channels", [])) else None,
+                        "Name": [ch.get("name", f"Ch{i}") for i, ch in enumerate(meta.get("channels", []))],
+                        "EmissionWavelength": [ch.get("emission_wavelength") for ch in meta.get("channels", [])]
+                        if all(ch.get("emission_wavelength") is not None for ch in meta.get("channels", [])) else None,
+                        "ExcitationWavelength": [ch.get("excitation_wavelength") for ch in meta.get("channels", [])]
+                        if all(ch.get("excitation_wavelength") is not None for ch in meta.get("channels", [])) else None,
                     }.items()
                     if v is not None
                 },
@@ -1215,71 +1472,113 @@ def _run_benchmark(
             "excitation_wavelengths": excitation_wavelengths,
         }
 
-    # --- Check method availability and filter ---
     available_methods = []
-    for m in bench_methods:
-        ok, reason = _check_method_available(m)
+    skip_reasons = {}
+    for method in bench_methods:
+        ok, reason = _check_method_available(method)
         if ok:
-            available_methods.append(m)
+            available_methods.append(method)
         else:
-            print(f"  Skipping {m}: {reason}")
+            skip_reasons[method] = reason
+            print(f"  Skipping {method}: {reason}")
 
-    if not available_methods:
-        print("  No benchmark methods available -- skipping.")
-        return
-
-    print(f"\n  Benchmarking {len(available_methods)} method(s) x "
-          f"{len(bench_iterations)} iteration count(s)")
-
-    # --- Run all method × iteration combinations ---
-    for m in available_methods:
+    print(f"\n  Benchmarking {len(available_methods)} available method(s) x {len(bench_iterations)} iteration count(s)")
+    for method in bench_methods:
         for nit in bench_iterations:
-            label = f"{m}_{nit}i"
-            print(f"\n  -- {m}, {nit} iterations --")
+            row = _blank_benchmark_row(
+                dataset_id=dataset_id,
+                image_filename=img_path.name,
+                method=method,
+                iterations=nit,
+                crop_mode="center_crop" if bench_crop else "full_volume",
+                tiling_mode=tiling,
+                tile_limits=f"{max_tile_xy},{max_tile_z}",
+            )
+            benchmark_rows.append(row)
+
+            if method not in available_methods:
+                row["status"] = "skipped"
+                row["status_reason"] = skip_reasons.get(method, "method_unavailable")
+                continue
+
+            print(f"\n  -- {method}, {nit} iterations --")
             try:
-                # sdeconv methods: pick CUDA if available, otherwise CPU
-                if m.startswith("sdeconv_"):
+                if method.startswith("sdeconv_"):
                     dev_val = "cuda" if torch.cuda.is_available() else "cpu"
                     monitor = _MetricsMonitor()
                     monitor.start()
                     result = deconvolve_image(
-                        work_path, method=m, niter=nit,
+                        work_path,
+                        method=method,
+                        niter=nit,
                         device=dev_val,
-                        tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+                        tiling=tiling,
+                        max_tile_xy=max_tile_xy,
+                        max_tile_z=max_tile_z,
                         **meta_overrides,
                     )
-                    out_name = f"{stem}_{m}_{dev_val}_{nit}i.ome.tiff"
+                    out_name = f"{stem}_{method}_{dev_val}_{nit}i.ome.tiff"
                     out_file = Path(out_path) / out_name
                     save_result(result, str(out_file), mip_only=True)
                     metrics = monitor.stop()
-                    metrics["device"] = dev_val.upper()
-                    key = f"{m}_{dev_val}_{nit}i"
-                    all_metrics[key] = metrics
-                    gpu_d = metrics['torch_gpu_delta_mb']
-                    print(f"    {dev_val}: {metrics['time_s']:.1f}s"
-                          f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
-                          f"  Alloc d{_format_bytes(gpu_d)}"
-                          f" -> {out_name}")
-                    del result
+                    row["device"] = dev_val.upper()
+                    gpu_delta = metrics["torch_gpu_delta_mb"]
+                    print(
+                        f"    {dev_val}: {metrics['time_s']:.1f}s"
+                        f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
+                        f"  Alloc d{_format_bytes(gpu_delta)}"
+                        f" -> {out_name}"
+                    )
                 else:
                     monitor = _MetricsMonitor()
                     monitor.start()
                     result = deconvolve_image(
-                        work_path, method=m, niter=nit,
-                        tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+                        work_path,
+                        method=method,
+                        niter=nit,
+                        tiling=tiling,
+                        max_tile_xy=max_tile_xy,
+                        max_tile_z=max_tile_z,
                         **meta_overrides,
                     )
-                    out_name = f"{stem}_{m}_{nit}i.ome.tiff"
+                    out_name = f"{stem}_{method}_{nit}i.ome.tiff"
                     out_file = Path(out_path) / out_name
                     save_result(result, str(out_file), mip_only=True)
                     metrics = monitor.stop()
-                    metrics["device"] = _method_device(m)
-                    all_metrics[label] = metrics
-                    print(f"    {metrics['time_s']:.1f}s"
-                          f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
-                          f"  Alloc d{_format_bytes(metrics['gpu_mem_delta_peak_mb'])}"
-                          f" -> {out_name}")
-                    del result
+                    row["device"] = _method_device(method)
+                    print(
+                        f"    {metrics['time_s']:.1f}s"
+                        f"  RAM d{_format_bytes(metrics['ram_delta_peak_mb'])}"
+                        f"  Alloc d{_format_bytes(metrics['gpu_mem_delta_peak_mb'])}"
+                        f" -> {out_name}"
+                    )
+
+                row["status"] = "ok"
+                row["status_reason"] = ""
+                for key in (
+                    "time_s",
+                    "cpu_percent_avg",
+                    "cpu_percent_peak",
+                    "ram_total_mb",
+                    "ram_peak_mb",
+                    "ram_percent",
+                    "ram_avg_mb",
+                    "ram_delta_peak_mb",
+                    "gpu_util_avg",
+                    "gpu_util_peak",
+                    "gpu_total_mb",
+                    "gpu_mem_peak_mb",
+                    "gpu_mem_percent",
+                    "gpu_mem_avg_mb",
+                    "gpu_mem_delta_peak_mb",
+                    "torch_gpu_peak_mb",
+                    "torch_gpu_delta_mb",
+                    "gpu_spill_mb",
+                ):
+                    row[key] = _safe_float(metrics.get(key, 0.0))
+                row["result_shape"] = _shape_to_str(result["channels"])
+                row.update(_quality_metrics(result["channels"]))
+                del result
 
                 gc.collect()
                 if torch.cuda.is_available():
@@ -1287,17 +1586,17 @@ def _run_benchmark(
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
 
-                # Wait for GPU memory to settle, then pause between methods
                 if torch.cuda.is_available():
                     try:
                         import pynvml
+
                         pynvml.nvmlInit()
                         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
                         prev_used = None
-                        for _ in range(10):          # up to ~5 s polling
+                        for _ in range(10):
                             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
                             if prev_used is not None and mem.used == prev_used:
-                                break                # memory stable
+                                break
                             prev_used = mem.used
                             time.sleep(0.5)
                     except Exception:
@@ -1306,59 +1605,98 @@ def _run_benchmark(
                     time.sleep(2)
 
             except ValueError as exc:
-                # Clean one-liner for expected issues (e.g. 2D not supported)
                 print(f"    SKIPPED: {exc}")
+                row["status"] = "skipped"
+                row["status_reason"] = str(exc)
             except Exception as exc:
                 print(f"    ERROR: {exc}")
                 import traceback
-                traceback.print_exc()
 
-    # --- Metrics summary ---
-    if all_metrics:
-        hdr = (f"  {'Method':<35} {'Device':>6} {'Time':>7} {'CPU%':>6}"
-               f" {'RAM tot':>8} {'RAM pk':>8} {'RAM%':>5} {'RAM Δ':>8}"
-               f" {'GPU%':>6} {'VRAM tot':>9} {'VRAM pk':>8} {'VRAM%':>5} {'Alloc Δ':>8} {'Spill':>8}")
+                traceback.print_exc()
+                row["status"] = "error"
+                row["status_reason"] = str(exc)
+
+    successful_rows = [row for row in benchmark_rows if row.get("status") == "ok"]
+    if successful_rows:
+        hdr = (
+            f"  {'Method':<35} {'Device':>6} {'Time':>7} {'CPU%':>6}"
+            f" {'RAM tot':>8} {'RAM pk':>8} {'RAM%':>5} {'RAM Δ':>8}"
+            f" {'GPU%':>6} {'VRAM tot':>9} {'VRAM pk':>8} {'VRAM%':>5} {'Alloc Δ':>8} {'Spill':>8}"
+        )
         sep = f"  {'─' * len(hdr.strip())}"
         print(f"\n{sep}")
-        print(f"  Benchmark metrics summary:")
+        print("  Benchmark metrics summary:")
         print(f"{sep}")
         print(hdr)
         print(f"{sep}")
-        for label, m in sorted(all_metrics.items()):
-            # Use PyTorch delta for sdeconv (precise), pynvml delta for others
-            gpu_delta = m['torch_gpu_delta_mb'] if label.startswith('sdeconv_') else m['gpu_mem_delta_peak_mb']
-            spill = m.get('gpu_spill_mb', 0.0)
+        for row in sorted(successful_rows, key=lambda r: (str(r['method']), int(r['iterations']))):
+            label = f"{row['method']}_{row['iterations']}i"
+            gpu_delta = row["torch_gpu_delta_mb"] if str(row["method"]).startswith("sdeconv_") else row["gpu_mem_delta_peak_mb"]
+            spill = _safe_float(row.get("gpu_spill_mb", 0.0))
             spill_str = _format_bytes(spill) if spill > 0 else "—"
-            ram_pct = m.get('ram_percent', 0.0)
-            gpu_pct = m.get('gpu_mem_percent', 0.0)
-            print(f"  {label:<35} {m.get('device', '?'):>6}"
-                  f" {m['time_s']:>6.1f}s"
-                  f" {m['cpu_percent_avg']:>5.0f}%"
-                  f" {_format_bytes(m['ram_total_mb']):>8}"
-                  f" {_format_bytes(m['ram_peak_mb']):>8}"
-                  f" {ram_pct:>4.0f}%"
-                  f" {_format_bytes(m['ram_delta_peak_mb']):>8}"
-                  f" {m['gpu_util_avg']:>5.0f}%"
-                  f" {_format_bytes(m['gpu_total_mb']):>9}"
-                  f" {_format_bytes(m['gpu_mem_peak_mb']):>8}"
-                  f" {gpu_pct:>4.0f}%"
-                  f" {_format_bytes(gpu_delta):>8}"
-                  f" {spill_str:>8}")
+            print(
+                f"  {label:<35} {row.get('device', '?'):>6}"
+                f" {_safe_float(row['time_s']):>6.1f}s"
+                f" {_safe_float(row['cpu_percent_avg']):>5.0f}%"
+                f" {_format_bytes(_safe_float(row['ram_total_mb'])):>8}"
+                f" {_format_bytes(_safe_float(row['ram_peak_mb'])):>8}"
+                f" {_safe_float(row['ram_percent']):>4.0f}%"
+                f" {_format_bytes(_safe_float(row['ram_delta_peak_mb'])):>8}"
+                f" {_safe_float(row['gpu_util_avg']):>5.0f}%"
+                f" {_format_bytes(_safe_float(row['gpu_total_mb'])):>9}"
+                f" {_format_bytes(_safe_float(row['gpu_mem_peak_mb'])):>8}"
+                f" {_safe_float(row['gpu_mem_percent']):>4.0f}%"
+                f" {_format_bytes(_safe_float(gpu_delta)):>8}"
+                f" {spill_str:>8}"
+            )
         print(f"{sep}")
 
-    # --- CSV export ---
     csv_path = Path(out_path) / f"benchmark_metrics_{stem}.csv"
-    _write_metrics_csv(csv_path, all_metrics)
+    _write_metrics_csv(csv_path, benchmark_rows)
 
-    # --- Create montage from MIP PNGs ---
-    montage_path = _make_benchmark_montage(
-        out_path, stem, available_methods, bench_iterations, all_metrics, meta,
+    provenance_path = Path(out_path) / f"benchmark_provenance_{stem}.json"
+    _write_provenance_json(
+        provenance_path,
+        _collect_run_provenance(
+            img_path=img_path,
+            data=data,
+            meta_overrides=meta_overrides,
+            cli_overrides=_cli_set,
+            bench_crop=bench_crop,
+            tiling=tiling,
+            max_tile_xy=max_tile_xy,
+            max_tile_z=max_tile_z,
+            benchmark_rows=benchmark_rows,
+        ),
     )
 
-    # --- Create per-channel greyscale montages from MIP TIFFs ---
-    _make_per_channel_montages(
-        out_path, stem, available_methods, bench_iterations, all_metrics, meta,
-    )
+    montage_metrics = {}
+    for row in successful_rows:
+        key = (
+            f"{row['method']}_{str(row['device']).lower()}_{row['iterations']}i"
+            if str(row["method"]).startswith("sdeconv_")
+            else f"{row['method']}_{row['iterations']}i"
+        )
+        montage_metrics[key] = {
+            "device": row.get("device", ""),
+            "time_s": _safe_float(row.get("time_s", 0.0)),
+            "cpu_percent_avg": _safe_float(row.get("cpu_percent_avg", 0.0)),
+            "ram_total_mb": _safe_float(row.get("ram_total_mb", 0.0)),
+            "ram_peak_mb": _safe_float(row.get("ram_peak_mb", 0.0)),
+            "ram_percent": _safe_float(row.get("ram_percent", 0.0)),
+            "ram_delta_peak_mb": _safe_float(row.get("ram_delta_peak_mb", 0.0)),
+            "gpu_util_avg": _safe_float(row.get("gpu_util_avg", 0.0)),
+            "gpu_total_mb": _safe_float(row.get("gpu_total_mb", 0.0)),
+            "gpu_mem_peak_mb": _safe_float(row.get("gpu_mem_peak_mb", 0.0)),
+            "gpu_mem_percent": _safe_float(row.get("gpu_mem_percent", 0.0)),
+            "gpu_mem_delta_peak_mb": _safe_float(row.get("gpu_mem_delta_peak_mb", 0.0)),
+            "torch_gpu_peak_mb": _safe_float(row.get("torch_gpu_peak_mb", 0.0)),
+            "torch_gpu_delta_mb": _safe_float(row.get("torch_gpu_delta_mb", 0.0)),
+            "gpu_spill_mb": _safe_float(row.get("gpu_spill_mb", 0.0)),
+        }
+    if bench_montage:
+        _make_benchmark_montage(out_path, stem, available_methods, bench_iterations, montage_metrics, meta)
+        _make_per_channel_montages(out_path, stem, available_methods, bench_iterations, montage_metrics, meta)
 
 
 if __name__ == "__main__":

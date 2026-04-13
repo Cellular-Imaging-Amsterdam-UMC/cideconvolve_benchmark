@@ -1,9 +1,9 @@
 {
   "values": {
-    "iterations": 20,
+    "iterations": 40,
     "tiling": "custom",
     "tile_limits": "512, 64",
-    "method": "sdeconv_rl",
+    "method": "imagej_ops_rltv",
     "device": "auto",
     "na": "auto",
     "refractive_index": "auto",
@@ -12,11 +12,12 @@
     "emission_wl": "auto",
     "excitation_wl": "auto",
     "projection": "none",
-    "benchmark": true,
+    "benchmark": false,
     "bench_iterations": "20, 40, 60",
-    "bench_methods": "all",
+    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
     "bench_crop": true,
     "bench_one_image": true,
+    "bench_montage": true,
     "log": false
   },
   "folders": {

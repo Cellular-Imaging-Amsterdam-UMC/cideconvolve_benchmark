@@ -1,5 +1,5 @@
 """
-launcher.py — PyQt6 GUI frontend for W_CIDeconvolve descriptor.json.
+launcher.py — PyQt6 GUI frontend for W_CIDeconvolve_benchmark descriptor.json.
 
 Dynamically reads descriptor.json and builds a form with appropriate
 widgets for each parameter. On "Run" it executes the Docker container
@@ -18,7 +18,7 @@ from pathlib import Path
 # Windows taskbar: set AppUserModelID so the taskbar shows our icon, not Python's
 if sys.platform == "win32":
     import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ci.w_cideconvolve.launcher")
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ci.w_cideconvolve_benchmark.launcher")
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
@@ -81,7 +81,7 @@ def load_descriptor() -> dict:
 def build_docker_command(descriptor: dict, values: dict, folders: dict) -> list[str]:
     """Build the docker run command from descriptor and current widget values."""
     # Derive from descriptor, strip namespace (e.g. "cellularimagingcf/") for local run
-    full_image = descriptor.get("container-image", {}).get("image", "w_cideconvolve")
+    full_image = descriptor.get("container-image", {}).get("image", "w_cideconvolve_benchmark")
     image = full_image.rsplit("/", 1)[-1]
     name = descriptor.get("name", image)
 
@@ -130,7 +130,7 @@ class LauncherWindow(QMainWindow):
         self._build_ui()
 
     def _build_ui(self):
-        name = self.descriptor.get("name", "W_CIDeconvolve")
+        name = self.descriptor.get("name", "W_CIDeconvolve_benchmark")
         self.setWindowTitle(f"{name} — Launcher")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setMinimumWidth(676)
