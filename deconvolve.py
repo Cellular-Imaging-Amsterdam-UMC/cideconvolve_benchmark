@@ -71,6 +71,10 @@ _IJ_JAR_CANDIDATES = [
     / ".m2" / "repository" / "net" / "imagej" / "ij" / "1.51h" / "ij-1.51h.jar",
 ]
 _IJ_JAR = next((p for p in _IJ_JAR_CANDIDATES if p.is_file()), _IJ_JAR_CANDIDATES[-1])
+_DL2_EXTRA_CP = [
+    Path(__file__).parent / "bin" / "JTransforms-3.1.jar",
+    Path(__file__).parent / "bin" / "JLargeArrays-1.5.jar",
+]
 _BIN_DIR = Path(__file__).parent / "bin"
 _DW_EXE = str(_BIN_DIR / "dw.exe") if (_BIN_DIR / "dw.exe").is_file() else (shutil.which("dw") or "")
 _DW_BW_EXE = str(_BIN_DIR / "dw_bw.exe") if (_BIN_DIR / "dw_bw.exe").is_file() else (shutil.which("dw_bw") or "")
@@ -1382,12 +1386,17 @@ def _deconvolve_deconvlab2(
             algo_spec = f"{algorithm} {niter}"
 
         sep = ";" if sys.platform == "win32" else ":"
-        cp = f"{dl2_jar}{sep}{ij_jar}"
+        cp_entries = [str(dl2_jar), str(ij_jar)]
+        cp_entries.extend(str(p) for p in _DL2_EXTRA_CP if p.is_file())
+        cp = sep.join(cp_entries)
         cmd = [
-            java, "-cp", cp, "DeconvolutionLab2", "Run",
+            java,
+            f"-XX:ActiveProcessorCount={os.cpu_count() or 1}",
+            "-cp", cp, "DeconvolutionLab2", "Run",
             "-image", "file", img_path,
             "-psf", "file", psf_path,
             "-algorithm", *algo_spec.split(),
+            "-fft", "JTransforms",
             "-out", "stack", "noshow", result_name,
             "-path", tmp,
             "-monitor", "console",

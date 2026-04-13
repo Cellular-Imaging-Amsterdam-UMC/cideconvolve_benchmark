@@ -84,7 +84,11 @@ RUN mkdir -p /root/.config/deconwolf
 # --- Download ImageJ JAR (required by DeconvolutionLab2) ---
 RUN mkdir -p /app/bin \
     && wget -q -O /app/bin/ij-1.51h.jar \
-       "https://repo1.maven.org/maven2/net/imagej/ij/1.51h/ij-1.51h.jar"
+       "https://repo1.maven.org/maven2/net/imagej/ij/1.51h/ij-1.51h.jar" \
+    && wget -q -O /app/bin/JTransforms-3.1.jar \
+       "https://repo1.maven.org/maven2/com/github/wendykierp/JTransforms/3.1/JTransforms-3.1.jar" \
+    && wget -q -O /app/bin/JLargeArrays-1.5.jar \
+       "https://repo1.maven.org/maven2/pl/edu/icm/JLargeArrays/1.5/JLargeArrays-1.5.jar"
 
 # --- Copy DeconvolutionLab2 JAR ---
 COPY bin/DeconvolutionLab_2.jar /app/bin/DeconvolutionLab_2.jar

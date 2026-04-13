@@ -134,6 +134,7 @@ CPU-only, but well-tested and supports both 2-D and 3-D images.
 - **2-D support:** ✅ Yes
 - **GPU:** None (CPU only, multi-threaded via Java)
 - **Implementation note:** The added Landweber / ISTA variants use DeconvolutionLab2's built-in default step, regularization, and wavelet settings except for the shared iteration count.
+- **Performance note:** In Docker, CIDeconvolve adds `JTransforms` and `JLargeArrays` to the Java classpath and requests `-fft JTransforms` when launching DeconvolutionLab2, which is typically faster than the default academic FFT backend.
 
 ### 11. RedLionfish — `redlionfish_rl`
 
