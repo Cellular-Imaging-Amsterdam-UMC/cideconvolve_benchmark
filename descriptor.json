@@ -182,9 +182,9 @@
       "command-line-flag": "--benchmark",
       "name": "Perform Benchmark",
       "description": "If true, run the benchmark suite instead of single deconvolution. The benchmark records performance metrics, writes structured CSV + provenance outputs, and adds quality metrics when ground-truth images are available.",
-      "default-value": false,
+      "default-value": true,
       "set-by-server": false,
-      "optional": true,
+      "optional": false,
       "type": "Boolean"
     },
     {
