@@ -89,6 +89,7 @@ _BENCH_BASE = [
     "pycudadecon_rl_cuda",
     "ci_rl",
     "ci_rl_tv",
+    "ci_sparse_hessian",
 ]
 _BENCH_BASE_RLF = _BENCH_BASE + [
     "redlionfish_rl",
@@ -115,10 +116,10 @@ _BENCH_FAST = [
 _BENCH_ALL = list(METHODS.keys())
 
 BENCH_METHOD_SETS = {
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv": _BENCH_BASE,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl": _BENCH_BASE_RLF,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
-    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian": _BENCH_BASE,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl": _BENCH_BASE_RLF,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
+    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
     "all": _BENCH_ALL,
 }
 
@@ -423,8 +424,8 @@ def _method_device(method: str) -> str:
         return "CUDA"
     if method in _CPU_METHODS:
         return "CPU"
-    # ci_rl / ci_rl_tv — PyTorch: CUDA when available, else CPU
-    if method.startswith("ci_rl"):
+    # ci_rl / ci_rl_tv / ci_sparse_hessian — PyTorch: CUDA when available, else CPU
+    if method.startswith("ci_"):
         import torch
         return "CUDA" if torch.cuda.is_available() else "CPU"
     # redlionfish uses OpenCL — prefer GPU device, fall back to CPU device
@@ -735,7 +736,12 @@ def main(argv):
         bench_iter_raw = str(getattr(parameters, "bench_iterations", "20, 40, 60"))
         bench_iterations = [int(x.strip()) for x in bench_iter_raw.split(",") if x.strip()]
         bench_methods_key = str(getattr(parameters, "bench_methods", "fast")).lower()
-        bench_methods = BENCH_METHOD_SETS.get(bench_methods_key, _BENCH_BASE)
+        bench_methods = BENCH_METHOD_SETS.get(bench_methods_key)
+        if bench_methods is None:
+            # Key doesn't match a preset — try parsing as comma-separated method names
+            parsed = [m.strip() for m in bench_methods_key.split(",") if m.strip()]
+            valid = [m for m in parsed if m in METHODS]
+            bench_methods = valid if valid else _BENCH_BASE
         bench_crop = _to_bool(getattr(parameters, "bench_crop", True))
         bench_one_image = _to_bool(getattr(parameters, "bench_one_image", True))
         bench_montage = _to_bool(getattr(parameters, "bench_montage", True))

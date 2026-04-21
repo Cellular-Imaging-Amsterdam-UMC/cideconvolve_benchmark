@@ -1,11 +1,15 @@
 """CI Deconvolve — GPU-accelerated Richardson-Lucy with SHB momentum & PSF generation.
 
-This module provides two public functions:
+This module provides three public functions:
 
 * ``ci_rl_deconvolve``  – Scaled Heavy Ball (SHB) accelerated Richardson-Lucy
   deconvolution with optional Total Variation regularisation, Bertero boundary
   weights, and I-divergence convergence monitoring.  All heavy lifting runs on
   GPU via PyTorch when a CUDA device is available; CPU fallback is automatic.
+
+* ``ci_sparse_hessian_deconvolve`` – Variational deconvolution with a
+  sparse-Hessian / SPITFIRE-style regulariser, using the same preprocessing,
+  FFT setup, and GPU/CPU execution model as the RL-family methods.
 
 * ``ci_generate_psf``  – Physically accurate PSF generation using the vectorial
   Richards-Wolf model (high NA) or scalar Kirchhoff model (lower NA), with
@@ -141,7 +145,25 @@ def _i_divergence(observed: torch.Tensor, estimated: torch.Tensor, eps: float = 
 # Total-Variation multiplicative penalty  (Dey et al. 2006 / DL2 RLTV)
 # ---------------------------------------------------------------------------
 
-def _tv_penalty(x: torch.Tensor, tv_lambda: float) -> torch.Tensor:
+def _axis_scales(
+    ndim: int,
+    pixel_size_xy: Optional[float],
+    pixel_size_z: Optional[float],
+) -> tuple[float, ...]:
+    """Return per-axis relative derivative scaling for anisotropic voxels."""
+    xy = max(float(pixel_size_xy), 1e-12) if pixel_size_xy is not None else 1.0
+    if ndim == 2:
+        return (1.0, 1.0)
+    z = max(float(pixel_size_z), 1e-12) if pixel_size_z is not None else xy
+    z_scale = xy / z
+    return (z_scale, 1.0, 1.0)
+
+
+def _tv_penalty(
+    x: torch.Tensor,
+    tv_lambda: float,
+    axis_scales: tuple[float, ...],
+) -> torch.Tensor:
     """Multiplicative TV correction factor.
 
     Returns a tensor of the same shape as *x* such that
@@ -158,7 +180,9 @@ def _tv_penalty(x: torch.Tensor, tv_lambda: float) -> torch.Tensor:
         slc_dst = [slice(None)] * ndim
         slc_src[d] = slice(0, -1)
         slc_dst[d] = slice(1, None)
-        g[tuple(slc_dst)] = x[tuple(slc_dst)] - x[tuple(slc_src)]
+        g[tuple(slc_dst)] = (
+            x[tuple(slc_dst)] - x[tuple(slc_src)]
+        ) * axis_scales[d]
         grads.append(g)
 
     # Gradient magnitude
@@ -179,7 +203,9 @@ def _tv_penalty(x: torch.Tensor, tv_lambda: float) -> torch.Tensor:
         slc_dst = [slice(None)] * ndim
         slc_src[d] = slice(1, None)
         slc_dst[d] = slice(0, -1)
-        bg[tuple(slc_dst)] = gn[tuple(slc_dst)] - gn[tuple(slc_src)]
+        bg[tuple(slc_dst)] = (
+            gn[tuple(slc_dst)] - gn[tuple(slc_src)]
+        ) * axis_scales[d]
         div = div + bg
 
     # Multiplicative factor
@@ -200,13 +226,7 @@ def _estimate_background(image: torch.Tensor) -> float:
 
 
 def _estimate_noise_sigma(image: torch.Tensor) -> float:
-    """Robust noise σ via MAD of the lowest quartile of voxel intensities.
-
-    Uses the Median Absolute Deviation (MAD) estimator, which is robust
-    against signal outliers:  σ ≈ 1.4826 · median(|x − median(x)|).
-    Only the lowest 25 % of voxels are considered so that bright signal
-    regions do not inflate the estimate.
-    """
+    """Robust noise estimate via MAD of the lowest quartile."""
     flat = image.flatten()
     n = max(int(flat.numel() * 0.25), 1)
     lowest, _ = torch.topk(flat, n, largest=False)
@@ -222,20 +242,192 @@ def _damping_map(
     damping: float,
     background: float = 0.0,
 ) -> torch.Tensor:
-    """Per-voxel damping exponent γ ∈ (0, 1] for noise-gated RL.
-
-    γ(x) = 1 − exp(−(x − bg) / (damping · σ))
-
-    The signal above background *(x − bg)* determines the damping
-    strength.  Pixels near the background floor are heavily damped
-    (γ → 0) while bright structures get the full RL update (γ → 1).
-
-    References: Laasmaa et al. 2011; Conchello 1998.
-    """
-    scale = damping * sigma
+    """Per-voxel damping exponent γ ∈ (0, 1] for noise-gated RL."""
+    scale = max(damping * sigma, 1e-12)
     signal = (estimate - background).clamp(min=0.0)
     gamma = 1.0 - torch.exp(-signal / scale)
     return gamma.clamp(min=1e-3, max=1.0)
+
+
+def _gaussian_smooth(image: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Apply separable Gaussian smoothing along each axis."""
+    if sigma <= 0.0:
+        return image.clone()
+
+    radius = int(math.ceil(3.0 * sigma))
+    radius = max(radius, 1)
+    x = torch.arange(-radius, radius + 1, dtype=image.dtype, device=image.device)
+    kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel_1d = kernel_1d / kernel_1d.sum()
+
+    smoothed = image
+    from torch.nn.functional import conv1d
+
+    for d in range(image.ndim):
+        pad_widths = [0] * (2 * image.ndim)
+        idx = 2 * (image.ndim - 1 - d)
+        pad_widths[idx] = radius
+        pad_widths[idx + 1] = radius
+        padded = torch.nn.functional.pad(
+            smoothed.unsqueeze(0).unsqueeze(0),
+            pad_widths,
+            mode="reflect",
+        ).squeeze(0).squeeze(0)
+
+        perm = list(range(image.ndim))
+        perm.remove(d)
+        perm.append(d)
+        t = padded.permute(*perm).contiguous()
+        batch_shape = t.shape[:-1]
+        t = t.reshape(-1, 1, t.shape[-1])
+        k1 = kernel_1d.reshape(1, 1, -1)
+        t = conv1d(t, k1)
+        t = t.reshape(*batch_shape, t.shape[-1])
+        inv_perm = [0] * image.ndim
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+        smoothed = t.permute(*inv_perm).contiguous()
+
+    return smoothed
+
+
+def _initial_estimate(
+    start: str,
+    img_t: torch.Tensor,
+    d_work: torch.Tensor,
+    work_shape: tuple[int, ...],
+    slices: tuple[slice, ...],
+    bg: float,
+    dtype: torch.dtype,
+    dev: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build initial estimates for iterative solvers."""
+    if start == "flat":
+        mean_val = max(float(img_t.mean()), bg)
+        x_prev = torch.full(work_shape, mean_val, dtype=dtype, device=dev)
+        x_cur = x_prev.clone()
+        return x_prev, x_cur
+
+    if start == "lowpass":
+        x_prev = torch.full(work_shape, bg, dtype=dtype, device=dev)
+        lowpass = _gaussian_smooth(img_t, sigma=8.0).clamp(min=bg)
+        x_prev[slices] = lowpass
+        x_cur = x_prev.clone()
+        return x_prev, x_cur
+
+    # "observed" — use the padded observed image as starting point
+    x_prev = d_work.clone()
+    x_cur = d_work.clone()
+    return x_prev, x_cur
+
+
+def _forward_project(
+    estimate: torch.Tensor,
+    otf: torch.Tensor,
+    work_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Forward convolution using the prepared OTF."""
+    return _irfft(_rfft(estimate) * otf, work_shape)
+
+
+def _embed_in_work(
+    image: torch.Tensor,
+    work_shape: tuple[int, ...],
+    slices: tuple[slice, ...],
+    background: float,
+) -> torch.Tensor:
+    """Embed an image-domain estimate in the full linear-convolution domain."""
+    work = torch.full(work_shape, background, dtype=image.dtype, device=image.device)
+    work[slices] = image
+    return work
+
+
+def _poisson_nll(
+    observed: torch.Tensor,
+    estimated: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Differentiable Poisson negative log-likelihood up to constants."""
+    est_safe = estimated.clamp(min=eps)
+    return torch.mean(est_safe - observed * torch.log(est_safe))
+
+
+def _sparse_hessian_penalty(
+    x: torch.Tensor,
+    weighting: float,
+    z_scale: float = 1.0,
+) -> torch.Tensor:
+    """Sparse-Hessian / SPITFIRE-style regularisation penalty."""
+    eps = 1e-8
+    weighting = float(np.clip(weighting, 0.0, 1.0))
+
+    if x.ndim == 2:
+        if min(x.shape) < 3:
+            return torch.zeros((), dtype=x.dtype, device=x.device)
+        core = x[1:-1, 1:-1]
+        dxx = -x[2:, 1:-1] + 2.0 * core - x[:-2, 1:-1]
+        dyy = -x[1:-1, 2:] + 2.0 * core - x[1:-1, :-2]
+        dxy = x[2:, 2:] - x[2:, 1:-1] - x[1:-1, 2:] + core
+        hv = (
+            (weighting * dxx) ** 2
+            + (weighting * dyy) ** 2
+            + 2.0 * (weighting * dxy) ** 2
+            + ((1.0 - weighting) * core) ** 2
+        )
+        return torch.mean(torch.sqrt(hv + eps))
+
+    if x.ndim == 3:
+        if min(x.shape) < 3:
+            return torch.zeros((), dtype=x.dtype, device=x.device)
+        core = x[1:-1, 1:-1, 1:-1]
+        dxx = -x[1:-1, 1:-1, 2:] + 2.0 * core - x[1:-1, 1:-1, :-2]
+        dyy = -x[1:-1, 2:, 1:-1] + 2.0 * core - x[1:-1, :-2, 1:-1]
+        dzz = z_scale * z_scale * (
+            -x[2:, 1:-1, 1:-1] + 2.0 * core - x[:-2, 1:-1, 1:-1]
+        )
+        dxy = x[1:-1, 2:, 2:] - x[1:-1, 1:-1, 2:] - x[1:-1, 2:, 1:-1] + core
+        dxz = z_scale * (
+            x[2:, 1:-1, 2:] - x[1:-1, 1:-1, 2:] - x[2:, 1:-1, 1:-1] + core
+        )
+        dyz = z_scale * (
+            x[2:, 2:, 1:-1] - x[1:-1, 2:, 1:-1] - x[2:, 1:-1, 1:-1] + core
+        )
+        hv = (
+            (weighting * dxx) ** 2
+            + (weighting * dyy) ** 2
+            + (weighting * dzz) ** 2
+            + 2.0 * (weighting * dxy) ** 2
+            + 2.0 * (weighting * dxz) ** 2
+            + 2.0 * (weighting * dyz) ** 2
+            + ((1.0 - weighting) * core) ** 2
+        )
+        return torch.mean(torch.sqrt(hv + eps))
+
+    raise ValueError("Sparse-Hessian regularisation supports only 2D or 3D tensors")
+
+
+def _anscombe_prefilter(
+    image: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """Variance-stabilising Anscombe pre-filter for Poisson data.
+
+    Applies the generalised Anscombe transform  ``2·√(x + 3/8)`` to
+    convert Poisson noise to approximately unit-variance Gaussian,
+    smooths with a Gaussian of width *sigma* pixels, then applies the
+    exact unbiased inverse  ``(y/2)² − 3/8``.
+
+    References: Anscombe 1948; Makitalo & Foi 2011.
+    """
+    # Forward Anscombe transform
+    stabilised = 2.0 * torch.sqrt(image.clamp(min=0.0) + 3.0 / 8.0)
+
+    # Separable Gaussian smoothing in the stabilised domain
+    smoothed = _gaussian_smooth(stabilised, sigma)
+
+    # Inverse Anscombe transform (exact unbiased)
+    result = (smoothed / 2.0) ** 2 - 3.0 / 8.0
+    return result.clamp(min=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +558,7 @@ def _ci_deconvolve_tiled(
     image: np.ndarray,
     psf: np.ndarray,
     n_tiles: int,
+    solver,
     **kwargs,
 ) -> dict[str, Any]:
     """Split *image* into XY tiles, deconvolve each, and blend back."""
@@ -379,7 +572,7 @@ def _ci_deconvolve_tiled(
             "n_tiles=%d produces tiles smaller than PSF; falling back to "
             "no tiling.", n_tiles,
         )
-        return ci_rl_deconvolve(image, psf, tiling="none", **kwargs)
+        return solver(image, psf, tiling="none", **kwargs)
 
     tiles = _compute_tile_slices(image.shape, ny, nx, overlap)
     log.info(
@@ -403,7 +596,7 @@ def _ci_deconvolve_tiled(
         tile_img = image[:, y0_m:y1_m, x0_m:x1_m].copy()
 
         log.info("  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape)
-        tile_out = ci_rl_deconvolve(tile_img, psf, tiling="none", **kwargs)
+        tile_out = solver(tile_img, psf, tiling="none", **kwargs)
         tile_result = tile_out["result"]
 
         total_iterations = max(total_iterations, tile_out["iterations_used"])
@@ -442,10 +635,15 @@ def ci_rl_deconvolve(
     niter: int = 50,
     tv_lambda: float = 0.0,
     damping: Union[str, float] = 0.0,
+    offset: Union[str, float] = "auto",
+    prefilter_sigma: float = 0.0,
+    start: str = "flat",
     background: Union[str, float] = "auto",
     convergence: str = "auto",
     rel_threshold: float = 0.005,
     check_every: int = 5,
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
     device: Optional[str] = None,
     tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
@@ -464,10 +662,22 @@ def ci_rl_deconvolve(
     tv_lambda : float
         Total-Variation regularisation strength (0 = disabled).
     damping : ``0.0``, ``"auto"``, or float > 0
-        Noise-gated damping strength.  When > 0 the RL correction factor
-        is raised to a per-voxel power γ ∈ (0,1] that attenuates the
-        update in background (noisy) regions while leaving bright
-        structures untouched.  ``"auto"`` uses 1.0.  ``0`` = disabled.
+        Noise-gated damping strength for RL-family methods.  When enabled
+        the multiplicative correction factor is attenuated in noisy,
+        near-background regions and preserved in bright structures.
+    offset : ``"auto"``, or float >= 0
+        Constant added to the image before RL iterations and subtracted
+        afterwards.  Shifts all pixels away from zero, preventing the
+        extreme ratio amplification that causes background noise.
+        ``"auto"`` uses 5.0 (DeconWolf default).  ``0`` = disabled.
+    prefilter_sigma : float
+        Gaussian sigma (in pixels) for Anscombe variance-stabilising
+        pre-filter.  ``0`` = disabled.  Typical values: 0.5–1.0.
+    start : ``"flat"``, ``"observed"``, or ``"lowpass"``
+        Initial estimate.  ``"flat"`` uses the mean of the (offset)
+        image as a uniform starting point (DeconWolf default).
+        ``"observed"`` uses the observed image as initial estimate and
+        ``"lowpass"`` uses a strongly smoothed version of the input.
     background : ``"auto"`` or float
         Background level used as positivity floor and safe-division epsilon.
     convergence : ``"fixed"`` or ``"auto"``
@@ -493,16 +703,25 @@ def ci_rl_deconvolve(
     if n_tiles > 1:
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
-            niter=niter, tv_lambda=tv_lambda, damping=damping,
+            solver=ci_rl_deconvolve,
+            niter=niter, tv_lambda=tv_lambda, damping=damping, offset=offset,
+            prefilter_sigma=prefilter_sigma, start=start,
             background=background,
             convergence=convergence, rel_threshold=rel_threshold,
-            check_every=check_every, device=device,
+            check_every=check_every,
+            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            device=device,
             max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
         )
 
     dev = _pick_device(device)
     dtype = _pick_dtype(dev)
-    ndim = image.ndim
+
+    # Resolve offset
+    if offset == "auto":
+        offset_val = 5.0
+    else:
+        offset_val = max(float(offset), 0.0)
 
     # Resolve damping
     if damping == "auto":
@@ -511,10 +730,14 @@ def ci_rl_deconvolve(
         damp_strength = max(float(damping), 0.0)
     use_damping = damp_strength > 0.0
 
+    if start not in ("flat", "observed", "lowpass"):
+        start = "flat"
+
     log.info("ci_rl_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
-             "tv_lambda=%.4g  damping=%.4g  convergence=%s",
-             dev, dtype, image.shape, niter, tv_lambda, damp_strength,
-             convergence)
+             "tv_lambda=%.4g  damping=%.4g  offset=%.4g  prefilter_sigma=%.4g  "
+             "start=%s  convergence=%s",
+             dev, dtype, image.shape, niter, tv_lambda, damp_strength, offset_val,
+             prefilter_sigma, start, convergence)
 
     # Move data to device
     img_t = _to_tensor(image.astype(np.float64), dev, dtype)
@@ -527,13 +750,23 @@ def ci_rl_deconvolve(
         bg = max(float(background), 1e-6)
     log.info("  background=%.4g", bg)
 
-    # Noise sigma for damping (estimated once from the input image)
+    # Apply offset — shift all intensities away from zero
+    if offset_val > 0.0:
+        img_t = img_t + offset_val
+        bg = bg + offset_val
+
+    # Anscombe pre-filter (variance stabilisation)
+    if prefilter_sigma > 0.0:
+        img_t = _anscombe_prefilter(img_t, prefilter_sigma)
+        log.info("  prefilter_sigma=%.4g applied", prefilter_sigma)
+
     if use_damping:
         noise_sigma = _estimate_noise_sigma(img_t)
         log.info("  noise_sigma=%.4g  damping=%.4g", noise_sigma, damp_strength)
 
     # Work shape = image + psf - 1  (full linear convolution)
     work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
+    axis_scales = _axis_scales(img_t.ndim, pixel_size_xy, pixel_size_z)
 
     # Prepare OTF & weights
     otf, otf_conj = _prepare_otf(psf_t, work_shape)
@@ -545,11 +778,13 @@ def ci_rl_deconvolve(
     d_work[slices] = img_t
 
     # Initialise estimate
-    x_prev = d_work.clone()
-    x_cur = d_work.clone()
+    x_prev, x_cur = _initial_estimate(
+        start, img_t, d_work, work_shape, slices, bg, dtype, dev,
+    )
 
     convergence_history: list[float] = []
     use_tv = tv_lambda > 0.0
+    early_stop_min_iter = max(10, niter // 4)
     iterations_used = niter
 
     for k in range(1, niter + 1):
@@ -585,7 +820,7 @@ def ci_rl_deconvolve(
 
         # --- TV regularisation ---
         if use_tv:
-            x_new = x_new * _tv_penalty(x_new, tv_lambda)
+            x_new = x_new * _tv_penalty(x_new, tv_lambda, axis_scales)
 
         # --- Positivity ---
         x_new = x_new.clamp(min=bg)
@@ -604,7 +839,7 @@ def ci_rl_deconvolve(
             convergence_history.append(idiv)
             log.info("  iter %4d/%d  I-div=%.6g", k, niter, idiv)
 
-            if convergence == "auto" and len(convergence_history) >= 2:
+            if convergence == "auto" and len(convergence_history) >= 2 and k > early_stop_min_iter:
                 prev_idiv = convergence_history[-2]
                 if prev_idiv > 0:
                     rel_change = (prev_idiv - idiv) / prev_idiv
@@ -615,6 +850,199 @@ def ci_rl_deconvolve(
 
     # Extract the image-sized region
     result = x_cur[slices]
+
+    # Remove offset
+    if offset_val > 0.0:
+        result = (result - offset_val).clamp(min=0.0)
+
+    return {
+        "result": _to_numpy(result),
+        "convergence": convergence_history,
+        "iterations_used": iterations_used,
+    }
+
+
+def ci_sparse_hessian_deconvolve(
+    image: np.ndarray,
+    psf: np.ndarray,
+    *,
+    niter: int = 50,
+    sparse_hessian_weight: float = 0.6,
+    sparse_hessian_reg: float = 0.98,
+    offset: Union[str, float] = "auto",
+    prefilter_sigma: float = 0.0,
+    start: str = "flat",
+    background: Union[str, float] = "auto",
+    convergence: str = "auto",
+    rel_threshold: float = 0.005,
+    check_every: int = 5,
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
+    device: Optional[str] = None,
+    tiling: str = "custom",
+    max_tile_xy: int = MAX_TILE_XY,
+    max_tile_z: int = MAX_TILE_Z,
+) -> dict[str, Any]:
+    """Sparse-Hessian / SPITFIRE-style deconvolution with alternating updates."""
+    n_tiles = _resolve_tiling(tiling, image.shape, max_xy=max_tile_xy, max_z=max_tile_z)
+    if n_tiles > 1:
+        return _ci_deconvolve_tiled(
+            image, psf, n_tiles,
+            solver=ci_sparse_hessian_deconvolve,
+            niter=niter,
+            sparse_hessian_weight=sparse_hessian_weight,
+            sparse_hessian_reg=sparse_hessian_reg,
+            offset=offset,
+            prefilter_sigma=prefilter_sigma,
+            start=start,
+            background=background,
+            convergence=convergence,
+            rel_threshold=rel_threshold,
+            check_every=check_every,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            device=device,
+            max_tile_xy=max_tile_xy,
+            max_tile_z=max_tile_z,
+        )
+
+    dev = _pick_device(device)
+    dtype = _pick_dtype(dev)
+
+    if start not in ("flat", "observed", "lowpass"):
+        start = "flat"
+
+    if offset == "auto":
+        offset_val = 5.0
+    else:
+        offset_val = max(float(offset), 0.0)
+
+    sparse_hessian_weight = float(np.clip(sparse_hessian_weight, 0.0, 1.0))
+    sparse_hessian_reg = float(np.clip(sparse_hessian_reg, 0.0, 1.0))
+
+    log.info(
+        "ci_sparse_hessian_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
+        "weight=%.4g  reg=%.4g  offset=%.4g  prefilter_sigma=%.4g  start=%s  convergence=%s",
+        dev, dtype, image.shape, niter,
+        sparse_hessian_weight, sparse_hessian_reg,
+        offset_val, prefilter_sigma, start, convergence,
+    )
+
+    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
+    psf_t = _to_tensor(psf.astype(np.float64), dev, dtype)
+
+    if background == "auto":
+        bg = max(_estimate_background(img_t), 1e-6)
+    else:
+        bg = max(float(background), 1e-6)
+    log.info("  background=%.4g", bg)
+
+    if offset_val > 0.0:
+        img_t = img_t + offset_val
+        bg = bg + offset_val
+
+    if prefilter_sigma > 0.0:
+        img_t = _anscombe_prefilter(img_t, prefilter_sigma)
+        log.info("  prefilter_sigma=%.4g applied", prefilter_sigma)
+
+    work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
+    axis_scales = _axis_scales(img_t.ndim, pixel_size_xy, pixel_size_z)
+    z_scale = axis_scales[0] if img_t.ndim == 3 else 1.0
+
+    otf, otf_conj = _prepare_otf(psf_t, work_shape)
+    W = _bertero_weights(otf, otf_conj, img_t.shape, work_shape)
+
+    d_work = torch.full(work_shape, bg, dtype=dtype, device=dev)
+    slices = tuple(slice(0, s) for s in img_t.shape)
+    d_work[slices] = img_t
+
+    x_prev, x_cur = _initial_estimate(
+        start,
+        img_t,
+        d_work,
+        work_shape,
+        slices,
+        bg,
+        dtype,
+        dev,
+    )
+    x_prev = x_prev.clamp(min=bg)
+    x_cur = x_cur.clamp(min=bg)
+
+    with torch.no_grad():
+        fwd0 = _forward_project(x_cur, otf, work_shape)[slices]
+        data_scale = max(float(_poisson_nll(img_t, fwd0).detach()), 1e-6)
+        prior_scale = max(
+            float(_sparse_hessian_penalty(x_cur[slices], sparse_hessian_weight, z_scale=z_scale).detach()),
+            1e-6,
+        )
+
+    convergence_history: list[float] = []
+    iterations_used = niter
+    early_stop_min_iter = max(10, niter // 4)
+
+    for k in range(1, niter + 1):
+        if k >= 3:
+            alpha_max = 1.0 - 2.0 / math.sqrt(k + 3.0)
+            alpha = min((k - 1.0) / (k + 2.0), alpha_max)
+        else:
+            alpha = 0.0
+        p = (x_cur + alpha * (x_cur - x_prev)).clamp(min=bg)
+
+        y = _forward_project(p, otf, work_shape)
+
+        r = torch.zeros(work_shape, dtype=dtype, device=dev)
+        r[slices] = img_t / y[slices].clamp(min=bg)
+        corr = _irfft(_rfft(r) * otf_conj, work_shape)
+
+        x_data = (p * corr * W).clamp(min=bg)
+
+        prior_probe = x_data[slices].detach().requires_grad_(True)
+        prior_loss_probe = _sparse_hessian_penalty(
+            prior_probe, sparse_hessian_weight, z_scale=z_scale,
+        )
+        prior_grad = torch.autograd.grad(prior_loss_probe, prior_probe)[0]
+        grad_scale = prior_grad.abs().mean().detach().clamp(min=1e-12)
+        signal_scale = max(float((x_data[slices].mean() - bg).detach()), 1.0)
+        reg_step = 0.1 * max(1.0 - sparse_hessian_reg, 0.0) * signal_scale
+        x_new = x_data.clone()
+        x_new[slices] = (
+            x_data[slices] - reg_step * prior_grad / grad_scale
+        ).clamp(min=bg)
+
+        x_prev = x_cur
+        x_cur = x_new
+
+        if k % check_every == 0 or k == niter:
+            fwd = _forward_project(x_cur, otf, work_shape)[slices]
+            data_loss = _poisson_nll(img_t, fwd)
+            prior_loss = _sparse_hessian_penalty(
+                x_cur[slices], sparse_hessian_weight, z_scale=z_scale,
+            )
+            total_loss = (
+                sparse_hessian_reg * (data_loss / data_scale)
+                + (1.0 - sparse_hessian_reg) * (prior_loss / prior_scale)
+            )
+            obj = float(total_loss.detach())
+            convergence_history.append(obj)
+            log.info(
+                "  iter %4d/%d  objective=%.6g  data=%.6g  prior=%.6g",
+                k, niter, obj, float(data_loss.detach()), float(prior_loss.detach()),
+            )
+
+            if convergence == "auto" and len(convergence_history) >= 2 and k > early_stop_min_iter:
+                prev_obj = convergence_history[-2]
+                if prev_obj > 0:
+                    rel_change = (prev_obj - obj) / prev_obj
+                    if rel_change < rel_threshold:
+                        log.info("  converged at iter %d (rel_change=%.4g)", k, rel_change)
+                        iterations_used = k
+                        break
+
+    result = x_cur[slices]
+    if offset_val > 0.0:
+        result = (result - offset_val).clamp(min=0.0)
+
     return {
         "result": _to_numpy(result),
         "convergence": convergence_history,

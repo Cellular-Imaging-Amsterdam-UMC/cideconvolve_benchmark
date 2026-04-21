@@ -266,11 +266,26 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
             is_int = inp.get("integer", False)
             kwargs["type"] = int if is_int else float
         else:
+            # Use nargs="+" so Docker CLI space-separated values like
+            # --bench_methods sdeconv_rl, ci_rl, ci_rl_tv  are all captured
+            # instead of only the first token.
             kwargs["type"] = str
+            kwargs["nargs"] = "+"
 
         parser.add_argument(flag, dest=param_id, **kwargs)
 
     args, unknown = parser.parse_known_args(argv)
+
+    # Join multi-word string arguments back into single strings.
+    # nargs="+" produces a list; join them so downstream code sees
+    # the same comma-separated string it expects.
+    for inp in descriptor_inputs:
+        param_id = inp.get("id")
+        param_type = inp.get("type", "String")
+        if param_id and param_type not in ("Boolean", "Number"):
+            val = getattr(args, param_id, None)
+            if isinstance(val, list):
+                setattr(args, param_id, " ".join(val))
 
     # Default directories for Docker convention
     if not args.input_dir:

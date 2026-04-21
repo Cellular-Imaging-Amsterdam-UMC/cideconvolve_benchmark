@@ -579,6 +579,7 @@ METHODS = {
     "skimage_cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
     "ci_rl": {"memory_factor": 8, "description": "CI SHB-accelerated RL (PyTorch GPU)"},
     "ci_rl_tv": {"memory_factor": 8, "description": "CI SHB-accelerated RL + TV (PyTorch GPU)"},
+    "ci_sparse_hessian": {"memory_factor": 8, "description": "CI Sparse-Hessian / SPITFIRE-style (PyTorch GPU)"},
 }
 
 
@@ -971,6 +972,12 @@ def deconvolve(
             background=background, device=device,
         )
 
+    if method == "ci_sparse_hessian":
+        return _deconvolve_ci_sparse_hessian(
+            image, psf, niter=niter,
+            background=background, device=device,
+        )
+
     if method == "pycudadecon_rl_cuda":
         return _deconvolve_pycudadecon(
             image, psf, niter=niter, dzdata=dzdata, dxdata=dxdata,
@@ -1038,6 +1045,24 @@ def _deconvolve_ci_rl(
         image, psf,
         niter=niter,
         tv_lambda=tv_lambda,
+        background=background,
+        device=device,
+    )
+    return result["result"]
+
+
+def _deconvolve_ci_sparse_hessian(
+    image: np.ndarray,
+    psf: np.ndarray,
+    *,
+    niter: int = 50,
+    background: Union[int, str] = "auto",
+    device: Optional[str] = None,
+) -> np.ndarray:
+    from deconvolve_ci import ci_sparse_hessian_deconvolve
+    result = ci_sparse_hessian_deconvolve(
+        image, psf,
+        niter=niter,
         background=background,
         device=device,
     )

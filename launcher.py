@@ -104,18 +104,10 @@ def build_docker_command(descriptor: dict, values: dict, folders: dict) -> list[
         if val is None:
             continue
         if inp["type"] == "Boolean":
-            default_val = inp.get("default-value", False)
-            if default_val is True:
-                # Default-true booleans use --no-<id> in argparse (store_false)
-                # Only emit flag when user unchecks (wants False)
-                if not val:
-                    neg_flag = f"--no-{param_id.replace('_', '-')}"
-                    cmd.append(neg_flag)
-            else:
-                # Default-false booleans use --<flag> in argparse (store_true)
-                # Only emit flag when user checks (wants True)
-                if val:
-                    cmd.append(flag)
+            # The local wrapper parses descriptor booleans as --flag True/False.
+            # Always pass the explicit value so launcher behavior does not depend
+            # on whatever default is baked into the current Docker image.
+            cmd.extend([flag, str(bool(val))])
         else:
             cmd.extend([flag, str(val)])
 

@@ -14,7 +14,7 @@
     "projection": "none",
     "benchmark": true,
     "bench_iterations": "20, 40, 60, 100, 150, 200",
-    "bench_methods": "all",
+    "bench_methods": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl",
     "bench_crop": true,
     "bench_one_image": true,
     "bench_montage": true,

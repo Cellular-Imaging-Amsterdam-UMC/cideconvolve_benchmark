@@ -204,15 +204,15 @@
       "command-line-flag": "--bench_methods",
       "name": "Benchmark methods",
       "description": "Which set of methods to benchmark. Each tier adds methods to the previous. 'all' includes every public backend. Methods that are unsupported on the current machine are written to the CSV as skipped with a reason.",
-      "default-value": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
+      "default-value": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv",
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, redlionfish_rl",
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, deconwolf_rl, deconwolf_shb, redlionfish_rl",
-        "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl",
+        "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber",
         "all"
       ]
     },
