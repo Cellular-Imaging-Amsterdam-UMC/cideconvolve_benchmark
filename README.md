@@ -269,15 +269,6 @@ Dockerfile               GPU-capable benchmark container
 requirements_docker.txt  Docker Python dependencies
 vendor/                  Vendored Python libraries
 ```
-
-## History Note
-
-The generic README was not introduced by the current working tree. In local git
-history, `README.md` was first added in commit `d4e57d6` on 2026-03-31 with
-generic CIDeconvolve wording. Later commits adjusted method counts and benchmark
-details. No older benchmark-specific README exists in the local branches or
-tags, so this file has been reconstructed for the benchmark repository.
-
 ## References
 
 - [CIDeconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
