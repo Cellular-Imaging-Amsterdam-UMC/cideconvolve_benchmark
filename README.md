@@ -1,208 +1,289 @@
-# CIDeconvolve
+# CIDeconvolve Benchmark
 
-**3-D / 2-D microscopy deconvolution with 16 algorithm backends.**
+Benchmark and test workflow for microscopy deconvolution methods.
 
-CIDeconvolve is a [BIAFLOWS](https://biaflows.neubias.org/)-compatible
-workflow that deconvolves widefield and confocal fluorescence microscopy
-images.  It generates a theoretically correct PSF from OME-TIFF metadata
-and applies a user-selected deconvolution method — ranging from fast CUDA
-GPU implementations to portable CPU-only fall-backs.
+This repository wraps the CIDeconvolve deconvolution engine in a
+BIAFLOWS/BIOMERO-compatible workflow and adds tooling for comparing multiple
+deconvolution backends on the same input image. It can run as a Docker
+container, through the PyQt6 launcher, or directly from `wrapper.py` in a local
+Python environment.
 
-The two native CI methods (`ci_rl`, `ci_rl_tv`) are developed and maintained
-in the companion [cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
-repository and bundled here as `deconvolve_ci.py`.
+The core CI deconvolution and PSF code is kept in [deconvolve_ci.py](deconvolve_ci.py)
+and is synced from the companion
+[cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
+repository when needed. This benchmark repository adds descriptor handling,
+Docker/BIAFLOWS integration, benchmark CSV/provenance output, and local test
+image generation.
 
 | | |
 |---|---|
-| **Docker image** | `cellularimagingcf/w_cideconvolve` |
-| **Version** | v0.1.0 |
-| **Container type** | Singularity (pulled from Docker Hub) |
-| **Available methods** | 16 — see [METHODS.md](METHODS.md) |
-| **Benchmark** | built-in multi-method benchmark with no-reference quality and provenance outputs |
+| Workflow name | `W_CIDeconvolve_benchmark` |
+| Docker image | `cellularimagingcf/w_cideconvolve_benchmark` |
+| Version | `v1.0.0` |
+| Single-method selector | 16 methods in `descriptor.json` |
+| Benchmark sets | include `ci_sparse_hessian` in addition to the public selector methods |
+| Input format | OME-TIFF / OME-Zarr via `bioio`, with TIFF fallback |
 
----
+## What It Produces
 
-## Using CIDeconvolve with BIOMERO
+In normal mode, the workflow writes deconvolved OME-TIFF results to the output
+folder. In benchmark mode, it writes:
 
-[BIOMERO](https://github.com/NL-BioImaging/biomero) (BioImage Analysis in
-OMERO) lets you run FAIR bioimage-analysis workflows from an OMERO server
-on a SLURM-based HPC cluster.  CIDeconvolve is designed to plug directly
-into this framework.
+- `benchmark_metrics_<image>.csv`: one row per method/iteration attempt
+- `benchmark_provenance_<image>.json`: platform, version, PSF, metadata, and CLI provenance
+- `decon_benchmark_<image>.png`: optional montage for visual comparison
+- deconvolved OME-TIFF outputs for successful method runs
 
-### How it works
+Benchmark rows include timing, CPU/RAM/GPU usage, status/skip reason, tiling
+mode, crop mode, and no-reference image metrics.
 
-1. The OMERO admin configures the workflow in
-   **`slurm-config.ini`** on the SLURM submission host by adding a section
-   for `W_CIDeconvolve`:
+## Benchmark Metrics
 
-   ```ini
-   [SLURM]
-   # ... global SLURM settings ...
+The benchmark currently uses no-reference image metrics:
 
-   [W_CIDeconvolve]
-   # Override default SLURM resources for this workflow
-   job_cpus=8
-   job_memory=52G
-   job_gres=gpu:2g.24gb
-   ```
+- `detail_energy_mean`: high-frequency FFT power after normalization
+- `bright_detail_energy_mean`: high-frequency detail within bright structures
+- `edge_strength_mean`: mean normalized gradient magnitude
+- `signal_sparsity_mean`: Gini-style concentration of signal intensity
+- `robust_range_mean`: 99.5th minus 0.5th percentile after normalization
 
-2. BIOMERO reads **`descriptor.json`** from the container to discover
-   input parameters (method, iterations, device, PSF settings, benchmark
-   options, etc.) and presents them in the OMERO web UI.
+These metrics are useful for comparing restoration behavior, but they are not
+ground-truth accuracy scores. Interpret them together with the montage images
+and the source data.
 
-3. On submission, BIOMERO pulls the Singularity image from Docker Hub,
-   transfers the selected images, and executes the workflow on the cluster.
+## Metadata And PSF Behavior
 
-4. Results (deconvolved images, benchmark CSV/JSON outputs, optional montages) are
-   automatically uploaded back into OMERO.
+The workflow generates PSFs from image metadata where possible:
 
-> For full BIOMERO setup instructions see the
-> [BIOMERO documentation](https://nl-bioimaging.github.io/biomero/)
-> and the [NL-BIOMERO deployment repo](https://github.com/NL-BioImaging/NL-BIOMERO).
+- pixel size XY/Z
+- numerical aperture
+- immersion refractive index
+- sample/mounting refractive index
+- microscope type (`widefield` or `confocal`)
+- excitation and emission wavelengths
+- confocal pinhole size
 
----
+The parameter `overrule_image_metadata` controls how descriptor values are used:
 
-## Building the Docker image locally
+- `False` (default): image metadata wins, descriptor values fill missing fields
+- `True`: descriptor values replace image metadata
+
+For confocal PSFs, the current `deconvolve_ci.py` uses finite pinhole size in
+the PSF calculation. The descriptor parameter `pinhole_size` is in Airy disk
+units. OME channel `PinholeSize` is stored/read in micrometers and converted to
+Airy units using emission wavelength, NA, and objective magnification.
+
+## Synthetic 3D Test Images
+
+`create3d_gt.py` creates a deterministic synthetic 3D GFP-like cell volume and
+a blurred/noisy image generated from it:
+
+- `synthetic_object_gt.ome.tiff`
+- `synthetic_blurred_noisy_snr10.ome.tiff`
+
+The generated OME-TIFF files include structured OME metadata for pixel size,
+objective NA and magnification, immersion RI, sample RI, microscope mode,
+wavelengths, and pinhole size.
+
+Example:
 
 ```bash
-docker build -t w_cideconvolve:v0.1.0 -t w_cideconvolve:latest .
+python create3d_gt.py --no-gui --output synthetic --z 64 --yx 256
 ```
 
-The Dockerfile uses a multi-stage build:
+Useful options:
 
-1. **Builder stage** — compiles [deconwolf](https://github.com/elgw/deconwolf)
-   from source with OpenCL GPU support on the NVIDIA CUDA 12.6 devel image.
-2. **Runtime stage** — NVIDIA CUDA 12.6 runtime + Java 17 +
-   Miniforge (conda) with `pycudadecon`, all Python dependencies, and
-   the application code.
+```bash
+python create3d_gt.py --no-gui \
+  --pixel-size-xy-nm 40 \
+  --pixel-size-z-nm 100 \
+  --na 1.4 \
+  --magnification 63 \
+  --immersion-ri 1.518 \
+  --sample-ri 1.47 \
+  --microscope-type confocal \
+  --excitation-nm 488 \
+  --emission-nm 520 \
+  --pinhole-size-airy 1.0 \
+  --snr 10
+```
 
-### Prerequisites
+Run without `--no-gui` to open the PyQt6 generator interface.
 
-- Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
-  (for GPU pass-through at runtime)
-- A working `docker build` environment (Docker Desktop on Windows/macOS,
-  or Docker Engine on Linux)
+## Local Launcher
 
----
+`launcher.py` reads `descriptor.json` and builds a PyQt6 GUI for running the
+Docker container. Parameters are grouped like the main cideconvolve launcher:
+essential parameters first and advanced parameters in a collapsible section.
+The parameter grid uses two columns.
 
-## Running locally with Docker
+```bash
+python launcher.py
+```
+
+The launcher mounts local folders:
+
+- `infolder` -> `/data/in`
+- `outfolder` -> `/data/out`
+- `gtfolder` -> `/data/gt`
+
+## Build Docker Image
+
+On Windows:
+
+```bat
+builddocker.cmd
+```
+
+This reads the local image name from `descriptor.json` and the tag from
+`version.txt`, then builds:
+
+- `w_cideconvolve_benchmark:v1.0.0`
+- `w_cideconvolve_benchmark:latest`
+
+Equivalent manual command:
+
+```bash
+docker build -t w_cideconvolve_benchmark:v1.0.0 -t w_cideconvolve_benchmark:latest .
+```
+
+The Docker image includes Python 3.11, CUDA runtime support, pycudadecon,
+deconwolf, DeconvolutionLab2, Java, vendored `sdeconv`, and the benchmark
+workflow code.
+
+## Run With Docker
+
+On Windows:
+
+```bat
+run.cmd --benchmark True
+```
+
+Manual Docker example:
 
 ```bash
 docker run --rm --gpus all \
-    -v /path/to/input:/data/in \
-    -v /path/to/output:/data/out \
-    cellularimagingcf/w_cideconvolve \
-    --infolder /data/in --outfolder /data/out \
-    --method sdeconv_rl --iterations 40 \
-    --na auto --refractive_index auto --sample_ri auto \
-    --microscope_type auto --emission_wl auto --excitation_wl auto
+  -v /path/to/input:/data/in \
+  -v /path/to/output:/data/out \
+  -v /path/to/gt:/data/gt \
+  w_cideconvolve_benchmark:latest \
+  --infolder /data/in \
+  --outfolder /data/out \
+  --gtfolder /data/gt \
+  --local \
+  --benchmark True \
+  --bench_iterations "20, 40, 60"
 ```
 
-Replace paths as needed.  The `--gpus all` flag enables NVIDIA GPU
-pass-through.  Omit it to force CPU-only execution.
-
-### Benchmark mode
+For a single deconvolution method:
 
 ```bash
 docker run --rm --gpus all \
-    -v /path/to/input:/data/in \
-    -v /path/to/output:/data/out \
-    cellularimagingcf/w_cideconvolve \
-    --infolder /data/in --outfolder /data/out \
-    --benchmark True --bench_methods all --bench_iterations "20, 40, 60"
+  -v /path/to/input:/data/in \
+  -v /path/to/output:/data/out \
+  -v /path/to/gt:/data/gt \
+  w_cideconvolve_benchmark:latest \
+  --infolder /data/in \
+  --outfolder /data/out \
+  --gtfolder /data/gt \
+  --local \
+  --benchmark False \
+  --method sdeconv_rl \
+  --iterations 40
 ```
 
----
+## Run Directly In Python
 
-## Benchmark outputs
+Example:
 
-Benchmark mode now produces structured outputs instead of relying on a
-static checked-in report:
+```bash
+python wrapper.py \
+  --infolder ./infolder \
+  --outfolder ./outfolder \
+  --gtfolder ./gtfolder \
+  --local \
+  --benchmark True \
+  --bench_iterations "20, 40, 60"
+```
 
-- `benchmark_metrics_<image>.csv` — the authoritative benchmark table
-- `benchmark_provenance_<image>.json` — dataset, platform, version, and PSF provenance
-- `decon_benchmark_<image>.png` and `decon_benchmark_<image>_ch<N>.png` — optional montage images
-
-The CSV includes one row per attempted method/iteration pair, including
-successful runs, skips, and errors. Each row records:
-
-- dataset and method identifiers
-- crop/full-volume and tiling settings
-- performance metrics
-- quality metrics
-- status and skip/error reason
-
-### Quality metrics
-
-Benchmark quality is no-reference only:
-
-- `detail_energy_mean` — mean fraction of FFT power in higher spatial frequencies after per-channel normalization. Higher values usually indicate restored fine detail, but can also reflect amplified noise.
-- `bright_detail_energy_mean` — same high-frequency detail measure, restricted to the brightest structures.
-- `edge_strength_mean` — mean gradient magnitude after normalization. Higher values indicate stronger local transitions.
-- `signal_sparsity_mean` — Gini-style concentration of normalized signal intensity. Higher values indicate signal concentrated in fewer bright structures.
-- `robust_range_mean` — 99.5th percentile minus 0.5th percentile after normalization, a robust contrast range.
-
-These metrics should be interpreted together with the montage images.
-None of them is a true biological or ground-truth accuracy score on its own.
-
----
+For local development, use a Python environment with the dependencies from
+`requirements_docker.txt` installed.
 
 ## Parameters
 
-All parameters are defined in `descriptor.json` and exposed on the
-command line via `wrapper.py`:
+The user-facing parameters are defined in [descriptor.json](descriptor.json).
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--iterations` | 40 | Number of RL iterations |
-| `--tiling` | custom | Tiling mode (`none` or `custom`) |
-| `--tile_limits` | 512, 64 | Max tile dimensions `max_xy, max_z` (used when tiling = `custom`) |
-| `--method` | sdeconv_rl | Deconvolution backend — see [METHODS.md](METHODS.md) |
-| `--device` | auto | Compute device: `auto`, `cpu`, `cuda` |
-| `--na` | auto | Numerical aperture override |
-| `--refractive_index` | auto | Immersion medium RI (`air`, `water`, `oil`) |
-| `--sample_ri` | auto | Sample/mounting medium RI (named presets available) |
-| `--microscope_type` | auto | `widefield` or `confocal` |
-| `--emission_wl` | auto | Emission wavelengths in nm (comma-separated) |
-| `--excitation_wl` | auto | Excitation wavelengths in nm (for confocal PSF) |
-| `--projection` | none | Z-projection: `none`, `mip`, `sum` |
-| `--benchmark` | false | Run the benchmark suite instead of single deconvolution |
-| `--bench_iterations` | 20, 40, 60 | Iteration counts for benchmark |
-| `--bench_methods` | sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv | Method set for benchmark |
-| `--bench_crop` | true | Centre-crop images before benchmarking |
-| `--bench_one_image` | true | Benchmark only the first image (sorted by name) |
-| `--bench_montage` | true | Generate optional montage PNGs in addition to CSV/JSON outputs |
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `--method` | `sdeconv_rl` | Single deconvolution backend |
+| `--iterations` | `40` | Iteration count for iterative methods |
+| `--overrule_image_metadata` | `False` | If false, descriptor metadata fills only missing image metadata |
+| `--na` | `1.4` | Objective NA fallback/override |
+| `--emission_wl` | `520` | Emission wavelength(s), nm |
+| `--pixel_size_xy` | `65.0` | XY pixel size, nm |
+| `--pixel_size_z` | `200.0` | Z step, nm |
+| `--microscope_type` | `confocal` | `widefield` or `confocal` |
+| `--excitation_wl` | `488` | Excitation wavelength(s), nm |
+| `--pinhole_size` | `1.0` | Confocal pinhole in Airy disk units |
+| `--refractive_index` | `oil (1.515)` | Immersion medium |
+| `--sample_ri` | `prolong gold (1.47)` | Sample/mounting medium |
+| `--projection` | `none` | `none`, `mip`, or `sum` |
+| `--benchmark` | `True` | Run benchmark instead of one method |
+| `--bench_iterations` | `20, 40, 60` | Iterations used in benchmark mode |
+| `--bench_methods` | base CI set | Preset or comma-separated method list |
+| `--bench_crop` | `True` | Center-crop before benchmarking |
+| `--bench_one_image` | `True` | Benchmark only first input image |
+| `--bench_montage` | `True` | Write PNG comparison montages |
+| `--tiling` | `custom` | Advanced; `none` or `custom` |
+| `--tile_limits` | `512, 64` | Advanced; max XY and Z tile size |
+| `--device` | `auto` | Advanced; `auto`, `cpu`, `cuda` |
+| `--log` | `False` | Advanced; save console log |
 
----
+## Methods
 
-## Project structure
+See [METHODS.md](METHODS.md) for method details and platform notes.
 
+Single-method choices in `descriptor.json` currently include:
+
+- `sdeconv_rl`, `sdeconv_wiener`, `sdeconv_spitfire`
+- `ci_rl`, `ci_rl_tv`
+- `pycudadecon_rl_cuda`
+- `deconwolf_rl`, `deconwolf_shb`
+- `deconvlab2_rl`, `deconvlab2_rltv`, `deconvlab2_landweber`, `deconvlab2_ista`
+- `redlionfish_rl`
+- `skimage_rl`, `skimage_unsupervised_wiener`, `skimage_cucim_rl`
+
+Benchmark presets also include `ci_sparse_hessian`.
+
+## Project Structure
+
+```text
+wrapper.py               BIAFLOWS entrypoint and benchmark runner
+deconvolve.py            Metadata parsing, PSF generation, method dispatch, saving
+deconvolve_ci.py         CI deconvolution and finite-pinhole PSF implementation
+create3d_gt.py           Local synthetic 3D ground-truth generator
+launcher.py              PyQt6 Docker launcher
+descriptor.json          BIAFLOWS/BIOMERO parameter descriptor
+bioflows_local.py        Local BIAFLOWS compatibility shim
+Dockerfile               GPU-capable benchmark container
+requirements_docker.txt  Docker Python dependencies
+vendor/                  Vendored Python libraries
 ```
-wrapper.py            BIAFLOWS entrypoint — parameter parsing, benchmark runner, provenance export
-deconvolve.py         Core deconvolution engine with all 16 backends + PSF generation
-launcher.py           PyQt6 GUI launcher
-descriptor.json       BIAFLOWS/BIOMERO parameter descriptor
-bioflows_local.py     Local BIAFLOWS compatibility shim
-cideconvolve.slurm    SLURM job script for HPC execution
-Dockerfile            Multi-stage Docker build
-requirements_docker.txt  Pinned dependencies for Docker
-vendor/               Vendored libraries (sdeconv, psf_generator)
-```
 
----
+## History Note
+
+The generic README was not introduced by the current working tree. In local git
+history, `README.md` was first added in commit `d4e57d6` on 2026-03-31 with
+generic CIDeconvolve wording. Later commits adjusted method counts and benchmark
+details. No older benchmark-specific README exists in the local branches or
+tags, so this file has been reconstructed for the benchmark repository.
 
 ## References
 
-- **BIOMERO:** Luik, T. T., Rosas-Bertolini, R., Reits, E. A. J., Hoebe, R. A. & Krawczyk, P. M. (2024). "BIOMERO: A scalable and extensible image analysis framework." *Patterns* **5**(8), 101024. [doi:10.1016/j.patter.2024.101024](https://doi.org/10.1016/j.patter.2024.101024) · [GitHub](https://github.com/NL-BioImaging/biomero) · [Documentation](https://nl-bioimaging.github.io/biomero/)
-- **BIAFLOWS:** Rubens, U. et al. (2020). "BIAFLOWS: A Collaborative Framework to Reproducibly Deploy and Benchmark Bioimage Analysis Workflows." *Patterns* **1**(3), 100040. [doi:10.1016/j.patter.2020.100040](https://doi.org/10.1016/j.patter.2020.100040)
-- **PSF Generator:** Kirshner, H. et al. — [EPFL PSF Generator](https://bigwww.epfl.ch/algorithms/psfgenerator/)
-- **Gibson–Lanni model:** Gibson, S. F. & Lanni, F. (1992). [doi:10.1364/JOSAA.9.000154](https://doi.org/10.1364/JOSAA.9.000154)
-- **OMERO:** Allan, C. et al. (2012). "OMERO: flexible, model-driven data management for experimental biology." *Nat Methods* **9**, 245–253. [doi:10.1038/nmeth.1896](https://doi.org/10.1038/nmeth.1896)
-
-For method-specific references and platform notes see [METHODS.md](METHODS.md).
-
----
-
-## License
-
-See individual library licenses in `vendor/` 
+- [CIDeconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
+- [BIOMERO](https://github.com/NL-BioImaging/biomero)
+- [BIAFLOWS](https://biaflows.neubias.org/)
+- [deconwolf](https://github.com/elgw/deconwolf)
+- [pycudadecon](https://github.com/tlambert03/pycudadecon)
+- [RedLionfish](https://github.com/rosalindfranklininstitute/RedLionfish)
+- [DeconvolutionLab2](http://bigwww.epfl.ch/deconvolution/deconvolutionlab2/)
