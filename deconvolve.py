@@ -88,6 +88,39 @@ def _get_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
+def _pinhole_airy_units_from_metadata(
+    metadata: dict[str, Any],
+    channel: dict[str, Any],
+    wavelength_nm: float,
+) -> float:
+    """Convert OME channel PinholeSize in micrometers to Airy disk units."""
+    for key in ("pinhole_airy_units", "pinhole_size_airy"):
+        if channel.get(key) is not None:
+            return max(float(channel[key]), 0.0)
+
+    pinhole_um = channel.get("pinhole_size")
+    if pinhole_um is None:
+        return 1.0
+
+    na = max(float(metadata.get("na", 1.4)), 1e-12)
+    magnification = max(float(metadata.get("magnification") or 63.0), 1e-12)
+    emission_um = max(float(wavelength_nm) / 1000.0, 1e-12)
+    airy_um = 1.22 * emission_um * magnification / na
+    return max(float(pinhole_um) / airy_um, 0.0)
+
+
+def _apply_map_metadata(meta: dict[str, Any], values: dict[str, str]) -> None:
+    """Apply custom OME MapAnnotation values written by local helper tools."""
+    sample_ri = values.get("SampleRefractiveIndex")
+    if sample_ri is not None:
+        meta["sample_refractive_index"] = float(sample_ri)
+
+    pinhole_airy = values.get("PinholeAiryUnits")
+    if pinhole_airy is not None:
+        for ch in meta.get("channels", []):
+            ch["pinhole_airy_units"] = float(pinhole_airy)
+
+
 # ===========================================================================
 # Phase 2: OME-TIFF Reader & Metadata Extraction
 # ===========================================================================
@@ -154,6 +187,13 @@ def _parse_ome_xml(xml_path: Union[str, Path]) -> dict[str, Any]:
 
     meta["channels"] = ch_info
     meta["microscope_type"] = microscope_type or "widefield"
+
+    map_values: dict[str, str] = {}
+    for item in root.findall(".//ome:MapAnnotation/ome:Value/ome:M", ns):
+        key = item.get("K")
+        if key and item.text is not None:
+            map_values[key] = item.text
+    _apply_map_metadata(meta, map_values)
     return meta
 
 
@@ -202,6 +242,18 @@ def _extract_bioio_metadata(img) -> dict[str, Any]:
         meta["channels"] = ch_info
         meta["microscope_type"] = microscope_type or "widefield"
 
+        structured = getattr(ome, "structured_annotations", None)
+        map_values: dict[str, str] = {}
+        if structured is not None:
+            for annotation in getattr(structured, "map_annotations", []) or []:
+                value = getattr(annotation, "value", None)
+                for item in getattr(value, "ms", []) or []:
+                    key = getattr(item, "k", None)
+                    val = getattr(item, "value", None)
+                    if key and val is not None:
+                        map_values[str(key)] = str(val)
+        _apply_map_metadata(meta, map_values)
+
         # Objective info
         if image.objective_settings is not None:
             ri = getattr(image.objective_settings, "refractive_index", None)
@@ -236,7 +288,9 @@ def load_image(
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
     excitation_wavelengths: Optional[list[float]] = None,
+    pinhole_airy_units: Optional[float] = None,
     sample_refractive_index: float = 1.33,
+    overrule_metadata: bool = True,
 ) -> dict[str, Any]:
     """Load an OME-TIFF image and extract microscopy metadata.
 
@@ -391,30 +445,45 @@ def load_image(
             elif data.ndim == 2:  # Single 2D image
                 images.append(np.asarray(data, dtype=np.float32))
 
-    # Apply user overrides (Consideration 1: incomplete metadata)
-    if na is not None:
+    def _use_value(current, value) -> bool:
+        return value is not None and (overrule_metadata or current is None)
+
+    # Apply user metadata values. With overrule_metadata=False, these are
+    # fallbacks only; existing image metadata is preserved.
+    if _use_value(meta.get("na"), na):
         meta["na"] = na
-    if refractive_index is not None:
+    if _use_value(meta.get("refractive_index"), refractive_index):
         meta["refractive_index"] = refractive_index
-    if microscope_type is not None:
+    if _use_value(meta.get("microscope_type"), microscope_type):
         meta["microscope_type"] = microscope_type
-    if pixel_size_xy is not None:
+    if _use_value(meta.get("pixel_size_x"), pixel_size_xy):
         meta["pixel_size_x"] = pixel_size_xy
+    if _use_value(meta.get("pixel_size_y"), pixel_size_xy):
         meta["pixel_size_y"] = pixel_size_xy
-    if pixel_size_z is not None:
+    if _use_value(meta.get("pixel_size_z"), pixel_size_z):
         meta["pixel_size_z"] = pixel_size_z
     if emission_wavelengths is not None:
         if "channels" not in meta:
             meta["channels"] = [{} for _ in emission_wavelengths]
         for i, wl in enumerate(emission_wavelengths):
             if i < len(meta["channels"]):
-                meta["channels"][i]["emission_wavelength"] = wl
+                ch = meta["channels"][i]
+                if _use_value(ch.get("emission_wavelength"), wl):
+                    ch["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
         if "channels" not in meta:
             meta["channels"] = [{} for _ in excitation_wavelengths]
         for i, wl in enumerate(excitation_wavelengths):
             if i < len(meta["channels"]):
-                meta["channels"][i]["excitation_wavelength"] = wl
+                ch = meta["channels"][i]
+                if _use_value(ch.get("excitation_wavelength"), wl):
+                    ch["excitation_wavelength"] = wl
+    if pinhole_airy_units is not None:
+        if "channels" not in meta:
+            meta["channels"] = [{} for _ in range(len(images))]
+        for ch in meta["channels"]:
+            if _use_value(ch.get("pinhole_airy_units"), pinhole_airy_units):
+                ch["pinhole_airy_units"] = pinhole_airy_units
 
     # Apply defaults for critical missing values (setdefault won't
     # replace an existing key whose value is None, so fix those too).
@@ -427,6 +496,7 @@ def load_image(
         "pixel_size_x": 0.1,
         "pixel_size_y": 0.1,
         "pixel_size_z": 0.3,
+        "magnification": 63.0,
     }
     _defaulted = set()
     for _k, _v in _defaults.items():
@@ -434,7 +504,12 @@ def load_image(
             meta[_k] = _v
             _defaulted.add(_k)
     meta["_defaulted_keys"] = _defaulted
-    meta["sample_refractive_index"] = sample_refractive_index
+    if overrule_metadata and sample_refractive_index is not None:
+        meta["sample_refractive_index"] = sample_refractive_index
+    elif meta.get("sample_refractive_index") is None:
+        meta["sample_refractive_index"] = (
+            sample_refractive_index if sample_refractive_index is not None else 1.47
+        )
     meta["n_channels"] = len(images)
 
     # Ensure channels list
@@ -514,6 +589,7 @@ def generate_psf(
     ch = metadata["channels"][channel_idx]
     wavelength_nm = ch.get("emission_wavelength", 520.0)
     excitation_nm = ch.get("excitation_wavelength")
+    pinhole_airy_units = _pinhole_airy_units_from_metadata(metadata, ch, wavelength_nm)
 
     # Convert units to nm
     pix_xy_nm = pix_xy_um * 1000.0
@@ -545,6 +621,7 @@ def generate_psf(
         ri_immersion_design=ri,
         microscope_type=microscope_type,
         excitation_nm=excitation_nm,
+        pinhole_airy_units=pinhole_airy_units,
         n_pupil=n_pix_pupil,
     )
 
@@ -1621,7 +1698,9 @@ def deconvolve_image(
     pixel_size_z: Optional[float] = None,
     emission_wavelengths: Optional[list[float]] = None,
     excitation_wavelengths: Optional[list[float]] = None,
+    pinhole_airy_units: Optional[float] = None,
     sample_refractive_index: float = 1.33,
+    overrule_metadata: bool = True,
     # PSF options
     psf_size_xy: Optional[int] = None,
     n_pix_pupil: int = 129,
@@ -1676,7 +1755,9 @@ def deconvolve_image(
         pixel_size_z=pixel_size_z,
         emission_wavelengths=emission_wavelengths,
         excitation_wavelengths=excitation_wavelengths,
+        pinhole_airy_units=pinhole_airy_units,
         sample_refractive_index=sample_refractive_index,
+        overrule_metadata=overrule_metadata,
     )
 
     images = data["images"]
@@ -1955,17 +2036,23 @@ def save_result(
         if ch_info:
             em_wavelengths = []
             ex_wavelengths = []
+            pinhole_sizes = []
             for i, ch in enumerate(ch_info[:len(channels_data)]):
                 em = ch.get("emission_wavelength")
                 ex = ch.get("excitation_wavelength")
+                pinhole = ch.get("pinhole_size")
                 if em is not None:
                     em_wavelengths.append(float(em))
                 if ex is not None:
                     ex_wavelengths.append(float(ex))
+                if pinhole is not None:
+                    pinhole_sizes.append(float(pinhole))
             if em_wavelengths:
                 ome_meta["Channel"]["EmissionWavelength"] = em_wavelengths
             if ex_wavelengths:
                 ome_meta["Channel"]["ExcitationWavelength"] = ex_wavelengths
+            if pinhole_sizes:
+                ome_meta["Channel"]["PinholeSize"] = pinhole_sizes
 
         # Add objective / instrument metadata as OME Description
         desc_parts = []

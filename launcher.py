@@ -26,8 +26,10 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -36,6 +38,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QLineEdit,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -71,6 +74,34 @@ class ToggleSwitch(QCheckBox):
             }
             """
         )
+
+
+class CollapsiblePanel(QWidget):
+    """Simple collapsible section for advanced parameters."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(False)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.toggle.clicked.connect(self._on_toggled)
+
+        self.content = QWidget()
+        self.content.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.toggle)
+        layout.addWidget(self.content)
+
+    def _on_toggled(self, checked: bool):
+        self.toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+        self.content.setVisible(checked)
 
 
 def load_descriptor() -> dict:
@@ -170,8 +201,19 @@ class LauncherWindow(QMainWindow):
 
         # -- Parameters from descriptor --
         param_group = QGroupBox("Parameters")
-        param_layout = QFormLayout()
-        param_group.setLayout(param_layout)
+        param_layout = QVBoxLayout(param_group)
+        essential_grid = QGridLayout()
+        essential_grid.setHorizontalSpacing(18)
+        essential_grid.setVerticalSpacing(8)
+        essential_grid.setColumnStretch(1, 1)
+        essential_grid.setColumnStretch(3, 1)
+        advanced_grid = QGridLayout()
+        advanced_grid.setHorizontalSpacing(18)
+        advanced_grid.setVerticalSpacing(8)
+        advanced_grid.setColumnStretch(1, 1)
+        advanced_grid.setColumnStretch(3, 1)
+        essential_count = 0
+        advanced_count = 0
 
         for inp in self.descriptor.get("inputs", []):
             if inp.get("set-by-server", False):
@@ -180,10 +222,21 @@ class LauncherWindow(QMainWindow):
             if widget is not None:
                 tooltip = inp.get("description", "")
                 widget.setToolTip(tooltip)
-                label = QLabel(inp.get("name", inp["id"]))
+                label = QLabel(self._display_name(inp))
                 label.setToolTip(tooltip)
-                param_layout.addRow(label, widget)
+                if self._is_advanced_input(inp):
+                    self._add_two_column_row(advanced_grid, advanced_count, label, widget)
+                    advanced_count += 1
+                else:
+                    self._add_two_column_row(essential_grid, essential_count, label, widget)
+                    essential_count += 1
                 self.widgets[inp["id"]] = widget
+
+        param_layout.addLayout(essential_grid)
+        if advanced_count:
+            advanced_panel = CollapsiblePanel("Advanced parameters")
+            advanced_panel.content.setLayout(advanced_grid)
+            param_layout.addWidget(advanced_panel)
 
         layout.addWidget(param_group)
 
@@ -244,7 +297,7 @@ class LauncherWindow(QMainWindow):
             w = self.widgets.get(inp["id"])
             if w is None:
                 continue
-            if isinstance(w, QSpinBox):
+            if isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 w.valueChanged.connect(self._update_preview)
             elif isinstance(w, QComboBox):
                 w.currentTextChanged.connect(self._update_preview)
@@ -271,11 +324,17 @@ class LauncherWindow(QMainWindow):
             return combo
 
         if ptype == "Number":
-            spin = QSpinBox()
-            spin.setMinimum(inp.get("minimum", 0))
-            spin.setMaximum(inp.get("maximum", 99999))
+            spin = QSpinBox() if inp.get("integer", False) else QDoubleSpinBox()
+            if isinstance(spin, QDoubleSpinBox):
+                spin.setMinimum(float(inp.get("minimum", 0)))
+                spin.setMaximum(float(inp.get("maximum", 99999)))
+                spin.setDecimals(4)
+            else:
+                spin.setMinimum(inp.get("minimum", 0))
+                spin.setMaximum(inp.get("maximum", 99999))
             if default is not None:
-                spin.setValue(int(default))
+                value = float(default) if isinstance(spin, QDoubleSpinBox) else int(default)
+                spin.setValue(value)
             return spin
 
         # Fallback: plain text
@@ -283,6 +342,25 @@ class LauncherWindow(QMainWindow):
         if default is not None:
             line.setText(str(default))
         return line
+
+    @staticmethod
+    def _is_advanced_input(inp: dict) -> bool:
+        return str(inp.get("name", "")).strip().startswith("(adv)")
+
+    @staticmethod
+    def _display_name(inp: dict) -> str:
+        name = str(inp.get("name", inp["id"]))
+        for prefix in ("(ess)", "(adv)"):
+            if name.startswith(prefix):
+                return name[len(prefix):].strip()
+        return name
+
+    @staticmethod
+    def _add_two_column_row(grid: QGridLayout, row_index: int, label: QLabel, widget: QWidget):
+        row = row_index // 2
+        col = (row_index % 2) * 2
+        grid.addWidget(label, row, col)
+        grid.addWidget(widget, row, col + 1)
 
     def _get_values(self) -> dict:
         values = {}
@@ -292,7 +370,7 @@ class LauncherWindow(QMainWindow):
                 continue
             if isinstance(w, QCheckBox):
                 values[inp["id"]] = w.isChecked()
-            elif isinstance(w, QSpinBox):
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 values[inp["id"]] = w.value()
             elif isinstance(w, QComboBox):
                 values[inp["id"]] = w.currentText()
@@ -347,6 +425,8 @@ class LauncherWindow(QMainWindow):
                 continue
             if isinstance(w, QCheckBox):
                 w.setChecked(bool(val))
+            elif isinstance(w, QDoubleSpinBox):
+                w.setValue(float(val))
             elif isinstance(w, QSpinBox):
                 w.setValue(int(val))
             elif isinstance(w, QComboBox):

@@ -137,13 +137,23 @@ _SAMPLE_RI = {
     "pbs":            1.334,
     "culture medium": 1.337,
     "vectashield":    1.45,
+    "prolong gold":   1.47,
     "glycerol":       1.474,
     "oil":            1.515,
     "prolong glass":  1.52,
 }
 
 # Default sample RI when "auto" is chosen and metadata has no value
-_SAMPLE_RI_DEFAULT = 1.45  # Vectashield
+_DEFAULT_NA = 1.4
+_DEFAULT_EMISSION_WL = "520"
+_DEFAULT_EXCITATION_WL = "488"
+_DEFAULT_PIXEL_SIZE_XY_NM = 65.0
+_DEFAULT_PIXEL_SIZE_Z_NM = 200.0
+_DEFAULT_MICROSCOPE_TYPE = "confocal"
+_DEFAULT_IMMERSION_RI_CHOICE = "oil (1.515)"
+_DEFAULT_SAMPLE_RI_CHOICE = "prolong gold (1.47)"
+_DEFAULT_PINHOLE_AIRY = 1.0
+_SAMPLE_RI_DEFAULT = 1.47  # ProLong Gold
 
 BENCHMARK_CSV_FIELDS = [
     "dataset_id",
@@ -175,9 +185,11 @@ BENCHMARK_CSV_FIELDS = [
     "torch_gpu_delta_mb",
     "gpu_spill_mb",
     "channels_compared",
-    "sharpness_mean",
-    "contrast_mean",
-    "noise_proxy_mean",
+    "detail_energy_mean",
+    "bright_detail_energy_mean",
+    "edge_strength_mean",
+    "signal_sparsity_mean",
+    "robust_range_mean",
     "result_shape",
 ]
 
@@ -199,6 +211,20 @@ def _parse_ri_choice(raw: str, lookup: dict[str, float]) -> float | None:
     s = str(raw).strip().lower()
     if s == "auto":
         return None
+
+
+def _parse_float_or_default(raw, default: float) -> float:
+    text = str(raw if raw is not None else default).strip()
+    if not text or text.lower() == "auto":
+        text = str(default)
+    return float(text)
+
+
+def _parse_float_list_or_default(raw, default: str) -> list[float]:
+    text = str(raw if raw is not None else default).strip()
+    if not text or text.lower() == "auto":
+        text = default
+    return [float(x.strip()) for x in text.split(",") if x.strip()]
     # Try "name (1.234)" format — extract the name part
     name = s.split("(")[0].strip()
     if name in lookup:
@@ -232,62 +258,136 @@ def _shape_to_str(images: list[np.ndarray]) -> str:
 
 
 def _normalise_image(arr: np.ndarray) -> np.ndarray:
-    img = np.asarray(arr, dtype=np.float64)
+    img = np.asarray(arr, dtype=np.float32)
     lo = float(np.min(img))
     hi = float(np.max(img))
     if hi <= lo:
-        return np.zeros_like(img, dtype=np.float64)
+        return np.zeros_like(img, dtype=np.float32)
     return (img - lo) / (hi - lo)
+
+
+_METRIC_MAX_Z = 32
+_METRIC_MAX_YX = 512
+_METRIC_RADIUS_CACHE: dict[tuple[int, ...], tuple[np.ndarray, float]] = {}
+
+
+def _metric_stride_slice(size: int, limit: int) -> slice:
+    """Return a deterministic stride slice capped to roughly limit samples."""
+    if size <= limit:
+        return slice(None)
+    return slice(0, size, int(np.ceil(size / limit)))
+
+
+def _metric_sample(arr: np.ndarray) -> np.ndarray:
+    """Sample image data before expensive metric calculations."""
+    data = np.asarray(arr)
+    if data.ndim == 3:
+        slices = (
+            _metric_stride_slice(data.shape[0], _METRIC_MAX_Z),
+            _metric_stride_slice(data.shape[1], _METRIC_MAX_YX),
+            _metric_stride_slice(data.shape[2], _METRIC_MAX_YX),
+        )
+    elif data.ndim == 2:
+        slices = (
+            _metric_stride_slice(data.shape[0], _METRIC_MAX_YX),
+            _metric_stride_slice(data.shape[1], _METRIC_MAX_YX),
+        )
+    else:
+        slices = tuple(_metric_stride_slice(size, _METRIC_MAX_YX) for size in data.shape)
+    return np.asarray(data[slices])
+
+
+def _metric_frequency_radius(shape: tuple[int, ...]) -> tuple[np.ndarray, float]:
+    """Return cached frequency radius grid and max radius for a sampled shape."""
+    cached = _METRIC_RADIUS_CACHE.get(shape)
+    if cached is not None:
+        return cached
+    freq_axes = np.meshgrid(
+        *[np.fft.fftfreq(n) for n in shape],
+        indexing="ij",
+    )
+    radius = np.sqrt(sum(axis ** 2 for axis in freq_axes))
+    max_radius = float(np.max(radius)) or 1.0
+    cached = (radius, max_radius)
+    _METRIC_RADIUS_CACHE[shape] = cached
+    return cached
 
 
 def _mean_or_zero(values: list[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
-def _no_reference_metrics(arr: np.ndarray) -> dict[str, float]:
-    img = _normalise_image(arr)
-    p1 = float(np.percentile(img, 1))
-    p99 = float(np.percentile(img, 99))
-    q1 = float(np.percentile(img, 25))
-    q3 = float(np.percentile(img, 75))
+def _deconvolution_effect_metrics(arr: np.ndarray) -> dict[str, float]:
+    """Compute no-reference metrics that describe deconvolution effects."""
+    img = _normalise_image(_metric_sample(arr))
+    centered = img - float(np.mean(img))
+    fft_power = np.abs(np.fft.fftn(centered)) ** 2
+    total_power = float(np.sum(fft_power)) + 1e-12
+    radius, max_radius = _metric_frequency_radius(img.shape)
+    detail_energy = float(np.sum(fft_power[radius > 0.25 * max_radius]) / total_power)
 
-    try:
-        from scipy import ndimage
+    gradient_axes = tuple(i for i, size in enumerate(img.shape) if size > 1)
+    if gradient_axes:
+        grads = np.gradient(img, axis=gradient_axes)
+        if isinstance(grads, np.ndarray):
+            grads = [grads]
+        edge_strength = float(np.mean(np.sqrt(sum(g ** 2 for g in grads))))
+    else:
+        edge_strength = 0.0
 
-        if img.ndim == 3:
-            lap_vars = [float(np.var(ndimage.laplace(z))) for z in img]
-            sharpness = float(np.mean(lap_vars)) if lap_vars else 0.0
-        else:
-            sharpness = float(np.var(ndimage.laplace(img)))
-    except ImportError:
-        grads = np.gradient(img.astype(np.float64))
-        sharpness = float(np.mean([np.var(g) for g in grads])) if grads else 0.0
+    p005 = float(np.percentile(img, 0.5))
+    p95 = float(np.percentile(img, 95))
+    p995 = float(np.percentile(img, 99.5))
+    bright = img >= p95
+    if np.any(bright):
+        bright_power = np.abs(np.fft.fftn(centered * bright.astype(np.float32))) ** 2
+        bright_total = float(np.sum(bright_power)) + 1e-12
+        bright_detail_energy = float(
+            np.sum(bright_power[radius > 0.25 * max_radius]) / bright_total
+        )
+    else:
+        bright_detail_energy = 0.0
+
+    flat = np.sort(img.ravel())
+    total_intensity = float(np.sum(flat))
+    if flat.size and total_intensity > 1e-12:
+        index = np.arange(1, flat.size + 1, dtype=np.float64)
+        signal_sparsity = float(
+            (2.0 * np.sum(index * flat)) / (flat.size * total_intensity)
+            - (flat.size + 1.0) / flat.size
+        )
+    else:
+        signal_sparsity = 0.0
 
     return {
-        "sharpness": sharpness,
-        "contrast": p99 - p1,
-        "noise_proxy": q3 - q1,
+        "detail_energy": detail_energy,
+        "bright_detail_energy": bright_detail_energy,
+        "edge_strength": edge_strength,
+        "signal_sparsity": signal_sparsity,
+        "robust_range": p995 - p005,
     }
 
 
 def _quality_metrics(
     result_channels: list[np.ndarray],
 ) -> dict[str, float | int]:
-    sharpness_vals: list[float] = []
-    contrast_vals: list[float] = []
-    noise_vals: list[float] = []
+    metric_values: dict[str, list[float]] = {
+        "detail_energy": [],
+        "bright_detail_energy": [],
+        "edge_strength": [],
+        "signal_sparsity": [],
+        "robust_range": [],
+    }
 
     for result in result_channels:
-        nr = _no_reference_metrics(result)
-        sharpness_vals.append(nr["sharpness"])
-        contrast_vals.append(nr["contrast"])
-        noise_vals.append(nr["noise_proxy"])
-    return {
-        "channels_compared": len(result_channels),
-        "sharpness_mean": _mean_or_zero(sharpness_vals),
-        "contrast_mean": _mean_or_zero(contrast_vals),
-        "noise_proxy_mean": _mean_or_zero(noise_vals),
-    }
+        metrics = _deconvolution_effect_metrics(result)
+        for key in metric_values:
+            metric_values[key].append(metrics[key])
+
+    out: dict[str, float | int] = {"channels_compared": len(result_channels)}
+    for key, values in metric_values.items():
+        out[f"{key}_mean"] = _mean_or_zero(values)
+    return out
 
 
 def _stem(filename: str) -> str:
@@ -379,6 +479,14 @@ def _collect_run_provenance(
     psf_fields["excitation_wavelengths"] = {
         "value": [ch.get("excitation_wavelength") for ch in meta.get("channels", [])],
         "source": "cli_override" if "excitation_wavelength" in cli_overrides else "image_metadata",
+    }
+    psf_fields["pinhole_sizes_um"] = {
+        "value": [ch.get("pinhole_size") for ch in meta.get("channels", [])],
+        "source": "image_metadata",
+    }
+    psf_fields["pinhole_airy_units"] = {
+        "value": [ch.get("pinhole_airy_units") for ch in meta.get("channels", [])],
+        "source": "cli_override" if "pinhole_airy_units" in cli_overrides else "image_metadata",
     }
 
     return {
@@ -691,26 +799,38 @@ def main(argv):
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
 
-        # PSF metadata overrides
-        na_raw = getattr(parameters, "na", "auto")
-        na_override = None if str(na_raw).strip().lower() == "auto" else float(na_raw)
-        ri_raw = str(getattr(parameters, "refractive_index", "auto"))
-        ri_override = _parse_ri_choice(ri_raw, _IMMERSION_RI)
-        sample_ri_raw = str(getattr(parameters, "sample_ri", "auto"))
-        sample_ri_parsed = _parse_ri_choice(sample_ri_raw, _SAMPLE_RI)
-        sample_ri = sample_ri_parsed if sample_ri_parsed is not None else _SAMPLE_RI_DEFAULT
-        micro_raw = getattr(parameters, "microscope_type", "auto")
-        micro_override = None if str(micro_raw).strip().lower() == "auto" else str(micro_raw)
-        em_raw = str(getattr(parameters, "emission_wl", "auto")).strip()
-        em_override = (
-            None if em_raw.lower() == "auto"
-            else [float(x.strip()) for x in em_raw.split(",") if x.strip()]
-        )
-        ex_raw = str(getattr(parameters, "excitation_wl", "auto")).strip()
-        ex_override = (
-            None if ex_raw.lower() == "auto" or not ex_raw
-            else [float(x.strip()) for x in ex_raw.split(",") if x.strip()]
-        ) or None
+        # PSF metadata parameters. By default image metadata wins; descriptor
+        # values are fallbacks for missing metadata. With overrule enabled,
+        # descriptor values replace image metadata.
+        overrule_metadata = _to_bool(getattr(parameters, "overrule_image_metadata", False))
+        na_raw = getattr(parameters, "na", str(_DEFAULT_NA))
+        na_override = _parse_float_or_default(na_raw, _DEFAULT_NA)
+        ri_raw = str(getattr(parameters, "refractive_index", _DEFAULT_IMMERSION_RI_CHOICE))
+        ri_override = _parse_ri_choice(ri_raw, _IMMERSION_RI) or 1.515
+        sample_ri_raw = str(getattr(parameters, "sample_ri", _DEFAULT_SAMPLE_RI_CHOICE))
+        sample_ri = _parse_ri_choice(sample_ri_raw, _SAMPLE_RI) or _SAMPLE_RI_DEFAULT
+        sample_ri_parsed = sample_ri
+        micro_raw = getattr(parameters, "microscope_type", _DEFAULT_MICROSCOPE_TYPE)
+        micro_override = str(micro_raw).strip().lower()
+        if micro_override == "auto":
+            micro_override = _DEFAULT_MICROSCOPE_TYPE
+        em_raw = str(getattr(parameters, "emission_wl", _DEFAULT_EMISSION_WL)).strip()
+        em_override = _parse_float_list_or_default(em_raw, _DEFAULT_EMISSION_WL)
+        ex_raw = str(getattr(parameters, "excitation_wl", _DEFAULT_EXCITATION_WL)).strip()
+        ex_override = _parse_float_list_or_default(ex_raw, _DEFAULT_EXCITATION_WL)
+        pinhole_raw = str(
+            getattr(
+                parameters,
+                "pinhole_airy",
+                getattr(parameters, "pinhole_size", str(_DEFAULT_PINHOLE_AIRY)),
+            )
+        ).strip()
+        pinhole_values = _parse_float_list_or_default(pinhole_raw, str(_DEFAULT_PINHOLE_AIRY))
+        pinhole_override = pinhole_values[0] if pinhole_values else _DEFAULT_PINHOLE_AIRY
+        px_xy_raw = str(getattr(parameters, "pixel_size_xy", _DEFAULT_PIXEL_SIZE_XY_NM)).strip()
+        px_xy_override = _parse_float_or_default(px_xy_raw, _DEFAULT_PIXEL_SIZE_XY_NM) / 1000.0
+        px_z_raw = str(getattr(parameters, "pixel_size_z", _DEFAULT_PIXEL_SIZE_Z_NM)).strip()
+        px_z_override = _parse_float_or_default(px_z_raw, _DEFAULT_PIXEL_SIZE_Z_NM) / 1000.0
 
         benchmark_mode = _to_bool(getattr(parameters, "benchmark", False))
         projection = str(getattr(parameters, "projection", "none")).lower()
@@ -770,20 +890,15 @@ def main(argv):
         print(f"  Benchmark    : {benchmark_mode}")
         print(f"  Projection   : {projection}")
         print(f"  Save PSF     : {save_psf}")
-        if na_override is not None:
-            print(f"  NA           : {na_override}")
-        if ri_override is not None:
-            print(f"  Immersion    : {ri_raw} -> RI {ri_override}")
-        if sample_ri_parsed is not None:
-            print(f"  Sample medium: {sample_ri_raw} -> RI {sample_ri}")
-        else:
-            print(f"  Sample medium: auto -> vectashield (RI {sample_ri})")
-        if micro_override is not None:
-            print(f"  Microscope   : {micro_override}")
-        if em_override is not None:
-            print(f"  Emission WL  : {em_override}")
-        if ex_override is not None:
-            print(f"  Excitation WL: {ex_override}")
+        print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'image metadata + descriptor fallbacks'}")
+        print(f"  NA           : {na_override}")
+        print(f"  Immersion    : {ri_raw} -> RI {ri_override}")
+        print(f"  Sample medium: {sample_ri_raw} -> RI {sample_ri}")
+        print(f"  Pixel size   : XY={px_xy_override * 1000:g} nm, Z={px_z_override * 1000:g} nm")
+        print(f"  Microscope   : {micro_override}")
+        print(f"  Emission WL  : {em_override}")
+        print(f"  Excitation WL: {ex_override}")
+        print(f"  Pinhole      : {pinhole_override} Airy Disk")
         if benchmark_mode:
             print(f"  Bench iters  : {bench_iterations}")
             print(f"  Bench methods: {bench_methods_key} ({len(bench_methods)} methods)")
@@ -818,7 +933,19 @@ def main(argv):
 
             try:
                 # Load image and extract metadata
-                data = load_image(img_path)
+                data = load_image(
+                    img_path,
+                    na=na_override,
+                    refractive_index=ri_override,
+                    microscope_type=micro_override,
+                    pixel_size_xy=px_xy_override,
+                    pixel_size_z=px_z_override,
+                    emission_wavelengths=em_override,
+                    excitation_wavelengths=ex_override,
+                    pinhole_airy_units=pinhole_override,
+                    sample_refractive_index=sample_ri,
+                    overrule_metadata=overrule_metadata,
+                )
                 meta = data["metadata"]
                 images = data["images"]
 
@@ -849,8 +976,12 @@ def main(argv):
                         refractive_index=ri_override,
                         sample_refractive_index=sample_ri_parsed,
                         microscope_type=micro_override,
+                        pixel_size_xy=px_xy_override,
+                        pixel_size_z=px_z_override,
                         emission_wavelengths=em_override,
                         excitation_wavelengths=ex_override,
+                        pinhole_airy_units=pinhole_override,
+                        overrule_metadata=overrule_metadata,
                     )
                     # Move final montage PNGs from tmp to output
                     for png in tmp_work.glob("decon_benchmark_*.png"):
@@ -880,8 +1011,12 @@ def main(argv):
                         refractive_index=ri_override,
                         sample_refractive_index=sample_ri,
                         microscope_type=micro_override,
+                        pixel_size_xy=px_xy_override,
+                        pixel_size_z=px_z_override,
                         emission_wavelengths=em_override,
                         excitation_wavelengths=ex_override,
+                        pinhole_airy_units=pinhole_override,
+                        overrule_metadata=overrule_metadata,
                     )
 
                     if result is None:
@@ -1354,8 +1489,12 @@ def _run_benchmark(
     refractive_index: float | None = None,
     sample_refractive_index: float | None = None,
     microscope_type: str | None = None,
+    pixel_size_xy: float | None = None,
+    pixel_size_z: float | None = None,
     emission_wavelengths: list[float] | None = None,
     excitation_wavelengths: list[float] | None = None,
+    pinhole_airy_units: float | None = None,
+    overrule_metadata: bool = False,
 ):
     """Run multi-method × multi-iteration benchmark for a single image."""
     del save_psf
@@ -1381,27 +1520,52 @@ def _run_benchmark(
         _cli_set.add("emission_wavelength")
     if excitation_wavelengths is not None:
         _cli_set.add("excitation_wavelength")
+    if pinhole_airy_units is not None:
+        _cli_set.add("pinhole_airy_units")
     if sample_refractive_index is not None:
         _cli_set.add("sample_refractive_index")
+    if pixel_size_xy is not None:
+        _cli_set.add("pixel_size_xy")
+    if pixel_size_z is not None:
+        _cli_set.add("pixel_size_z")
+
+    def _use_value(current, value) -> bool:
+        return value is not None and (overrule_metadata or current is None)
+
+    if _use_value(meta.get("sample_refractive_index"), sample_refractive_index):
         meta["sample_refractive_index"] = sample_refractive_index
-    else:
-        sample_refractive_index = _SAMPLE_RI_DEFAULT
+    elif meta.get("sample_refractive_index") is None:
+        sample_refractive_index = sample_refractive_index or _SAMPLE_RI_DEFAULT
         meta["sample_refractive_index"] = sample_refractive_index
 
-    if na is not None:
+    if _use_value(meta.get("na"), na):
         meta["na"] = na
-    if refractive_index is not None:
+    if _use_value(meta.get("refractive_index"), refractive_index):
         meta["refractive_index"] = refractive_index
-    if microscope_type is not None:
+    if _use_value(meta.get("microscope_type"), microscope_type):
         meta["microscope_type"] = microscope_type
+    if _use_value(meta.get("pixel_size_x"), pixel_size_xy):
+        meta["pixel_size_x"] = pixel_size_xy
+    if _use_value(meta.get("pixel_size_y"), pixel_size_xy):
+        meta["pixel_size_y"] = pixel_size_xy
+    if _use_value(meta.get("pixel_size_z"), pixel_size_z):
+        meta["pixel_size_z"] = pixel_size_z
     if emission_wavelengths is not None:
         for i, wl in enumerate(emission_wavelengths):
             if i < len(meta.get("channels", [])):
-                meta["channels"][i]["emission_wavelength"] = wl
+                ch = meta["channels"][i]
+                if _use_value(ch.get("emission_wavelength"), wl):
+                    ch["emission_wavelength"] = wl
     if excitation_wavelengths is not None:
         for i, wl in enumerate(excitation_wavelengths):
             if i < len(meta.get("channels", [])):
-                meta["channels"][i]["excitation_wavelength"] = wl
+                ch = meta["channels"][i]
+                if _use_value(ch.get("excitation_wavelength"), wl):
+                    ch["excitation_wavelength"] = wl
+    if pinhole_airy_units is not None:
+        for ch in meta.get("channels", []):
+            if _use_value(ch.get("pinhole_airy_units"), pinhole_airy_units):
+                ch["pinhole_airy_units"] = pinhole_airy_units
     meta["_cli_overrides"] = _cli_set
 
     if bench_crop:
@@ -1454,6 +1618,8 @@ def _run_benchmark(
                         if all(ch.get("emission_wavelength") is not None for ch in meta.get("channels", [])) else None,
                         "ExcitationWavelength": [ch.get("excitation_wavelength") for ch in meta.get("channels", [])]
                         if all(ch.get("excitation_wavelength") is not None for ch in meta.get("channels", [])) else None,
+                        "PinholeSize": [ch.get("pinhole_size") for ch in meta.get("channels", [])]
+                        if all(ch.get("pinhole_size") is not None for ch in meta.get("channels", [])) else None,
                     }.items()
                     if v is not None
                 },
@@ -1473,6 +1639,8 @@ def _run_benchmark(
             "excitation_wavelengths": excitation_wavelengths if excitation_wavelengths is not None else (
                 [ch.get("excitation_wavelength") for ch in meta.get("channels", [])] or None
             ),
+            "pinhole_airy_units": pinhole_airy_units,
+            "overrule_metadata": overrule_metadata,
         }
     else:
         meta_overrides = {
@@ -1480,8 +1648,12 @@ def _run_benchmark(
             "refractive_index": refractive_index,
             "sample_refractive_index": sample_refractive_index,
             "microscope_type": microscope_type,
+            "pixel_size_xy": pixel_size_xy,
+            "pixel_size_z": pixel_size_z,
             "emission_wavelengths": emission_wavelengths,
             "excitation_wavelengths": excitation_wavelengths,
+            "pinhole_airy_units": pinhole_airy_units,
+            "overrule_metadata": overrule_metadata,
         }
 
     available_methods = []

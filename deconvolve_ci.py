@@ -1581,6 +1581,43 @@ def _pixel_integrate_psf(
     fine_psf = fine_psf.reshape(nz, n_xy, n_subpixels, n_xy, n_subpixels)
     return fine_psf.mean(dim=(2, 4))
 
+
+def _make_circular_pinhole_kernel(
+    *,
+    pinhole_airy_units: float,
+    wavelength_nm: float,
+    na: float,
+    pixel_size_xy_nm: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a normalized circular pinhole aperture kernel."""
+    airy_diameter_nm = 1.22 * wavelength_nm / max(float(na), 1e-12)
+    diameter_px = pinhole_airy_units * airy_diameter_nm / pixel_size_xy_nm
+    radius_px = max(diameter_px / 2.0, 0.0)
+    half_size = max(1, int(math.ceil(radius_px)))
+    coords = torch.arange(-half_size, half_size + 1, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    kernel = ((xx ** 2 + yy ** 2) <= radius_px ** 2).to(dtype)
+    if torch.count_nonzero(kernel) == 0:
+        kernel[half_size, half_size] = 1.0
+    kernel = kernel / kernel.sum()
+    return kernel
+
+
+def _convolve_lateral_with_kernel(psf: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """Convolve each Z plane of a centered PSF with a lateral aperture kernel."""
+    import torch.nn.functional as F
+
+    if kernel.shape == (1, 1):
+        return psf
+    nz = psf.shape[0]
+    image = psf.reshape(nz, 1, psf.shape[-2], psf.shape[-1])
+    weight = kernel.reshape(1, 1, kernel.shape[0], kernel.shape[1])
+    pad_y = kernel.shape[0] // 2
+    pad_x = kernel.shape[1] // 2
+    return F.conv2d(image, weight, padding=(pad_y, pad_x)).reshape_as(psf)
+
 # ---------------------------------------------------------------------------
 # Core PSF builder
 # ---------------------------------------------------------------------------
@@ -1701,6 +1738,7 @@ def ci_generate_psf(
     z_p: float = 0.0,
     microscope_type: str = "widefield",
     excitation_nm: Optional[float] = None,
+    pinhole_airy_units: float = 1.0,
     integrate_pixels: bool = True,
     n_subpixels: int = 3,
     n_pupil: int = 129,
@@ -1732,6 +1770,10 @@ def ci_generate_psf(
         ``"widefield"`` or ``"confocal"``.
     excitation_nm : float or None
         Excitation wavelength for confocal.
+    pinhole_airy_units : float
+        Confocal pinhole diameter in Airy disk units. ``0`` keeps the legacy
+        point-detector model; values > 0 convolve the detection PSF laterally
+        with a circular pinhole aperture before multiplying by excitation.
     integrate_pixels : bool
         Integrate over pixel area (more accurate, slower).
     n_subpixels : int
@@ -1791,8 +1833,23 @@ def ci_generate_psf(
         fov = pixel_size_xy_nm * n_xy
         psf = _psf_func(fov=fov, n_xy=n_xy)
 
-    # Confocal: multiply emission × excitation PSFs
+    # Confocal: detection PSF × excitation PSF. Finite pinholes are modelled
+    # by laterally integrating the detection/emission PSF over a circular
+    # object-space aperture measured in Airy disk units.
     if microscope_type == "confocal":
+        detector_psf = psf
+        pinhole_airy_units = float(pinhole_airy_units)
+        if pinhole_airy_units > 0.0:
+            kernel = _make_circular_pinhole_kernel(
+                pinhole_airy_units=pinhole_airy_units,
+                wavelength_nm=wavelength_nm,
+                na=na,
+                pixel_size_xy_nm=pixel_size_xy_nm,
+                device=dev,
+                dtype=dtype,
+            )
+            detector_psf = _convolve_lateral_with_kernel(detector_psf, kernel)
+
         if excitation_nm is not None and excitation_nm != wavelength_nm:
             common_ex = {**common, "wavelength_nm": excitation_nm}
 
@@ -1809,9 +1866,9 @@ def ci_generate_psf(
             else:
                 fov = pixel_size_xy_nm * n_xy
                 psf_ex = _psf_ex(fov=fov, n_xy=n_xy)
-            psf = psf * psf_ex
+            psf = detector_psf * psf_ex
         else:
-            psf = psf ** 2
+            psf = detector_psf * psf
 
     # Normalise
     psf = psf / psf.sum()

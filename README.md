@@ -136,11 +136,13 @@ successful runs, skips, and errors. Each row records:
 
 Benchmark quality is no-reference only:
 
-- `sharpness_mean` — mean variance of the Laplacian after per-channel normalization. Higher values usually mean crisper edges and finer structure, but they can also increase when noise is amplified.
-- `contrast_mean` — mean robust intensity range after normalization, computed as the 99th percentile minus the 1st percentile. Higher values usually mean stronger separation between dim and bright structures.
-- `noise_proxy_mean` — mean interquartile range after normalization, computed as the 75th percentile minus the 25th percentile. This is a rough spread/noise indicator: higher values can reflect richer texture, but also more residual background or noise.
+- `detail_energy_mean` — mean fraction of FFT power in higher spatial frequencies after per-channel normalization. Higher values usually indicate restored fine detail, but can also reflect amplified noise.
+- `bright_detail_energy_mean` — same high-frequency detail measure, restricted to the brightest structures.
+- `edge_strength_mean` — mean gradient magnitude after normalization. Higher values indicate stronger local transitions.
+- `signal_sparsity_mean` — Gini-style concentration of normalized signal intensity. Higher values indicate signal concentrated in fewer bright structures.
+- `robust_range_mean` — 99.5th percentile minus 0.5th percentile after normalization, a robust contrast range.
 
-These three metrics should be interpreted together with the montage images.
+These metrics should be interpreted together with the montage images.
 None of them is a true biological or ground-truth accuracy score on its own.
 
 ---
