@@ -1624,7 +1624,14 @@ def _deconvolve_skimage_unsupervised_wiener(
     """
     from skimage.restoration import unsupervised_wiener
 
-    user_params = {"max_num_iter": niter}
+    # For small benchmark iteration counts (e.g. 3/5), scikit-image defaults
+    # can leave no usable posterior samples after burn-in, yielding flat output.
+    # Keep burn-in at 0 and force exactly niter Gibbs samples.
+    user_params = {
+        "max_num_iter": niter,
+        "min_num_iter": niter,
+        "burnin": 0,
+    }
 
     def _wiener_2d(plane: np.ndarray) -> np.ndarray:
         # Normalise to [0, 1] for skimage pipeline compatibility
