@@ -872,6 +872,10 @@ def deconvolve(
     background: Union[int, str] = "auto",
     # Device override for sdeconv backend
     device: Optional[str] = None,
+    # Metadata used by CI backends
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
+    microscope_type: str = "widefield",
     # RLTV regularization (DeconvolutionLab2)
     tv_lambda: float = 1e-4,
     # XY tiling for large images
@@ -946,7 +950,9 @@ def deconvolve(
             image, psf, n_tiles, method=method,
             niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
             plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
-            background=background, device=device, tv_lambda=tv_lambda,
+            background=background, device=device,
+            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            microscope_type=microscope_type, tv_lambda=tv_lambda,
         )
 
     # Crop PSF to image size when it is larger (e.g. n_defocus = 2*nz-1).
@@ -970,12 +976,15 @@ def deconvolve(
             image, psf, niter=niter,
             tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
             background=background, device=device,
+            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            microscope_type=microscope_type,
         )
 
     if method == "ci_sparse_hessian":
         return _deconvolve_ci_sparse_hessian(
             image, psf, niter=niter,
             background=background, device=device,
+            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
         )
 
     if method == "pycudadecon_rl_cuda":
@@ -1039,6 +1048,9 @@ def _deconvolve_ci_rl(
     tv_lambda: float = 0.0,
     background: Union[int, str] = "auto",
     device: Optional[str] = None,
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
+    microscope_type: str = "widefield",
 ) -> np.ndarray:
     from deconvolve_ci import ci_rl_deconvolve
     result = ci_rl_deconvolve(
@@ -1046,7 +1058,11 @@ def _deconvolve_ci_rl(
         niter=niter,
         tv_lambda=tv_lambda,
         background=background,
+        pixel_size_xy=pixel_size_xy,
+        pixel_size_z=pixel_size_z,
+        microscope_type=microscope_type,
         device=device,
+        tiling="none",
     )
     return result["result"]
 
@@ -1058,13 +1074,18 @@ def _deconvolve_ci_sparse_hessian(
     niter: int = 50,
     background: Union[int, str] = "auto",
     device: Optional[str] = None,
+    pixel_size_xy: Optional[float] = None,
+    pixel_size_z: Optional[float] = None,
 ) -> np.ndarray:
     from deconvolve_ci import ci_sparse_hessian_deconvolve
     result = ci_sparse_hessian_deconvolve(
         image, psf,
         niter=niter,
         background=background,
+        pixel_size_xy=pixel_size_xy,
+        pixel_size_z=pixel_size_z,
         device=device,
+        tiling="none",
     )
     return result["result"]
 
@@ -1700,6 +1721,9 @@ def deconvolve_image(
             niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
             plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
             background=background, device=device, tv_lambda=tv_lambda,
+            pixel_size_xy=metadata.get("pixel_size_x"),
+            pixel_size_z=metadata.get("pixel_size_z"),
+            microscope_type=metadata.get("microscope_type", "widefield"),
             tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
         )
         results.append(result)

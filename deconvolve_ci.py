@@ -98,6 +98,11 @@ def _prepare_otf(
     otf_conj = torch.conj(otf)
     return otf, otf_conj
 
+
+def _origin_support_slices(shape: tuple[int, ...]) -> tuple[slice, ...]:
+    """Return slices that place a support region at the origin of a work volume."""
+    return tuple(slice(0, s) for s in shape)
+
 # ---------------------------------------------------------------------------
 # Bertero boundary weights  (Bertero & Boccacci 2005)
 # ---------------------------------------------------------------------------
@@ -116,9 +121,25 @@ def _bertero_weights(
     it is inverted to give W; elsewhere W is zero.  This corrects for
     partial PSF overlap near the data boundary (Bertero & Boccacci 2005).
     """
+    return _bertero_weights_for_support(
+        otf,
+        otf_conj,
+        _origin_support_slices(image_shape),
+        work_shape,
+        sigma=sigma,
+    )
+
+
+def _bertero_weights_for_support(
+    otf: torch.Tensor,
+    otf_conj: torch.Tensor,
+    support_slices: tuple[slice, ...],
+    work_shape: tuple[int, ...],
+    sigma: float = 0.01,
+) -> torch.Tensor:
+    """Compute boundary weights for an arbitrary observed support region."""
     ones = torch.zeros(work_shape, dtype=otf.real.dtype, device=otf.device)
-    slices = tuple(slice(0, s) for s in image_shape)
-    ones[slices] = 1.0
+    ones[support_slices] = 1.0
 
     ones_fft = _rfft(ones)
     # H^T(1_M) = IFFT(conj(H) * FFT(1_M))  — Bertero & Boccacci 2005
@@ -217,12 +238,72 @@ def _tv_penalty(
 # ---------------------------------------------------------------------------
 
 def _estimate_background(image: torch.Tensor) -> float:
-    """Estimate background from the mode of the lowest 10% of voxels."""
+    """Estimate background from the median of the lowest 10% of voxels."""
     flat = image.flatten()
     n = max(int(flat.numel() * 0.1), 1)
     lowest, _ = torch.topk(flat, n, largest=False)
     # Approximate mode via median of lowest decile (robust)
     return float(lowest.median())
+
+
+def _estimate_background_local_plane(
+    image: torch.Tensor,
+    pixel_size_xy: Optional[float],
+    radius_um: float = 0.5,
+) -> float:
+    """Estimate 2D background from the darkest local neighborhoods."""
+    px_nm = max(float(pixel_size_xy), 1e-6) if pixel_size_xy is not None else 100.0
+    radius_px = max(int(round((radius_um * 1000.0) / px_nm)), 1)
+    kernel = 2 * radius_px + 1
+    work = image[None, None]
+    padded = torch.nn.functional.pad(
+        work, (radius_px, radius_px, radius_px, radius_px), mode="reflect",
+    )
+    local_mean = torch.nn.functional.avg_pool2d(
+        padded, kernel_size=kernel, stride=1,
+    ).squeeze(0).squeeze(0)
+    flat = local_mean.flatten()
+    n = max(int(flat.numel() * 0.01), 1)
+    lowest, _ = torch.topk(flat, n, largest=False)
+    return float(lowest.median())
+
+
+def _collapse_widefield_psf_to_2d(
+    psf: torch.Tensor,
+    aggressiveness: str,
+) -> torch.Tensor:
+    """Collapse a 3D widefield PSF to 2D with center weighting by aggressiveness."""
+    if psf.ndim != 3 or psf.shape[0] <= 1:
+        return psf.squeeze() if psf.ndim == 3 else psf
+
+    mode = str(aggressiveness).strip().lower()
+    nz = psf.shape[0]
+    if mode == "very strong":
+        weights = torch.ones(nz, dtype=psf.dtype, device=psf.device)
+    elif mode == "strong":
+        z = torch.arange(nz, dtype=psf.dtype, device=psf.device)
+        center = (nz - 1) / 2.0
+        sigma = max(nz / 2.5, 1.0)
+        weights = torch.exp(-0.5 * ((z - center) / sigma) ** 2)
+    elif mode == "very conservative":
+        z = torch.arange(nz, dtype=psf.dtype, device=psf.device)
+        center = (nz - 1) / 2.0
+        sigma = max(nz / 12.0, 1.0)
+        weights = torch.exp(-0.5 * ((z - center) / sigma) ** 2)
+    elif mode == "conservative":
+        z = torch.arange(nz, dtype=psf.dtype, device=psf.device)
+        center = (nz - 1) / 2.0
+        sigma = max(nz / 8.0, 1.0)
+        weights = torch.exp(-0.5 * ((z - center) / sigma) ** 2)
+    else:
+        z = torch.arange(nz, dtype=psf.dtype, device=psf.device)
+        center = (nz - 1) / 2.0
+        sigma = max(nz / 4.0, 1.0)
+        weights = torch.exp(-0.5 * ((z - center) / sigma) ** 2)
+
+    weights = weights / weights.sum().clamp(min=1e-12)
+    plane = (psf * weights[:, None, None]).sum(dim=0)
+    return plane / plane.sum().clamp(min=1e-12)
 
 
 def _estimate_noise_sigma(image: torch.Tensor) -> float:
@@ -321,6 +402,89 @@ def _initial_estimate(
     return x_prev, x_cur
 
 
+def _initial_estimate_center_plane(
+    start: str,
+    img_t: torch.Tensor,
+    latent_shape: tuple[int, int, int],
+    work_shape: tuple[int, int, int],
+    obs_slice: tuple[slice, slice, slice],
+    bg: float,
+    dtype: torch.dtype,
+    dev: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Initial estimate for hidden-volume 2D widefield RL."""
+    center = latent_shape[0] // 2
+    if start == "flat":
+        mean_val = max(float(img_t.mean()), bg)
+        x_prev = torch.full(work_shape, bg, dtype=dtype, device=dev)
+        x_prev[center, :latent_shape[1], :latent_shape[2]] = mean_val
+        x_cur = x_prev.clone()
+        return x_prev, x_cur
+
+    x_prev = torch.full(work_shape, bg, dtype=dtype, device=dev)
+    if start == "lowpass":
+        plane = _gaussian_smooth(img_t, sigma=8.0).clamp(min=bg)
+    else:
+        plane = img_t.clamp(min=bg)
+    x_prev[obs_slice] = plane.unsqueeze(0)
+    x_prev[center, :latent_shape[1], :latent_shape[2]] = plane
+    x_cur = x_prev.clone()
+    return x_prev, x_cur
+
+
+def _estimate_widefield_2d_pixel_size_z_nm(
+    wavelength_nm: float,
+    na: float,
+    ri_sample: float,
+    pixel_size_xy_nm: Optional[float],
+) -> float:
+    """Return a practical axial sampling step for hidden-volume 2D widefield RL."""
+    na_safe = max(float(na), 1e-6)
+    sample_ri = max(float(ri_sample), na_safe + 1e-6)
+    xy_nm = max(float(pixel_size_xy_nm), 1.0) if pixel_size_xy_nm is not None else 100.0
+    denom = max(sample_ri - math.sqrt(max(sample_ri ** 2 - na_safe ** 2, 1e-9)), 1e-6)
+    nyquist_nm = wavelength_nm / (2.0 * denom)
+    return max(min(nyquist_nm, 1000.0), xy_nm / 2.0)
+
+
+def _crop_psf_axial_support(
+    psf: torch.Tensor,
+    energy_fraction: float = 0.995,
+    min_planes: int = 17,
+    max_planes: int = 65,
+) -> torch.Tensor:
+    """Crop a 3D PSF to the smallest odd axial extent covering most energy."""
+    if psf.ndim != 3 or psf.shape[0] <= 1:
+        return psf
+    nz = psf.shape[0]
+    center = nz // 2
+    axial = psf.sum(dim=(1, 2))
+    total = float(axial.sum().detach())
+    if total <= 0.0:
+        return psf
+
+    target = energy_fraction * total
+    cum = float(axial[center].detach())
+    radius = 0
+    max_radius = center
+    while cum < target and radius < max_radius:
+        radius += 1
+        cum += float(axial[center - radius].detach()) + float(axial[center + radius].detach())
+
+    planes = 2 * radius + 1
+    planes = max(min_planes, planes)
+    planes = min(max_planes, planes, nz)
+    if planes % 2 == 0:
+        planes = max(1, planes - 1)
+    half = planes // 2
+    lo = max(center - half, 0)
+    hi = min(center + half + 1, nz)
+    if hi - lo < planes:
+        lo = max(hi - planes, 0)
+        hi = min(lo + planes, nz)
+    return psf[lo:hi]
+
+
 def _forward_project(
     estimate: torch.Tensor,
     otf: torch.Tensor,
@@ -361,9 +525,19 @@ def _sparse_hessian_penalty(
     eps = 1e-8
     weighting = float(np.clip(weighting, 0.0, 1.0))
 
+    # Treat singleton axes as lower-dimensional data so 2-D inputs stored
+    # as (1, Y, X) still receive XY regularisation instead of a zero penalty.
+    if x.ndim == 3 and 1 in x.shape:
+        squeezed = x.squeeze()
+        if squeezed.ndim in (2, 3):
+            eff_z_scale = z_scale if squeezed.ndim == 3 else 1.0
+            return _sparse_hessian_penalty(
+                squeezed, weighting, z_scale=eff_z_scale
+            )
+
     if x.ndim == 2:
         if min(x.shape) < 3:
-            return torch.zeros((), dtype=x.dtype, device=x.device)
+            return x.sum() * 0.0
         core = x[1:-1, 1:-1]
         dxx = -x[2:, 1:-1] + 2.0 * core - x[:-2, 1:-1]
         dyy = -x[1:-1, 2:] + 2.0 * core - x[1:-1, :-2]
@@ -378,7 +552,7 @@ def _sparse_hessian_penalty(
 
     if x.ndim == 3:
         if min(x.shape) < 3:
-            return torch.zeros((), dtype=x.dtype, device=x.device)
+            return x.sum() * 0.0
         core = x[1:-1, 1:-1, 1:-1]
         dxx = -x[1:-1, 1:-1, 2:] + 2.0 * core - x[1:-1, 1:-1, :-2]
         dyy = -x[1:-1, 2:, 1:-1] + 2.0 * core - x[1:-1, :-2, 1:-1]
@@ -434,40 +608,96 @@ def _anscombe_prefilter(
 # XY tiling helpers (large image support)
 # ---------------------------------------------------------------------------
 
-MAX_TILE_Z = 64
-MAX_TILE_XY = 512
 TILE_MARGIN = 16
+
+
+def _get_memory_budget_bytes(device: Optional[str] = None) -> int:
+    """Return an estimated safe memory budget in bytes for tiling decisions.
+
+    Uses 55% of total GPU VRAM when CUDA is available, or 50% of available
+    system RAM (capped at 16 GB) for CPU execution.
+    """
+    dev = _pick_device(device)
+    if dev.type == "cuda":
+        try:
+            total = torch.cuda.get_device_properties(dev).total_memory
+            return int(total * 0.55)
+        except Exception:
+            return int(8e9 * 0.55)
+    else:
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+            return int(min(available * 0.50, 16e9))
+        except ImportError:
+            return int(8e9 * 0.50)
+
+
+def _suggest_max_tile_xy(
+    n_z: int,
+    psf_xy_est: int = 65,
+    device: Optional[str] = None,
+) -> int:
+    """Return the largest safe XY tile dimension for the given Z depth and device.
+
+    Memory model: ``budget ≈ 64 × padded_z × (tile_xy + psf_xy)²`` bytes,
+    where ``padded_z ≈ 4 × n_z`` (FFT zero-padding for a 3D PSF of size
+    ``2*n_z - 1``).  CPU uses float64, so effective budget is halved.
+    """
+    budget = _get_memory_budget_bytes(device)
+    dev = _pick_device(device)
+    if dev.type == "cpu":
+        budget //= 2  # float64 uses twice the memory
+    padded_z = max(1, 4 * n_z) if n_z > 1 else 1
+    inner_sq = budget / max(64 * padded_z, 1)
+    tile_xy = int(math.sqrt(max(inner_sq, 0.0))) - psf_xy_est
+    return max(256, min(tile_xy, 4096))
 
 
 def _auto_n_tiles(
     shape: tuple[int, ...],
-    max_z: int = MAX_TILE_Z,
-    max_xy: int = MAX_TILE_XY,
+    device: Optional[str] = None,
+    psf_xy_est: int = 65,
 ) -> int:
-    """Return the minimum number of XY tiles so each tile fits within limits."""
+    """Return the minimum number of XY tiles so each tile fits in device memory.
+
+    Tile size is computed automatically from the available GPU/CPU memory
+    budget via :func:`_suggest_max_tile_xy`.  Only XY is tiled; Z is always
+    processed in full.
+    """
     if len(shape) < 3:
         return 1
-    Z, H, W = shape[:3]
+    n_z, H, W = shape[:3]
+    max_xy = _suggest_max_tile_xy(n_z, psf_xy_est=psf_xy_est, device=device)
     ny = max(1, -(-H // max_xy))
     nx = max(1, -(-W // max_xy))
     n_tiles = ny * nx
+    if n_tiles > 1:
+        log.info(
+            "Auto-tiling: image z=%d h=%d w=%d, budget max_tile_xy=%d → %d×%d grid",
+            n_z, H, W, max_xy, ny, nx,
+        )
     return 1 if n_tiles <= 1 else n_tiles
 
 
 def _resolve_tiling(
     tiling: str,
     shape: tuple[int, ...],
-    max_xy: int = MAX_TILE_XY,
-    max_z: int = MAX_TILE_Z,
+    device: Optional[str] = None,
+    psf_xy_est: int = 65,
 ) -> int:
-    """Resolve *tiling* mode to a concrete tile count."""
+    """Resolve *tiling* mode to a concrete tile count.
+
+    Accepted values: ``"none"`` (disable tiling) or ``"auto"`` / ``"custom"``
+    (compute from image shape using the device memory budget).
+    """
     if isinstance(tiling, str):
         mode = tiling.strip().lower()
         if mode == "none":
             return 1
         if mode in ("custom", "auto"):
-            return _auto_n_tiles(shape, max_z=max_z, max_xy=max_xy)
-        raise ValueError(f"tiling must be 'none' or 'custom', got '{tiling}'")
+            return _auto_n_tiles(shape, device=device, psf_xy_est=psf_xy_est)
+        raise ValueError(f"tiling must be 'none' or 'auto', got '{tiling}'")
     return max(int(tiling), 1)
 
 
@@ -624,6 +854,129 @@ def _ci_deconvolve_tiled(
     }
 
 
+def _ci_rl_deconvolve_2d_widefield(
+    image: np.ndarray,
+    psf: np.ndarray,
+    *,
+    niter: int,
+    tv_lambda: float,
+    damping: Union[str, float],
+    offset: Union[str, float],
+    prefilter_sigma: float,
+    start: str,
+    background: Union[str, float],
+    convergence: str,
+    rel_threshold: float,
+    check_every: int,
+    pixel_size_xy: Optional[float],
+    pixel_size_z: Optional[float],
+    two_d_wf_aggressiveness: str,
+    two_d_wf_bg_radius_um: float,
+    two_d_wf_bg_scale: float,
+    device: Optional[str],
+) -> dict[str, Any]:
+    """Conservative widefield-aware 2D RL using a collapsed 3D PSF."""
+    if start not in ("flat", "observed", "lowpass"):
+        start = "flat"
+
+    dev = _pick_device(device)
+    dtype = _pick_dtype(dev)
+    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
+
+    if psf.ndim == 3:
+        psf_t = _crop_psf_axial_support(_to_tensor(psf.astype(np.float64), dev, dtype))
+        psf_2d = _to_numpy(
+            _collapse_widefield_psf_to_2d(psf_t, two_d_wf_aggressiveness).detach()
+        )
+    elif psf.ndim == 2:
+        psf_2d = np.asarray(psf, dtype=np.float64)
+        psf_2d = psf_2d / max(float(psf_2d.sum()), 1e-12)
+    else:
+        raise ValueError(f"Unsupported PSF dimensionality for 2D widefield auto mode: {psf.shape}")
+
+    mode = str(two_d_wf_aggressiveness).strip().lower()
+    if mode == "very conservative":
+        auto_damping_default = 2.5
+        auto_offset_default = 3.0
+        auto_bg_preset_scale = 1.2
+    elif mode == "conservative":
+        auto_damping_default = 2.0
+        auto_offset_default = 2.5
+        auto_bg_preset_scale = 1.1
+    elif mode == "very strong":
+        auto_damping_default = 0.75
+        auto_offset_default = 1.0
+        auto_bg_preset_scale = 0.8
+    elif mode == "strong":
+        auto_damping_default = 1.0
+        auto_offset_default = 1.5
+        auto_bg_preset_scale = 0.9
+    else:
+        auto_damping_default = 1.5
+        auto_offset_default = 2.0
+        auto_bg_preset_scale = 1.0
+
+    bg_radius_um = max(float(two_d_wf_bg_radius_um), 0.05)
+    bg_scale = max(float(two_d_wf_bg_scale), 0.1)
+
+    if background == "auto":
+        local_bg = _estimate_background_local_plane(
+            img_t, pixel_size_xy, radius_um=bg_radius_um,
+        )
+        global_bg = _estimate_background(img_t)
+        base_bg = min(local_bg, global_bg)
+        effective_background: Union[str, float] = max(
+            base_bg * auto_bg_preset_scale * bg_scale, 1e-6,
+        )
+    else:
+        effective_background = max(float(background), 1e-6)
+
+    if damping == "auto":
+        effective_damping = auto_damping_default
+    else:
+        effective_damping = damping
+
+    if offset == "auto":
+        effective_offset = auto_offset_default
+    else:
+        effective_offset = offset
+
+    effective_prefilter = max(float(prefilter_sigma), 0.0)
+
+    log.info(
+        "  2D WF auto -> collapsed-PSF RL  mode=%s  radius_um=%.3g  bg_scale=%.3g  "
+        "bg=%.4g  damping=%s  offset=%s  prefilter=%.4g",
+        two_d_wf_aggressiveness,
+        bg_radius_um,
+        bg_scale,
+        float(effective_background),
+        effective_damping,
+        effective_offset,
+        effective_prefilter,
+    )
+
+    return ci_rl_deconvolve(
+        image,
+        psf_2d,
+        niter=niter,
+        tv_lambda=tv_lambda,
+        damping=effective_damping,
+        offset=effective_offset,
+        prefilter_sigma=effective_prefilter,
+        start=start,
+        background=effective_background,
+        convergence=convergence,
+        rel_threshold=rel_threshold,
+        check_every=check_every,
+        pixel_size_xy=pixel_size_xy,
+        pixel_size_z=pixel_size_z,
+        microscope_type="widefield",
+        two_d_mode="legacy_2d",
+        device=device,
+        tiling="none",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level RL deconvolution
 # ---------------------------------------------------------------------------
@@ -644,10 +997,13 @@ def ci_rl_deconvolve(
     check_every: int = 5,
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
+    microscope_type: str = "widefield",
+    two_d_mode: str = "auto",
+    two_d_wf_aggressiveness: str = "balanced",
+    two_d_wf_bg_radius_um: float = 0.5,
+    two_d_wf_bg_scale: float = 1.0,
     device: Optional[str] = None,
-    tiling: str = "custom",
-    max_tile_xy: int = MAX_TILE_XY,
-    max_tile_z: int = MAX_TILE_Z,
+    tiling: str = "auto",
 ) -> dict[str, Any]:
     """SHB-accelerated Richardson-Lucy deconvolution (GPU / CPU).
 
@@ -687,6 +1043,21 @@ def ci_rl_deconvolve(
         Relative change threshold for auto-convergence.
     check_every : int
         Evaluate I-divergence every *check_every* iterations.
+    microscope_type : str
+        Microscope mode. ``"widefield"`` activates the hidden-volume 2-D
+        model when *image* is 2-D and *two_d_mode* is ``"auto"``.
+    two_d_mode : str
+        ``"auto"`` enables the enhanced 2-D widefield model; ``"legacy_2d"``
+        preserves the historical pure-2-D RL behavior.
+    two_d_wf_aggressiveness : str
+        Expert tuning for 2-D widefield auto mode: ``"conservative"``,
+        ``"balanced"``, or ``"strong"``.
+    two_d_wf_bg_radius_um : float
+        Expert background-estimator neighborhood radius in micrometers for
+        2-D widefield auto mode.
+    two_d_wf_bg_scale : float
+        Expert multiplier applied to the auto-estimated 2-D widefield
+        background.
     device : str or None
         PyTorch device (``"cuda"``, ``"cpu"``).  ``None`` = auto.
 
@@ -698,8 +1069,8 @@ def ci_rl_deconvolve(
         ``"iterations_used"`` — number of iterations actually performed.
     """
     # --- Tiling dispatch ---
-    n_tiles = _resolve_tiling(tiling, image.shape, max_xy=max_tile_xy,
-                              max_z=max_tile_z)
+    psf_xy_est = max(psf.shape[-1], psf.shape[-2]) if psf.ndim >= 2 else 65
+    n_tiles = _resolve_tiling(tiling, image.shape, device=device, psf_xy_est=psf_xy_est)
     if n_tiles > 1:
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
@@ -710,8 +1081,35 @@ def ci_rl_deconvolve(
             convergence=convergence, rel_threshold=rel_threshold,
             check_every=check_every,
             pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            microscope_type=microscope_type, two_d_mode=two_d_mode,
+            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+            two_d_wf_bg_scale=two_d_wf_bg_scale,
             device=device,
-            max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
+        )
+
+    two_d_mode = str(two_d_mode).strip().lower()
+    microscope_type = str(microscope_type).strip().lower()
+    if image.ndim == 2 and microscope_type == "widefield" and two_d_mode == "auto":
+        return _ci_rl_deconvolve_2d_widefield(
+            image,
+            psf,
+            niter=niter,
+            tv_lambda=tv_lambda,
+            damping=damping,
+            offset=offset,
+            prefilter_sigma=prefilter_sigma,
+            start=start,
+            background=background,
+            convergence=convergence,
+            rel_threshold=rel_threshold,
+            check_every=check_every,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            two_d_wf_aggressiveness=two_d_wf_aggressiveness,
+            two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
+            two_d_wf_bg_scale=two_d_wf_bg_scale,
+            device=device,
         )
 
     dev = _pick_device(device)
@@ -735,9 +1133,9 @@ def ci_rl_deconvolve(
 
     log.info("ci_rl_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
              "tv_lambda=%.4g  damping=%.4g  offset=%.4g  prefilter_sigma=%.4g  "
-             "start=%s  convergence=%s",
+             "start=%s  convergence=%s  microscope=%s  two_d_mode=%s",
              dev, dtype, image.shape, niter, tv_lambda, damp_strength, offset_val,
-             prefilter_sigma, start, convergence)
+             prefilter_sigma, start, convergence, microscope_type, two_d_mode)
 
     # Move data to device
     img_t = _to_tensor(image.astype(np.float64), dev, dtype)
@@ -879,12 +1277,11 @@ def ci_sparse_hessian_deconvolve(
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
     device: Optional[str] = None,
-    tiling: str = "custom",
-    max_tile_xy: int = MAX_TILE_XY,
-    max_tile_z: int = MAX_TILE_Z,
+    tiling: str = "auto",
 ) -> dict[str, Any]:
     """Sparse-Hessian / SPITFIRE-style deconvolution with alternating updates."""
-    n_tiles = _resolve_tiling(tiling, image.shape, max_xy=max_tile_xy, max_z=max_tile_z)
+    psf_xy_est = max(psf.shape[-1], psf.shape[-2]) if psf.ndim >= 2 else 65
+    n_tiles = _resolve_tiling(tiling, image.shape, device=device, psf_xy_est=psf_xy_est)
     if n_tiles > 1:
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
@@ -902,8 +1299,6 @@ def ci_sparse_hessian_deconvolve(
             pixel_size_xy=pixel_size_xy,
             pixel_size_z=pixel_size_z,
             device=device,
-            max_tile_xy=max_tile_xy,
-            max_tile_z=max_tile_z,
         )
 
     dev = _pick_device(device)
