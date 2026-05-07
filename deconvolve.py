@@ -1088,7 +1088,7 @@ def deconvolve(
         }
         dl2_algo, dl2_kwargs = dl2_algorithms[method]
         return _deconvolve_deconvlab2(
-            image, psf, algorithm=dl2_algo, niter=niter, tv_lambda=tv_lambda,
+            image, psf, algorithm=dl2_algo, niter=niter,
             **(dl2_kwargs or {}),
         )
 
@@ -1257,6 +1257,7 @@ def _deconvolve_pycudadecon(
         result_slices = []
         for z in range(image.shape[0]):
             slice_3d = image[z][np.newaxis, :, :]  # (1, Y, X)
+
             out = decon(
                 slice_3d, psf_3d,
                 dzdata=dzdata or 0.1, dxdata=dxdata or 0.1,

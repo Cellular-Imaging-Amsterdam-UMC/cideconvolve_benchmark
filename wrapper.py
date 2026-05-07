@@ -76,6 +76,7 @@ from deconvolve import (
     METHODS,
     deconvolve_image,
     load_image,
+    save_mip_png,
     save_result,
 )
 
@@ -205,6 +206,30 @@ BENCHMARK_CSV_FIELDS = [
     "edge_strength_mean",
     "signal_sparsity_mean",
     "robust_range_mean",
+    "gt_psnr_mean",
+    "gt_nrmse_mean",
+    "gt_ssim_mean",
+    "gt_ncc_mean",
+    "gt_frc_area_mean",
+    "gt_total_intensity_err",
+    "gt_bg_noise_std_mean",
+    "gt_overshoot_ratio",
+    "gt_negative_fraction",
+    "gt_spot_f1_mean",
+    "gt_spot_precision_mean",
+    "gt_spot_recall_mean",
+    "input_gt_psnr_mean",
+    "input_gt_nrmse_mean",
+    "input_gt_ssim_mean",
+    "input_gt_ncc_mean",
+    "input_gt_frc_area_mean",
+    "input_gt_total_intensity_err",
+    "input_gt_bg_noise_std_mean",
+    "input_gt_spot_f1_mean",
+    "delta_gt_psnr_mean",
+    "delta_gt_nrmse_mean",
+    "delta_gt_ssim_mean",
+    "delta_gt_ncc_mean",
     "result_shape",
 ]
 
@@ -403,6 +428,214 @@ def _quality_metrics(
     for key, values in metric_values.items():
         out[f"{key}_mean"] = _mean_or_zero(values)
     return out
+
+
+def _detect_synthetic_gt(img_path: Path) -> "Path | None":
+    """Return path to synthetic_object_gt.ome.tiff if img_path is a synthetic blurred image."""
+    if "synthetic_blurred_noisy" not in img_path.name:
+        return None
+    gt_path = img_path.parent / "synthetic_object_gt.ome.tiff"
+    return gt_path if gt_path.exists() else None
+
+
+def _compute_frc_area(img1: np.ndarray, img2: np.ndarray) -> float:
+    """Compute FRC AUC (mean correlation over frequency rings). Higher = better."""
+    h, w = img1.shape[-2], img1.shape[-1]
+    # Use central 2D slice if 3D
+    if img1.ndim == 3:
+        img1 = img1[img1.shape[0] // 2]
+        img2 = img2[img2.shape[0] // 2]
+    f1 = np.fft.fft2(img1 - img1.mean())
+    f2 = np.fft.fft2(img2 - img2.mean())
+    n_rings = min(h, w) // 2
+    if n_rings < 2:
+        return 0.0
+    yy, xx = np.mgrid[0:h, 0:w]
+    cy, cx = h / 2.0, w / 2.0
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    max_r = min(h, w) / 2.0
+    frc_values = []
+    cross = f1 * np.conj(f2)
+    p1 = np.abs(f1) ** 2
+    p2 = np.abs(f2) ** 2
+    for ring_i in range(n_rings):
+        lo = ring_i * max_r / n_rings
+        hi = (ring_i + 1) * max_r / n_rings
+        mask = (r >= lo) & (r < hi)
+        if not np.any(mask):
+            continue
+        num = float(np.abs(np.sum(cross[mask])))
+        denom = float(np.sqrt(np.sum(p1[mask]) * np.sum(p2[mask]))) + 1e-12
+        frc_values.append(num / denom)
+    return float(np.mean(frc_values)) if frc_values else 0.0
+
+
+def _gt_quality_metrics(
+    result_channels: list[np.ndarray],
+    gt_channels: list[np.ndarray],
+) -> dict[str, float]:
+    """Compute GT-referenced accuracy metrics."""
+    from skimage.metrics import structural_similarity
+
+    psnr_vals, nrmse_vals, ssim_vals, ncc_vals = [], [], [], []
+    frc_vals, tie_vals, bg_vals, overshoot_vals, neg_vals = [], [], [], [], []
+
+    n_pairs = min(len(result_channels), len(gt_channels))
+    for i in range(n_pairs):
+        res = np.asarray(result_channels[i], dtype=np.float64)
+        gt = np.asarray(gt_channels[i], dtype=np.float64)
+        if res.shape != gt.shape:
+            continue
+        gt_max = float(gt.max())
+        if gt_max < 1e-12:
+            continue
+        res_n = res / gt_max
+        gt_n = gt / gt_max
+
+        # PSNR
+        mse = float(np.mean((res_n - gt_n) ** 2))
+        psnr = min(float(20.0 * np.log10(1.0 / (np.sqrt(mse) + 1e-12))), 100.0) if mse > 0 else 100.0
+        psnr_vals.append(psnr)
+
+        # NRMSE
+        nrmse = float(np.sqrt(mse)) / max(float(gt_n.max() - gt_n.min()), 1e-12)
+        nrmse_vals.append(nrmse)
+
+        # SSIM
+        try:
+            ssim_val = float(structural_similarity(
+                gt_n, res_n, data_range=1.0,
+                channel_axis=None,
+            ))
+        except Exception:
+            ssim_val = 0.0
+        ssim_vals.append(ssim_val)
+
+        # NCC (Pearson)
+        try:
+            r = float(np.corrcoef(gt_n.ravel(), res_n.ravel())[0, 1])
+            if not np.isfinite(r):
+                r = 0.0
+            r = max(-1.0, min(1.0, r))
+        except Exception:
+            r = 0.0
+        ncc_vals.append(r)
+
+        # FRC
+        frc_vals.append(_compute_frc_area(gt_n, res_n))
+
+        # Total intensity error
+        gt_sum = float(np.sum(gt_n))
+        res_sum = float(np.sum(res_n))
+        tie = abs(res_sum - gt_sum) / max(gt_sum, 1e-12)
+        tie_vals.append(tie)
+
+        # Background noise std
+        gt_p10 = float(np.percentile(gt_n, 10))
+        bg_mask = gt_n < gt_p10
+        if np.any(bg_mask):
+            bg_vals.append(float(np.std(res_n[bg_mask])))
+        else:
+            bg_vals.append(0.0)
+
+        # Overshoot ratio
+        overshoot_vals.append(float(np.max(res_n)) / max(float(np.max(gt_n)), 1e-12))
+
+        # Negative fraction (before clip — some algorithms produce negatives)
+        neg_frac = float(np.sum(res < 0)) / max(float(res.size), 1)
+        neg_vals.append(neg_frac)
+
+    def _m(lst: list) -> float:
+        return float(np.mean(lst)) if lst else 0.0
+
+    return {
+        "gt_psnr_mean": _m(psnr_vals),
+        "gt_nrmse_mean": _m(nrmse_vals),
+        "gt_ssim_mean": _m(ssim_vals),
+        "gt_ncc_mean": _m(ncc_vals),
+        "gt_frc_area_mean": _m(frc_vals),
+        "gt_total_intensity_err": _m(tie_vals),
+        "gt_bg_noise_std_mean": _m(bg_vals),
+        "gt_overshoot_ratio": _m(overshoot_vals),
+        "gt_negative_fraction": _m(neg_vals),
+    }
+
+
+def _gt_spot_metrics(
+    result_channels: list[np.ndarray],
+    gt_channels: list[np.ndarray],
+    tolerance_px: float = 3.0,
+) -> dict[str, float]:
+    """Compute spot detection F1 score comparing result vs GT using blob_log."""
+    try:
+        from skimage.feature import blob_log
+    except ImportError:
+        return {"gt_spot_f1_mean": 0.0, "gt_spot_precision_mean": 0.0, "gt_spot_recall_mean": 0.0}
+
+    f1_vals, prec_vals, rec_vals = [], [], []
+    n_pairs = min(len(result_channels), len(gt_channels))
+    for i in range(n_pairs):
+        res = np.asarray(result_channels[i], dtype=np.float32)
+        gt = np.asarray(gt_channels[i], dtype=np.float32)
+        if res.shape != gt.shape:
+            continue
+        # Use Z-MIP for spot detection
+        res_mip = res.max(axis=0) if res.ndim == 3 else res
+        gt_mip = gt.max(axis=0) if gt.ndim == 3 else gt
+
+        def _norm(x: np.ndarray) -> np.ndarray:
+            lo, hi = float(x.min()), float(x.max())
+            return (x - lo) / max(hi - lo, 1e-12)
+
+        gt_mip_n = _norm(gt_mip)
+        res_mip_n = _norm(res_mip)
+
+        try:
+            gt_blobs = blob_log(gt_mip_n, min_sigma=1, max_sigma=6, num_sigma=6, threshold=0.08)
+            res_blobs = blob_log(res_mip_n, min_sigma=1, max_sigma=6, num_sigma=6, threshold=0.08)
+        except Exception:
+            f1_vals.append(0.0)
+            prec_vals.append(0.0)
+            rec_vals.append(0.0)
+            continue
+
+        if len(gt_blobs) == 0:
+            f1_vals.append(1.0 if len(res_blobs) == 0 else 0.0)
+            prec_vals.append(1.0 if len(res_blobs) == 0 else 0.0)
+            rec_vals.append(1.0)
+            continue
+
+        gt_pts = gt_blobs[:, :2]
+        res_pts = res_blobs[:, :2] if len(res_blobs) > 0 else np.empty((0, 2))
+
+        # Greedy nearest-neighbour matching
+        matched_gt: set[int] = set()
+        matched_res: set[int] = set()
+        if len(res_pts) > 0:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(gt_pts)
+            dists, idxs = tree.query(res_pts, k=1)
+            for res_i, (d, gt_i) in enumerate(zip(dists, idxs)):
+                if d <= tolerance_px and gt_i not in matched_gt and res_i not in matched_res:
+                    matched_gt.add(int(gt_i))
+                    matched_res.add(res_i)
+
+        tp = len(matched_gt)
+        prec = tp / max(len(res_pts), 1)
+        rec = tp / max(len(gt_pts), 1)
+        f1 = 2 * prec * rec / max(prec + rec, 1e-12)
+        f1_vals.append(f1)
+        prec_vals.append(prec)
+        rec_vals.append(rec)
+
+    def _m(lst: list) -> float:
+        return float(np.mean(lst)) if lst else 0.0
+
+    return {
+        "gt_spot_f1_mean": _m(f1_vals),
+        "gt_spot_precision_mean": _m(prec_vals),
+        "gt_spot_recall_mean": _m(rec_vals),
+    }
 
 
 def _stem(filename: str) -> str:
@@ -1169,6 +1402,8 @@ def _make_benchmark_montage(
     bench_iterations,
     all_metrics,
     metadata,
+    *,
+    gt_mip_png: "Path | None" = None,
 ):
     """Create an RGB montage of all benchmark MIP PNGs and return its path."""
     from PIL import Image, ImageDraw, ImageFont
@@ -1195,8 +1430,11 @@ def _make_benchmark_montage(
         else:
             col_order.append((m, None))
 
-    # Row 0: source MIP
-    rows = [[(out_dir / "mip_source.ome.png", "Source")]]
+    # Row 0: source MIP (with optional ground truth)
+    if gt_mip_png is not None and Path(gt_mip_png).exists():
+        rows = [[(Path(gt_mip_png), "Ground Truth"), (out_dir / "mip_source.ome.png", "Blurred+Noise")]]
+    else:
+        rows = [[(out_dir / "mip_source.ome.png", "Source")]]
 
     # One row per iteration count
     for nit in bench_iterations:
@@ -1249,8 +1487,9 @@ def _make_benchmark_montage(
     cell_w = max_w + 2 * padding
     cell_h = max_h + label_height + 2 * padding
 
-    # Metadata panel spans all columns to the right of Source
-    span_cols = max(n_cols - 1, 1)
+    # Metadata panel spans all columns to the right of row-0 images
+    row0_len = len(rows[0]) if rows else 1
+    span_cols = max(n_cols - row0_len, 1)
     meta_w = span_cols * cell_w - 2 * padding
     meta_panel = _make_metadata_panel(metadata, meta_w, max_h, font)
 
@@ -1273,8 +1512,8 @@ def _make_benchmark_montage(
             ty = y0 + max_h + padding
             draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
 
-    # Paste wide metadata panel at row 0, starting at column 1
-    meta_x = cell_w + padding
+    # Paste wide metadata panel at row 0, starting after row-0 images
+    meta_x = row0_len * cell_w + padding
     meta_y = padding
     montage.paste(meta_panel, (meta_x, meta_y))
 
@@ -1291,6 +1530,8 @@ def _make_per_channel_montages(
     bench_iterations,
     all_metrics,
     metadata,
+    *,
+    gt_mip_tiff: "Path | None" = None,
 ):
     """Create one greyscale montage per channel from benchmark MIP TIFFs."""
     from PIL import Image, ImageDraw, ImageFont
@@ -1319,10 +1560,18 @@ def _make_per_channel_montages(
         else:
             col_order.append((m, None))
 
-    # Build row definitions: row 0 = source, rows 1-N = per iteration count
-    mip_rows = [
-        [("Source", out_dir / "mip_source.ome.tiff")],
-    ]
+    # Build row definitions: row 0 = source (+ optional GT), rows 1-N = per iteration count
+    _gt_tiff = Path(gt_mip_tiff) if gt_mip_tiff is not None else None
+    if _gt_tiff is not None and _gt_tiff.exists():
+        mip_rows = [
+            [("Ground Truth", _gt_tiff), ("Blurred+Noise", out_dir / "mip_source.ome.tiff")],
+        ]
+        _row0_len = 2
+    else:
+        mip_rows = [
+            [("Source", out_dir / "mip_source.ome.tiff")],
+        ]
+        _row0_len = 1
     for nit in bench_iterations:
         row = []
         for method, variant in col_order:
@@ -1400,8 +1649,8 @@ def _make_per_channel_montages(
         cell_w = max_w + 2 * padding
         cell_h = max_h + label_height + 2 * padding
 
-        # Metadata panel spans all columns to the right of Source
-        span_cols = max(n_cols - 1, 1)
+        # Metadata panel spans all columns to the right of row-0 images
+        span_cols = max(n_cols - _row0_len, 1)
         meta_w = span_cols * cell_w - 2 * padding
         meta_panel = _make_metadata_panel(metadata, meta_w, max_h, font)
 
@@ -1424,8 +1673,8 @@ def _make_per_channel_montages(
                 ty = y0 + max_h + padding
                 draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
 
-        # Paste wide metadata panel at row 0, starting at column 1
-        meta_x = cell_w + padding
+        # Paste wide metadata panel at row 0, starting after row-0 images
+        meta_x = _row0_len * cell_w + padding
         meta_y = padding
         montage.paste(meta_panel, (meta_x, meta_y))
 
@@ -1582,6 +1831,40 @@ def _run_benchmark(
             if _use_value(ch.get("pinhole_airy_units"), pinhole_airy_units):
                 ch["pinhole_airy_units"] = pinhole_airy_units
     meta["_cli_overrides"] = _cli_set
+
+    # --- Detect synthetic ground truth ---
+    gt_path = _detect_synthetic_gt(img_path)
+    gt_channels: "list[np.ndarray] | None" = None
+    input_gt_metrics: dict = {}
+    if gt_path is not None:
+        if bench_crop:
+            print(f"  Synthetic GT detected: forcing bench_crop=False for GT compatibility")
+            bench_crop = False
+        print(f"  Loading ground truth: {gt_path.name}")
+        try:
+            import tifffile as _tifffile_gt_load
+            gt_data = load_image(gt_path)
+            gt_channels = gt_data["images"]
+            # Save GT MIP for montage
+            gt_stack = np.stack(gt_channels, axis=0)
+            gt_mip_arr = gt_stack.max(axis=1) if gt_channels[0].ndim == 3 else gt_stack
+            gt_mip_tiff_path = Path(out_path) / "mip_gt.ome.tiff"
+            _tifffile_gt_load.imwrite(
+                str(gt_mip_tiff_path),
+                gt_mip_arr.astype(np.float32),
+                ome=True,
+                photometric="minisblack",
+                metadata={"axes": "CYX"},
+            )
+            gt_mip_png_path = Path(out_path) / "mip_gt.ome.png"
+            save_mip_png(gt_mip_arr, gt_mip_png_path, gt_data["metadata"])
+            print(f"  GT MIP saved: {gt_mip_png_path.name}")
+            # Compute baseline metrics (blurred input vs GT)
+            input_gt_metrics = _gt_quality_metrics(images, gt_channels)
+            input_gt_metrics.update(_gt_spot_metrics(images, gt_channels))
+        except Exception as _gt_exc:
+            print(f"  WARNING: Could not load GT ({_gt_exc}); GT metrics will be empty.")
+            gt_channels = None
 
     if bench_crop:
         cropped = []
@@ -1777,6 +2060,28 @@ def _run_benchmark(
                     row[key] = _safe_float(metrics.get(key, 0.0))
                 row["result_shape"] = _shape_to_str(result["channels"])
                 row.update(_quality_metrics(result["channels"]))
+                # GT-based metrics (only when ground truth is available)
+                if gt_channels is not None:
+                    try:
+                        gt_m = _gt_quality_metrics(result["channels"], gt_channels)
+                        gt_m.update(_gt_spot_metrics(result["channels"], gt_channels))
+                        row.update(gt_m)
+                        # Input baseline columns
+                        for _k, _v in input_gt_metrics.items():
+                            row[f"input_{_k}"] = _v
+                        # Delta columns (positive = improvement for quality metrics)
+                        for _metric in ("gt_psnr_mean", "gt_ssim_mean", "gt_ncc_mean"):
+                            row[f"delta_{_metric}"] = (
+                                _safe_float(gt_m.get(_metric, 0.0))
+                                - _safe_float(input_gt_metrics.get(_metric, 0.0))
+                            )
+                        # For NRMSE: lower is better, so delta positive = improvement
+                        row["delta_gt_nrmse_mean"] = (
+                            _safe_float(input_gt_metrics.get("gt_nrmse_mean", 0.0))
+                            - _safe_float(gt_m.get("gt_nrmse_mean", 0.0))
+                        )
+                    except Exception as _gt_m_exc:
+                        print(f"    WARNING: GT metrics failed: {_gt_m_exc}")
                 del result
 
                 gc.collect()
@@ -1894,8 +2199,12 @@ def _run_benchmark(
             "gpu_spill_mb": _safe_float(row.get("gpu_spill_mb", 0.0)),
         }
     if bench_montage:
-        _make_benchmark_montage(out_path, stem, available_methods, bench_iterations, montage_metrics, meta)
-        _make_per_channel_montages(out_path, stem, available_methods, bench_iterations, montage_metrics, meta)
+        _gt_mip_png = Path(out_path) / "mip_gt.ome.png" if gt_channels is not None else None
+        _gt_mip_tiff = Path(out_path) / "mip_gt.ome.tiff" if gt_channels is not None else None
+        _make_benchmark_montage(out_path, stem, available_methods, bench_iterations, montage_metrics, meta,
+                                gt_mip_png=_gt_mip_png)
+        _make_per_channel_montages(out_path, stem, available_methods, bench_iterations, montage_metrics, meta,
+                                   gt_mip_tiff=_gt_mip_tiff)
 
 
 if __name__ == "__main__":

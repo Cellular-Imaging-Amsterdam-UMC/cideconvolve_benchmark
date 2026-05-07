@@ -257,16 +257,23 @@ def generate_psf(config: SyntheticConfig) -> np.ndarray:
 
 
 def blur_and_noise(obj: np.ndarray, psf: np.ndarray, config: SyntheticConfig) -> np.ndarray:
+    """Blur *obj* with *psf* and add Poisson shot noise.
+
+    Returns uint16 photon counts as measured by a photon-counting detector.
+    Peak signal = SNR² photons (e.g. SNR=10 → 100 photons at peak).
+    """
     from scipy.signal import fftconvolve
 
     blurred = fftconvolve(obj, psf, mode="same").astype(np.float32)
     blurred = np.clip(blurred + 0.015, 0.0, None)
     peak = max(float(blurred.max()), 1e-12)
+    # For a photon-counting detector: SNR = sqrt(N_photons), so N_peak = SNR²
     photon_peak = config.snr ** 2
     scaled = blurred / peak * photon_peak
     rng = np.random.default_rng(config.seed)
-    noisy = rng.poisson(scaled).astype(np.float32) / photon_peak * peak
-    return np.clip(noisy, 0.0, None).astype(np.float32)
+    # Store raw integer photon counts — no rescaling back to float
+    counts = rng.poisson(scaled)
+    return np.clip(counts, 0, 65535).astype(np.uint16)
 
 
 def _immersion_name(ri: float) -> str:
@@ -279,6 +286,21 @@ def _immersion_name(ri: float) -> str:
     if abs(ri - 1.474) < 0.02:
         return "glycerol"
     return "other"
+
+
+def _numpy_dtype_to_ome_type(dtype: np.dtype) -> str:
+    """Map a numpy dtype to the corresponding OME-XML PixelType string."""
+    _map = {
+        np.float32: "float",
+        np.float64: "double",
+        np.uint8: "uint8",
+        np.uint16: "uint16",
+        np.uint32: "uint32",
+        np.int8: "int8",
+        np.int16: "int16",
+        np.int32: "int32",
+    }
+    return _map.get(np.dtype(dtype).type, "float")
 
 
 def _ome_xml(config: SyntheticConfig, image_kind: str, data: np.ndarray) -> bytes:
@@ -391,7 +413,7 @@ def _ome_xml(config: SyntheticConfig, image_kind: str, data: np.ndarray) -> byte
                 pixels=Pixels(
                     id="Pixels:0",
                     dimension_order="XYZCT",
-                    type="float",
+                    type=_numpy_dtype_to_ome_type(data.dtype),
                     size_x=int(data.shape[2]),
                     size_y=int(data.shape[1]),
                     size_z=int(data.shape[0]),
@@ -434,9 +456,10 @@ def write_ome(path: Path, data: np.ndarray, config: SyntheticConfig, image_kind:
     import tifffile
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Write as-is — float32 for GT, uint16 for blurred/noisy image
     tifffile.imwrite(
         str(path),
-        data.astype(np.float32),
+        data,
         description=_ome_xml(config, image_kind, data),
         photometric="minisblack",
         compression="zlib",
