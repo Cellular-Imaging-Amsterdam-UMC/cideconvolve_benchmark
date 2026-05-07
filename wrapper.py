@@ -113,6 +113,20 @@ _BENCH_FAST = [
     "skimage_cucim_rl",
     "deconvlab2_landweber",
 ]
+_BENCH_CROSS = [
+    "sdeconv_rl",
+    "sdeconv_spitfire",
+    "pycudadecon_rl_cuda",
+    "deconwolf_rl",
+    "deconwolf_shb",
+    "deconvlab2_rl",
+    "deconvlab2_rltv",
+    "redlionfish_rl",
+    "skimage_rl",
+    "ci_rl",
+    "ci_rl_tv",
+    "ci_sparse_hessian",
+]
 _BENCH_ALL = list(METHODS.keys())
 
 BENCH_METHOD_SETS = {
@@ -120,6 +134,7 @@ BENCH_METHOD_SETS = {
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl": _BENCH_BASE_RLF,
     "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
     "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
+    "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_sparse_hessian": _BENCH_CROSS,
     "all": _BENCH_ALL,
 }
 

@@ -23,6 +23,7 @@
         "sdeconv_spitfire",
         "ci_rl",
         "ci_rl_tv",
+        "ci_sparse_hessian",
         "pycudadecon_rl_cuda",
         "deconwolf_rl",
         "deconwolf_shb",
@@ -234,6 +235,7 @@
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl",
         "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl",
         "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber",
+        "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_sparse_hessian",
         "all"
       ]
     },

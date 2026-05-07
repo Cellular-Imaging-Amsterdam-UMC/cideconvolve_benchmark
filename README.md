@@ -20,7 +20,7 @@ image generation.
 | Workflow name | `W_CIDeconvolve_benchmark` |
 | Docker image | `cellularimagingcf/w_cideconvolve_benchmark` |
 | Version | `v1.0.0` |
-| Single-method selector | 16 methods in `descriptor.json` |
+| Single-method selector | 17 methods in `descriptor.json` |
 | Benchmark sets | include `ci_sparse_hessian` in addition to the public selector methods |
 | Input format | OME-TIFF / OME-Zarr via `bioio`, with TIFF fallback |
 
@@ -246,7 +246,7 @@ See [METHODS.md](METHODS.md) for method details and platform notes.
 Single-method choices in `descriptor.json` currently include:
 
 - `sdeconv_rl`, `sdeconv_wiener`, `sdeconv_spitfire`
-- `ci_rl`, `ci_rl_tv`
+- `ci_rl`, `ci_rl_tv`, `ci_sparse_hessian`
 - `pycudadecon_rl_cuda`
 - `deconwolf_rl`, `deconwolf_shb`
 - `deconvlab2_rl`, `deconvlab2_rltv`, `deconvlab2_landweber`, `deconvlab2_ista`

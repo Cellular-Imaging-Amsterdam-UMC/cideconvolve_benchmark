@@ -1,6 +1,6 @@
 # CIDeconvolve — Deconvolution Methods
 
-CIDeconvolve bundles **16 deconvolution methods** from 7 independent
+CIDeconvolve bundles **17 deconvolution methods** from 7 independent
 libraries.  Each method generates a theoretically correct PSF on-the-fly
 using metadata extracted from the input OME-TIFF (NA, refractive indices,
 wavelengths, voxel spacing, microscope type) and then applies the chosen
@@ -35,6 +35,7 @@ deconvolution algorithm.
 | 14 | `skimage_cucim_rl` | Richardson–Lucy | scikit-image + cuCIM | CUDA | ✅ | ✅ | 🟢 GPU | ❌ | 🟢 GPU |
 | 15 | `ci_rl` | SHB-accelerated RL | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
 | 16 | `ci_rl_tv` | SHB-accelerated RL + TV | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
+| 17 | `ci_sparse_hessian` | Sparse-Hessian variational | cideconvolve | CUDA / CPU | ✅ | ✅ | 🟢 GPU | 🟢 GPU | 🟢 GPU |
 
 > 🟢 **GPU** = runs with GPU acceleration.  🟡 **CPU** = runs but CPU-only.
 > **❌** = not available on that platform.  
@@ -181,7 +182,7 @@ scikit-image Richardson–Lucy implementation.
 - **GPU:** CUDA (required)
 - **Platform note:** Linux only — cuCIM does not support Windows.
 
-### 15–16. CIDeconvolve — `ci_rl`, `ci_rl_tv`
+### 15–17. CIDeconvolve — `ci_rl`, `ci_rl_tv`, `ci_sparse_hessian`
 
 Native CI methods developed in-house and maintained in the companion
 [cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
@@ -194,9 +195,18 @@ repository.  The implementation is bundled here as `deconvolve_ci.py`.
   is monitored at every iteration as a convergence criterion.
 - **`ci_rl_tv`** — Same as `ci_rl` with an additional
   **Total Variation (TV)** regularisation term (Dey et al. 2006) to
-  suppress noise amplification at high iteration counts.
+  suppress noise amplification at high iteration counts while preserving
+  edges.  Controlled by `--tv_lambda` (typical range 0.00005–0.001).
+- **`ci_sparse_hessian`** — A quality-focused variational deconvolution
+  combining the same FFT-based forward model and preprocessing stack with
+  a **sparse-Hessian / SPITFIRE-style** regulariser that favours thin,
+  high-contrast structures (filaments, membranes, synapses) while
+  suppressing noise.  Uses SHB momentum and Bertero boundary weighting.
+  Controlled by `--sparse_hessian_weight` (0–1, Hessian-vs-sparsity
+  balance) and `--sparse_hessian_reg` (0–1, data-vs-regulariser
+  balance).
 
-Both methods generate a physically accurate PSF on-the-fly (vectorial
+All three methods generate a physically accurate PSF on-the-fly (vectorial
 Richards–Wolf model for high-NA objectives, scalar Kirchhoff otherwise,
 with Gibson–Lanni RI-mismatch correction) and run on CUDA GPUs via
 PyTorch with automatic CPU fallback.
@@ -205,7 +215,7 @@ PyTorch with automatic CPU fallback.
 - **2-D support:** ✅ Yes
 - **GPU:** CUDA via PyTorch (CPU fallback)
 - **References:** Wang & Miller (2014), Bertero & Boccacci (2005), Dey et al. (2006),
-  Richards & Wolf (1959), Gibson & Lanni (1992)
+  Descloux et al. (2022), Richards & Wolf (1959), Gibson & Lanni (1992)
 
 ---
 
