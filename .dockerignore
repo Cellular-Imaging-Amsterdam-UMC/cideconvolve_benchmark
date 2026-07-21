@@ -1,7 +1,6 @@
 # Runtime inputs/outputs are mounted, not baked in
 outfolder/
 infolder/
-gtfolder/
 
 # Data is mounted at runtime, not baked in
 data/
@@ -28,6 +27,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+optimized_cuda/_build/
 
 # vcpkg build artifacts
 vcpkg/
@@ -42,7 +42,7 @@ Desktop.ini
 .DS_Store
 
 # Local app/editor state
-.last_settings.json
+.last_launcher_settings.json
 
 # Local helper assets not used by the image build
 tests/

@@ -1,16 +1,16 @@
 """
-wrapper.py — BIAFLOWS-compatible entrypoint for CIDeconvolve.
+wrapper.py — Bilayers-compatible entrypoint for CIDeconvolve Benchmark.
 
-Parses BIAFLOWS job parameters (--infolder, --outfolder, --gtfolder, etc.)
-via bioflows_local, then processes each input image through the
+Parses Bilayers workflow parameters from config.yaml, then processes each input
+image through the
 deconvolution pipeline in deconvolve.py and writes results to the output
 folder.
 
 Usage (inside Docker):
-    python wrapper.py --infolder /data/in --outfolder /data/out --gtfolder /data/gt --local
+    python wrapper.py --infolder /data/in --outfolder /data/out --local
 
 Usage (local):
-    python wrapper.py --infolder ./infolder --outfolder ./outfolder --gtfolder ./gtfolder --local --iterations 40 --method sdeconv_rl
+    python wrapper.py --infolder ./infolder --outfolder ./outfolder --local --iterations 40 --method sdeconv_rl
 """
 import csv
 import glob
@@ -62,12 +62,7 @@ class _TeeWriter:
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from bioflows_local import (
-    CLASS_SPTCNT,
-    BiaflowsJob,
-    get_discipline,
-    prepare_data,
-)
+from bilayers_cli import DEFAULT_CONFIG, BilayersJob, load_config, prepare_bilayers_data
 
 # Import deconvolve first (handles torch-before-numpy DLL load order)
 from deconvolve import (
@@ -90,7 +85,6 @@ _BENCH_BASE = [
     "pycudadecon_rl_cuda",
     "ci_rl",
     "ci_rl_tv",
-    "ci_rl_dl",
     "ci_sparse_hessian",
 ]
 _BENCH_BASE_RLF = _BENCH_BASE + [
@@ -111,7 +105,7 @@ _BENCH_FAST = [
     "pycudadecon_rl_cuda",
     "ci_rl",
     "ci_rl_tv",
-    "ci_rl_dl",
+    "ci_sparse_hessian",
     "sdeconv_rl",
     "skimage_cucim_rl",
     "deconvlab2_landweber",
@@ -128,22 +122,21 @@ _BENCH_CROSS = [
     "skimage_rl",
     "ci_rl",
     "ci_rl_tv",
-    "ci_rl_dl",
     "ci_sparse_hessian",
 ]
 _BENCH_ALL = list(METHODS.keys())
 
 BENCH_METHOD_SETS = {
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian": _BENCH_BASE,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, redlionfish_rl": _BENCH_BASE_RLF,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
-    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
-    "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian": _BENCH_CROSS,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian": _BENCH_BASE,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl": _BENCH_BASE_RLF,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
+    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
+    "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_sparse_hessian": _BENCH_CROSS,
     "all": _BENCH_ALL,
 }
 
 # ---------------------------------------------------------------------------
-# RI lookup tables — value-choices in descriptor.json use "name (RI)" format
+# RI lookup tables — config.yaml options use "name (RI)" format.
 # ---------------------------------------------------------------------------
 _IMMERSION_RI = {
     "air":   1.0003,
@@ -707,10 +700,12 @@ def _collect_run_provenance(
         except importlib_metadata.PackageNotFoundError:
             continue
 
-    descriptor_image = ""
+    container_image = ""
     try:
-        descriptor = json.loads(Path(__file__).with_name("descriptor.json").read_text(encoding="utf-8"))
-        descriptor_image = descriptor.get("container-image", {}).get("image", "")
+        docker_image = load_config(DEFAULT_CONFIG).get("docker_image", {})
+        image_name = str(docker_image.get("name", ""))
+        image_org = str(docker_image.get("org", ""))
+        container_image = f"{image_org}/{image_name}" if image_org else image_name
     except Exception:
         pass
 
@@ -760,7 +755,7 @@ def _collect_run_provenance(
     return {
         "benchmark_version": 1,
         "repo_version": version_txt,
-        "container_image": descriptor_image,
+        "container_image": container_image,
         "platform": {
             "system": platform.system(),
             "release": platform.release(),
@@ -800,7 +795,7 @@ def _method_device(method: str) -> str:
         return "CUDA"
     if method in _CPU_METHODS:
         return "CPU"
-    # ci_rl / ci_rl_tv / ci_rl_dl / ci_sparse_hessian — PyTorch: CUDA when available, else CPU
+    # CI methods use CUDA when available and otherwise fall back to CPU.
     if method.startswith("ci_"):
         import torch
         return "CUDA" if torch.cuda.is_available() else "CPU"
@@ -1052,32 +1047,24 @@ def _check_method_available(method: str) -> tuple[bool, str]:
         if not (_DECONVLAB2_JAR.exists() and _IJ_JAR.exists() and shutil.which("java")):
             return False, "DeconvolutionLab2 JAR or java not found"
 
-    if method == "ci_rl_dl":
-        base = Path(__file__).parent / "models"
-        confocal_model = base / "defaultconfocal" / "best_model.pt"
-        widefield_model = base / "defaultwidefield" / "best_model.pt"
-        if not (confocal_model.is_file() and widefield_model.is_file()):
-            return False, "ci_rl_dl model checkpoints not found"
-
     return True, ""
 
 
 def main(argv):
-    with BiaflowsJob.from_cli(argv) as bj:
+    with BilayersJob.from_cli(argv) as bj:
         parameters = getattr(bj, "parameters", SimpleNamespace())
 
-        # Extract parameters with defaults from descriptor.json
+        # Extract parameters with defaults from config.yaml.
         iterations = int(getattr(parameters, "iterations", 40))
         tiling_raw = getattr(parameters, "tiling", "custom")
         tile_limits_raw = str(getattr(parameters, "tile_limits", "512, 64"))
         method = getattr(parameters, "method", "sdeconv_rl")
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
-        residual_strength = float(getattr(parameters, "residual_strength", 1.0))
 
-        # PSF metadata parameters. By default image metadata wins; descriptor
-        # values are fallbacks for missing metadata. With overrule enabled,
-        # descriptor values replace image metadata.
+        # PSF metadata parameters. By default image metadata wins; config values
+        # are fallbacks for missing metadata. With overrule enabled, config
+        # values replace image metadata.
         overrule_metadata = _to_bool(getattr(parameters, "overrule_image_metadata", False))
         na_raw = getattr(parameters, "na", str(_DEFAULT_NA))
         na_override = _parse_float_or_default(na_raw, _DEFAULT_NA)
@@ -1153,7 +1140,7 @@ def main(argv):
         max_tile_z = int(_lim_parts[1]) if len(_lim_parts) >= 2 else MAX_TILE_Z
 
         print("=" * 70)
-        print("CIDeconvolve - BIAFLOWS Workflow")
+        print("CIDeconvolve Benchmark - Bilayers Workflow")
         print("=" * 70)
         print(f"  Input dir    : {bj.input_dir}")
         print(f"  Output dir   : {bj.output_dir}")
@@ -1166,7 +1153,7 @@ def main(argv):
         print(f"  Benchmark    : {benchmark_mode}")
         print(f"  Projection   : {projection}")
         print(f"  Save PSF     : {save_psf}")
-        print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'image metadata + descriptor fallbacks'}")
+        print(f"  Metadata     : {'overrule image metadata' if overrule_metadata else 'image metadata + config fallbacks'}")
         print(f"  NA           : {na_override}")
         print(f"  Immersion    : {ri_raw} -> RI {ri_override}")
         print(f"  Sample medium: {sample_ri_raw} -> RI {sample_ri}")
@@ -1175,8 +1162,6 @@ def main(argv):
         print(f"  Emission WL  : {em_override}")
         print(f"  Excitation WL: {ex_override}")
         print(f"  Pinhole      : {pinhole_override} Airy Disk")
-        if method == "ci_rl_dl":
-            print(f"  Residual str.: {residual_strength}")
         if benchmark_mode:
             print(f"  Bench iters  : {bench_iterations}")
             print(f"  Bench methods: {bench_methods_key} ({len(bench_methods)} methods)")
@@ -1185,9 +1170,7 @@ def main(argv):
             print(f"  Bench montage: {bench_montage}")
 
         # Prepare data directories and collect input images
-        in_imgs, _, in_path, _, out_path, tmp_path = prepare_data(
-            get_discipline(bj, default=CLASS_SPTCNT), bj, is_2d=False, **bj.flags
-        )
+        in_imgs, in_path, out_path, tmp_path = prepare_bilayers_data(bj)
 
         if not in_imgs:
             print("No input images found. Exiting.")
@@ -1260,7 +1243,6 @@ def main(argv):
                         excitation_wavelengths=ex_override,
                         pinhole_airy_units=pinhole_override,
                         overrule_metadata=overrule_metadata,
-                        residual_strength=residual_strength,
                     )
                     # Move final montage PNGs from tmp to output
                     for png in tmp_work.glob("decon_benchmark_*.png"):
@@ -1296,7 +1278,6 @@ def main(argv):
                         excitation_wavelengths=ex_override,
                         pinhole_airy_units=pinhole_override,
                         overrule_metadata=overrule_metadata,
-                        dl_residual_strength=residual_strength,
                     )
 
                     if result is None:
@@ -1791,7 +1772,6 @@ def _run_benchmark(
     excitation_wavelengths: list[float] | None = None,
     pinhole_airy_units: float | None = None,
     overrule_metadata: bool = False,
-    residual_strength: float = 1.0,
 ):
     """Run multi-method × multi-iteration benchmark for a single image."""
     del save_psf
@@ -1972,7 +1952,6 @@ def _run_benchmark(
             ),
             "pinhole_airy_units": pinhole_airy_units,
             "overrule_metadata": overrule_metadata,
-            "dl_residual_strength": residual_strength,
         }
     else:
         meta_overrides = {
@@ -1986,7 +1965,6 @@ def _run_benchmark(
             "excitation_wavelengths": excitation_wavelengths,
             "pinhole_airy_units": pinhole_airy_units,
             "overrule_metadata": overrule_metadata,
-            "dl_residual_strength": residual_strength,
         }
 
     available_methods = []

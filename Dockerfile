@@ -1,5 +1,5 @@
 # ===========================================================================
-# CIDeconvolve Benchmark — BIAFLOWS-compatible GPU-enabled Docker image
+# CIDeconvolve Benchmark — Bilayers-compatible GPU-enabled Docker image
 # ===========================================================================
 # This benchmark image needs more runtimes than the main cideconvolve image:
 # Java for DeconvolutionLab2, deconwolf, pycudadecon, OpenCL, cuCIM/CuPy, and
@@ -7,9 +7,14 @@
 # Python/conda wheels and the host NVIDIA driver mounted by NVIDIA Container
 # Toolkit; the final image no longer uses an NVIDIA CUDA base image.
 #
-# BIAFLOWS convention: images in /data/in, results in /data/out, ground truth
-# in /data/gt.  The entrypoint is wrapper.py.
+# Bilayers convention: images in /data/in and results in /data/out.
+# The entrypoint is wrapper.py and its interface is defined by config.yaml.
 # ===========================================================================
+
+ARG CUDA_TOOLKIT_IMAGE=nvidia/cuda:13.2.0-devel-ubuntu22.04
+ARG CUDA_HOME_PATH=/usr/local/cuda-13.2
+ARG PYTORCH_VERSION=2.13.0
+ARG PYTORCH_CUDA=cu132
 
 FROM ubuntu:22.04 AS deconwolf_builder
 
@@ -38,12 +43,38 @@ RUN git clone --depth 1 --branch "${DECONWOLF_VERSION}" \
     && cmake --install /tmp/deconwolf/build \
     && strip /usr/local/bin/dw /usr/local/bin/dw_bw /usr/lib/x86_64-linux-gnu/libtrafo.so
 
+FROM ${CUDA_TOOLKIT_IMAGE} AS cuda_toolkit
+
+FROM python:3.11-slim-bookworm AS optimized_extension_builder
+
+ARG CUDA_HOME_PATH
+ARG PYTORCH_VERSION
+ARG PYTORCH_CUDA
+ENV CUDA_HOME=${CUDA_HOME_PATH}
+ENV CUDA_PATH=${CUDA_HOME_PATH}
+ENV PATH=${CUDA_HOME_PATH}/bin:${PATH}
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;10.0;12.0+PTX"
+
+COPY --from=cuda_toolkit ${CUDA_HOME_PATH} ${CUDA_HOME_PATH}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install --upgrade pip \
+    && python -m pip install \
+        "torch==${PYTORCH_VERSION}+${PYTORCH_CUDA}" \
+        --index-url "https://download.pytorch.org/whl/${PYTORCH_CUDA}"
+COPY optimized_cuda/ /build/optimized_cuda/
+RUN PYTHONPATH=/build python /build/optimized_cuda/build_prebuilt.py --output /optimized-extension
+
 # ===========================================================================
 # Runtime stage
 # ===========================================================================
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG PYTORCH_VERSION
+ARG PYTORCH_CUDA
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
@@ -94,7 +125,7 @@ COPY --from=deconwolf_builder /usr/local/bin/dw /usr/local/bin/dw
 COPY --from=deconwolf_builder /usr/local/bin/dw_bw /usr/local/bin/dw_bw
 COPY --from=deconwolf_builder /usr/lib/x86_64-linux-gnu/libtrafo.so /usr/lib/x86_64-linux-gnu/libtrafo.so
 RUN ldconfig \
-    && mkdir -p /root/.config/deconwolf /app/bin /data/in /data/out /data/gt
+    && mkdir -p /root/.config/deconwolf /app/bin /data/in /data/out
 
 WORKDIR /app
 
@@ -110,19 +141,22 @@ COPY bin/DeconvolutionLab_2.jar /app/bin/DeconvolutionLab_2.jar
 
 COPY requirements_docker.txt /app/requirements_docker.txt
 RUN python -m pip install --no-cache-dir --no-compile --upgrade pip \
+    && python -m pip install --no-cache-dir --no-compile \
+        "torch==${PYTORCH_VERSION}+${PYTORCH_CUDA}" \
+        --index-url "https://download.pytorch.org/whl/${PYTORCH_CUDA}" \
     && python -m pip install --no-cache-dir --no-compile -r requirements_docker.txt \
     && find /opt/conda -type d -name "__pycache__" -prune -exec rm -rf {} + \
     && find /opt/conda -type f \( -name "*.pyc" -o -name "*.pyo" -o -name "*.a" \) -delete \
     && micromamba clean -a -f -y
 
 COPY vendor/ /app/vendor/
-COPY models/ /app/models/
+COPY optimized_cuda/ /app/optimized_cuda/
+COPY --from=optimized_extension_builder /optimized-extension/_optimized_cuda*.so /app/optimized_cuda/
 COPY deconvolve.py /app/deconvolve.py
 COPY deconvolve_ci.py /app/deconvolve_ci.py
-COPY deconvolve_ci_dl.py /app/deconvolve_ci_dl.py
-COPY bioflows_local.py /app/bioflows_local.py
+COPY bilayers_cli.py /app/bilayers_cli.py
 COPY wrapper.py /app/wrapper.py
-COPY descriptor.json /app/descriptor.json
+COPY config.yaml /app/config.yaml
 
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all

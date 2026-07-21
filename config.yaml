@@ -1,0 +1,193 @@
+citations:
+- name: cideconvolve-benchmark
+  doi: https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve_benchmark
+  license: MIT
+  description: Comparative 2D/3D microscopy deconvolution benchmark workflow.
+docker_image:
+  org: cellularimagingcf
+  name: w_cideconvolve_benchmark
+  tag: latest
+  platform: linux/amd64
+algorithm_folder_name: cideconvolve_benchmark
+exec_function:
+  name: generate_cli_command
+  cli_command: python wrapper.py
+  hidden_args:
+  - {cli_tag: --local, value: 'true', append_value: false, cli_order: 3}
+inputs:
+- name: infolder
+  type: image
+  label: Input Images
+  description: Folder containing microscopy images to deconvolve and benchmark.
+  cli_tag: --infolder
+  cli_order: 1
+  default: directory
+  optional: false
+  format: [tif, tiff, ometif, ometiff, png, jpg, jpeg, bmp, npy, zarr]
+  unique_string: [.tif, .tiff, .ome.tif, .ome.tiff, .png, .jpg, .jpeg, .bmp, .npy, .zarr]
+  folder_name: /data/in
+  file_count: multiple
+  section_id: inputs
+  mode: beginner
+  subtype: [grayscale, color]
+  depth: true
+  timepoints: true
+  tiled: true
+  pyramidal: true
+outputs:
+- name: outfolder
+  type: image
+  label: Benchmark Outputs
+  description: Folder receiving deconvolved images, benchmark CSV files, provenance JSON, and montages.
+  cli_tag: --outfolder
+  cli_order: 2
+  default: directory
+  optional: false
+  format: [ometiff, tif, tiff, csv, png, json]
+  unique_string: [.ome.tiff, .ome.tif, .tif, .tiff, .csv, .png, .json]
+  folder_name: /data/out
+  file_count: multiple
+  section_id: outputs
+  mode: beginner
+  subtype: [grayscale, color]
+  depth: true
+  timepoints: true
+  tiled: true
+  pyramidal: false
+display_only: []
+parameters:
+- name: method
+  type: dropdown
+  label: Deconvolution Method
+  description: Backend used for a single-method run.
+  options:
+  - {label: sdeconv_rl, value: sdeconv_rl}
+  - {label: sdeconv_wiener, value: sdeconv_wiener}
+  - {label: sdeconv_spitfire, value: sdeconv_spitfire}
+  - {label: ci_rl, value: ci_rl}
+  - {label: ci_rl_tv, value: ci_rl_tv}
+  - {label: ci_sparse_hessian, value: ci_sparse_hessian}
+  - {label: pycudadecon_rl_cuda, value: pycudadecon_rl_cuda}
+  - {label: deconwolf_rl, value: deconwolf_rl}
+  - {label: deconwolf_shb, value: deconwolf_shb}
+  - {label: deconvlab2_rl, value: deconvlab2_rl}
+  - {label: deconvlab2_rltv, value: deconvlab2_rltv}
+  - {label: deconvlab2_landweber, value: deconvlab2_landweber}
+  - {label: deconvlab2_ista, value: deconvlab2_ista}
+  - {label: redlionfish_rl, value: redlionfish_rl}
+  - {label: skimage_rl, value: skimage_rl}
+  - {label: skimage_unsupervised_wiener, value: skimage_unsupervised_wiener}
+  - {label: skimage_cucim_rl, value: skimage_cucim_rl}
+  default: sdeconv_rl
+  cli_tag: --method
+  cli_order: 10
+  optional: true
+  section_id: essential
+  mode: beginner
+- {name: iterations, type: integer, label: RL Iterations, description: Iteration count for a single-method run., default: 40, minimum: 1, maximum: 500, cli_tag: --iterations, cli_order: 11, optional: true, section_id: essential, mode: beginner}
+- {name: overrule_image_metadata, type: checkbox, label: Overrule Image Metadata, description: Always use the supplied optical values instead of image metadata., default: false, cli_tag: --overrule_image_metadata, cli_order: 12, optional: true, append_value: true, section_id: essential, mode: beginner}
+- {name: na, type: float, label: Numerical Aperture, description: Objective numerical aperture fallback or override., default: 1.4, minimum: 0.01, cli_tag: --na, cli_order: 13, optional: true, section_id: essential, mode: beginner}
+- {name: emission_wl, type: textbox, label: Emission Wavelengths (nm), description: Comma-separated emission wavelengths., default: '520', cli_tag: --emission_wl, cli_order: 14, optional: true, section_id: essential, mode: beginner}
+- {name: pixel_size_xy, type: float, label: Pixel Size XY (nm), description: Lateral pixel size fallback or override., default: 65.0, minimum: 0.001, cli_tag: --pixel_size_xy, cli_order: 15, optional: true, section_id: essential, mode: beginner}
+- {name: pixel_size_z, type: float, label: Pixel Size Z (nm), description: Axial pixel size fallback or override., default: 200.0, minimum: 0.001, cli_tag: --pixel_size_z, cli_order: 16, optional: true, section_id: essential, mode: beginner}
+- name: microscope_type
+  type: dropdown
+  label: Microscope Type
+  description: Microscope modality used for PSF generation.
+  options: [{label: widefield, value: widefield}, {label: confocal, value: confocal}]
+  default: confocal
+  cli_tag: --microscope_type
+  cli_order: 17
+  optional: true
+  section_id: essential
+  mode: beginner
+- {name: excitation_wl, type: textbox, label: Excitation Wavelengths (nm), description: Comma-separated excitation wavelengths., default: '488', cli_tag: --excitation_wl, cli_order: 18, optional: true, section_id: essential, mode: beginner}
+- {name: pinhole_size, type: float, label: Confocal Pinhole (AU), description: Confocal pinhole diameter in Airy disk units., default: 1.0, minimum: 0.0, cli_tag: --pinhole_size, cli_order: 19, optional: true, section_id: essential, mode: beginner}
+- name: refractive_index
+  type: dropdown
+  label: Immersion Medium
+  description: Immersion-medium refractive index preset.
+  options: [{label: auto, value: auto}, {label: air (1.0003), value: air (1.0003)}, {label: water (1.333), value: water (1.333)}, {label: oil (1.515), value: oil (1.515)}]
+  default: oil (1.515)
+  cli_tag: --refractive_index
+  cli_order: 20
+  optional: true
+  section_id: essential
+  mode: beginner
+- name: sample_ri
+  type: dropdown
+  label: Sample / Mounting Medium
+  description: Sample-medium refractive index preset.
+  options:
+  - {label: auto, value: auto}
+  - {label: water (1.333), value: water (1.333)}
+  - {label: PBS (1.334), value: PBS (1.334)}
+  - {label: culture medium (1.337), value: culture medium (1.337)}
+  - {label: vectashield (1.45), value: vectashield (1.45)}
+  - {label: prolong gold (1.47), value: prolong gold (1.47)}
+  - {label: glycerol (1.474), value: glycerol (1.474)}
+  - {label: oil (1.515), value: oil (1.515)}
+  - {label: prolong glass (1.52), value: prolong glass (1.52)}
+  default: prolong gold (1.47)
+  cli_tag: --sample_ri
+  cli_order: 21
+  optional: true
+  section_id: essential
+  mode: beginner
+- name: projection
+  type: dropdown
+  label: Z Projection
+  description: Optional projection for 3D outputs.
+  options: [{label: none, value: none}, {label: mip, value: mip}, {label: sum, value: sum}]
+  default: none
+  cli_tag: --projection
+  cli_order: 22
+  optional: true
+  section_id: essential
+  mode: beginner
+- {name: benchmark, type: checkbox, label: Perform Benchmark, description: Run the selected benchmark method suite., default: true, cli_tag: --benchmark, cli_order: 30, optional: false, append_value: true, section_id: benchmark, mode: beginner}
+- {name: bench_iterations, type: textbox, label: Benchmark Iterations, description: Comma-separated iteration counts., default: '20, 40, 60', cli_tag: --bench_iterations, cli_order: 31, optional: true, section_id: benchmark, mode: beginner}
+- name: bench_methods
+  type: dropdown
+  label: Benchmark Methods
+  description: Method suite to compare; unsupported methods are recorded as skipped.
+  options:
+  - &base {label: CI and GPU baseline, value: 'sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian'}
+  - {label: Baseline plus RedLionfish, value: 'sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl'}
+  - {label: Baseline plus deconwolf and RedLionfish, value: 'sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl'}
+  - {label: Fast cross-library suite, value: 'sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber'}
+  - {label: Broad cross-library suite, value: 'sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_sparse_hessian'}
+  - {label: All methods, value: all}
+  default: 'sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian'
+  cli_tag: --bench_methods
+  cli_order: 32
+  optional: true
+  section_id: benchmark
+  mode: beginner
+- {name: bench_crop, type: checkbox, label: Benchmark Crop, description: Center-crop inputs to the tile limits before benchmarking., default: true, cli_tag: --bench_crop, cli_order: 33, optional: true, append_value: true, section_id: benchmark, mode: beginner}
+- {name: bench_one_image, type: checkbox, label: Benchmark One Image, description: Benchmark only the first sorted input image., default: true, cli_tag: --bench_one_image, cli_order: 34, optional: true, append_value: true, section_id: benchmark, mode: beginner}
+- {name: bench_montage, type: checkbox, label: Benchmark Montage, description: Generate visual montage PNG files., default: true, cli_tag: --bench_montage, cli_order: 35, optional: true, append_value: true, section_id: benchmark, mode: beginner}
+- name: tiling
+  type: dropdown
+  label: Tiling
+  description: XY tiling mode for large images.
+  options: [{label: none, value: none}, {label: custom, value: custom}]
+  default: custom
+  cli_tag: --tiling
+  cli_order: 40
+  optional: true
+  section_id: advanced
+  mode: advanced
+- {name: tile_limits, type: textbox, label: Tile Limits, description: Maximum XY and Z tile dimensions as max_xy comma max_z., default: '512, 64', cli_tag: --tile_limits, cli_order: 41, optional: true, section_id: advanced, mode: advanced}
+- name: device
+  type: dropdown
+  label: Compute Device
+  description: Auto uses CUDA where supported and otherwise CPU.
+  options: [{label: auto, value: auto}, {label: cpu, value: cpu}, {label: cuda, value: cuda}]
+  default: auto
+  cli_tag: --device
+  cli_order: 42
+  optional: true
+  section_id: advanced
+  mode: advanced
+- {name: log, type: checkbox, label: Save Console Log, description: Save console output as cideconvolve.log., default: false, cli_tag: --log, cli_order: 43, optional: true, append_value: true, section_id: advanced, mode: advanced}

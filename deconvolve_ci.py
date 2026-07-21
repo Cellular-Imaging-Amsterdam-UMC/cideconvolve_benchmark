@@ -29,6 +29,11 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import hashlib
+import threading
+from collections import OrderedDict
+from functools import wraps
 from typing import Any, Callable, Optional, Union
 
 import numpy as np
@@ -47,6 +52,19 @@ CONCRETE_START_MODES = (
     "hybrid",
 )
 START_MODES = ("auto",) + CONCRETE_START_MODES
+
+SNR_AUTO = "auto"
+
+BACKEND_AUTO = "auto"
+BACKEND_OPTIMIZED_CUDA = "optimized_cuda"
+BACKEND_PYTORCH_CUDA = "pytorch_cuda"
+BACKEND_CPU = "cpu"
+BACKENDS = (
+    BACKEND_AUTO,
+    BACKEND_OPTIMIZED_CUDA,
+    BACKEND_PYTORCH_CUDA,
+    BACKEND_CPU,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers — device / dtype
@@ -69,12 +87,174 @@ def _release_cuda_cache() -> None:
         pass
 
 
+def _release_cuda_cache_after(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _release_cuda_cache()
+    return wrapper
+
+
 def _pick_dtype(dev: torch.device) -> torch.dtype:
-    return torch.float32 if dev.type == "cuda" else torch.float64
+    if dev.type == "cpu" and os.environ.get("CIDE_CONVOLVE_CPU_FLOAT64") == "1":
+        return torch.float64
+    return torch.float32
+
+
+def _resolve_backend(
+    backend: Optional[str], device: Optional[str],
+) -> tuple[torch.device, Any | None, str]:
+    """Resolve user-facing backend selection to device and optional CUDA ops."""
+    requested = str(backend or BACKEND_AUTO).strip().lower().replace(" ", "_")
+    aliases = {
+        "optimized": BACKEND_OPTIMIZED_CUDA,
+        "cuda": BACKEND_PYTORCH_CUDA,
+        "pytorch": BACKEND_PYTORCH_CUDA,
+    }
+    requested = aliases.get(requested, requested)
+    if requested not in BACKENDS:
+        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
+    if requested == BACKEND_CPU:
+        return torch.device("cpu"), None, BACKEND_CPU
+    if requested in (BACKEND_OPTIMIZED_CUDA, BACKEND_PYTORCH_CUDA):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{requested.replace('_', ' ')} requires a CUDA-capable PyTorch runtime")
+        dev = torch.device(device or "cuda")
+        if dev.type != "cuda":
+            raise ValueError(f"backend {requested!r} cannot use device {device!r}")
+        if requested == BACKEND_PYTORCH_CUDA:
+            return dev, None, requested
+        from optimized_cuda import load_optimized_extension
+
+        return dev, load_optimized_extension(required=True), requested
+
+    dev = _pick_device(device)
+    if dev.type != "cuda":
+        return dev, None, BACKEND_CPU
+    from optimized_cuda import load_optimized_extension
+
+    ops = load_optimized_extension(required=False)
+    return dev, ops, BACKEND_OPTIMIZED_CUDA if ops is not None else BACKEND_PYTORCH_CUDA
+
+
+def _next_smooth(value: int) -> int:
+    candidate = max(1, int(value))
+    while True:
+        remainder = candidate
+        for prime in (2, 3, 5, 7):
+            while remainder % prime == 0:
+                remainder //= prime
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
+_OPTIMIZED_CONTEXTS: "OrderedDict[tuple[Any, ...], dict[str, Any]]" = OrderedDict()
+_OPTIMIZED_CONTEXTS_LOCK = threading.Lock()
+# Tiled execution is sequential. Grouping equal geometries and retaining one
+# direct-cuFFT arena matches the winning benchmark and avoids keeping four
+# multi-gigabyte edge/centre arenas resident simultaneously.
+_MAX_OPTIMIZED_CONTEXTS = 1
+
+
+def _psf_cache_digest(psf: torch.Tensor) -> str:
+    array = psf.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    return hashlib.blake2b(array.view(np.uint8), digest_size=12).hexdigest()
+
+
+def _optimized_context(
+    ops: Any,
+    psf: torch.Tensor,
+    image_shape: tuple[int, ...],
+    minimum_shape: tuple[int, ...],
+) -> dict[str, Any]:
+    """Return cached FP32 OTF, weights, in-place arena, plan and workspace."""
+    if len(minimum_shape) != 3:
+        raise ValueError("the optimized direct-cuFFT backend currently requires a 3D work volume")
+    work_shape = tuple(_next_smooth(v) for v in minimum_shape)
+    device_index = psf.device.index if psf.device.index is not None else torch.cuda.current_device()
+    stream_id = int(torch.cuda.current_stream(device_index).cuda_stream)
+    key = (
+        device_index,
+        threading.get_ident(),
+        stream_id,
+        tuple(image_shape),
+        work_shape,
+        _psf_cache_digest(psf),
+    )
+    evicted = False
+    with _OPTIMIZED_CONTEXTS_LOCK:
+        context = _OPTIMIZED_CONTEXTS.get(key)
+        if context is not None:
+            _OPTIMIZED_CONTEXTS.move_to_end(key)
+            return context
+        # Drop the previous geometry before allocating the next large arena.
+        # Local references keep an in-flight context alive in the unlikely
+        # event of concurrent callers.
+        if len(_OPTIMIZED_CONTEXTS) >= _MAX_OPTIMIZED_CONTEXTS:
+            _OPTIMIZED_CONTEXTS.clear()
+            evicted = True
+
+    if evicted:
+        _release_cuda_cache()
+
+    otf, otf_conj = _prepare_otf(psf, work_shape)
+    weights = _bertero_weights(otf, otf_conj, image_shape, work_shape).contiguous()
+    with torch.cuda.device(device_index):
+        plan = ops.DirectFFTPlan(*work_shape)
+        pitch = int(plan.physical_x)
+        storage = torch.empty(
+            (work_shape[0], work_shape[1], pitch), dtype=torch.float32, device=psf.device,
+        )
+        frequency = storage.view(torch.complex64).view(
+            work_shape[0], work_shape[1], work_shape[2] // 2 + 1,
+        )
+        workspace = torch.empty(
+            max(int(plan.workspace_bytes), 1), dtype=torch.uint8, device=psf.device,
+        )
+    context = {
+        "otf": otf.resolve_conj().contiguous(),
+        "weights": weights,
+        "plan": plan,
+        "pitch": pitch,
+        "storage": storage,
+        "frequency": frequency,
+        "workspace": workspace,
+        "work_shape": work_shape,
+        "normalization": float(math.prod(work_shape)),
+        "workspace_bytes": int(plan.workspace_bytes),
+    }
+    with _OPTIMIZED_CONTEXTS_LOCK:
+        _OPTIMIZED_CONTEXTS[key] = context
+        _OPTIMIZED_CONTEXTS.move_to_end(key)
+        while len(_OPTIMIZED_CONTEXTS) > _MAX_OPTIMIZED_CONTEXTS:
+            _OPTIMIZED_CONTEXTS.popitem(last=False)
+    return context
+
+
+def clear_optimized_context_cache() -> None:
+    with _OPTIMIZED_CONTEXTS_LOCK:
+        _OPTIMIZED_CONTEXTS.clear()
+    _release_cuda_cache()
+
+
+def _numpy_dtype_for_torch(dtype: torch.dtype) -> np.dtype:
+    return np.dtype(np.float64 if dtype == torch.float64 else np.float32)
+
+
+def _as_torch_input_array(arr: np.ndarray, dtype: torch.dtype) -> np.ndarray:
+    """Return a contiguous NumPy array matching the torch compute dtype."""
+    target_dtype = _numpy_dtype_for_torch(dtype)
+    arr_np = np.asarray(arr)
+    if arr_np.dtype != target_dtype or not arr_np.flags.c_contiguous:
+        return np.ascontiguousarray(arr_np, dtype=target_dtype)
+    return arr_np
 
 
 def _to_tensor(arr: np.ndarray, dev: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return torch.as_tensor(np.ascontiguousarray(arr), dtype=dtype, device=dev)
+    return torch.as_tensor(_as_torch_input_array(arr, dtype), dtype=dtype, device=dev)
 
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
@@ -274,13 +454,24 @@ def _estimate_background_local_plane(
     radius_um: float = 0.5,
 ) -> float:
     """Estimate 2D background from the darkest local neighborhoods."""
-    px_nm = max(float(pixel_size_xy), 1e-6) if pixel_size_xy is not None else 100.0
+    if pixel_size_xy is None:
+        px_nm = 100.0
+    else:
+        px_val = max(float(pixel_size_xy), 1e-6)
+        # GUI callers pass nm, while metadata-driven paths historically pass
+        # um. Normalize small metadata-style values to nm before sizing the
+        # local neighborhood.
+        px_nm = px_val * 1000.0 if px_val < 10.0 else px_val
     radius_px = max(int(round((radius_um * 1000.0) / px_nm)), 1)
+    radius_px = min(radius_px, max(min(int(image.shape[-2]), int(image.shape[-1])) - 1, 0))
     kernel = 2 * radius_px + 1
     work = image[None, None]
-    padded = torch.nn.functional.pad(
-        work, (radius_px, radius_px, radius_px, radius_px), mode="reflect",
-    )
+    if radius_px > 0:
+        padded = torch.nn.functional.pad(
+            work, (radius_px, radius_px, radius_px, radius_px), mode="reflect",
+        )
+    else:
+        padded = work
     local_mean = torch.nn.functional.avg_pool2d(
         padded, kernel_size=kernel, stride=1,
     ).squeeze(0).squeeze(0)
@@ -339,17 +530,137 @@ def _estimate_noise_sigma(image: torch.Tensor) -> float:
     return max(sigma, 1e-12)
 
 
-def _damping_map(
-    estimate: torch.Tensor,
-    sigma: float,
-    damping: float,
-    background: float = 0.0,
-) -> torch.Tensor:
-    """Per-voxel damping exponent γ ∈ (0, 1] for noise-gated RL."""
-    scale = max(damping * sigma, 1e-12)
-    signal = (estimate - background).clamp(min=0.0)
-    gamma = 1.0 - torch.exp(-signal / scale)
-    return gamma.clamp(min=1e-3, max=1.0)
+def estimate_image_snr(image: np.ndarray) -> dict[str, Any]:
+    """Estimate image SNR without interpreting empty pixels as zero noise.
+
+    Sparse, quantised data is treated as photon-count-like when most values
+    lie close to integer multiples of a recurring positive intensity step.
+    Other data uses a robust adjacent-difference noise estimate.  The result
+    is intentionally deterministic so it can be frozen across a time series.
+    """
+    values = np.asarray(image, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"snr": 1.0, "reliability": "low", "mode": "empty", "intensity_step": None,
+                "noise_sigma": 0.0}
+    if values.size > 1_000_000:
+        values = values[::max(1, int(math.ceil(values.size / 1_000_000)))]
+
+    background = float(np.percentile(values, 10.0))
+    signal = np.clip(values - background, 0.0, None)
+    positive = signal[signal > 0.0]
+    if positive.size:
+        low = positive[positive <= np.percentile(positive, 25.0)]
+        step = float(np.median(low)) if low.size else float(np.min(positive))
+        if step > 0.0 and np.isfinite(step):
+            multiples = signal / step
+            quantised_fraction = float(np.mean(np.abs(multiples - np.rint(multiples)) <= 0.05))
+            sparse_fraction = float(np.mean(signal <= 0.0))
+            if quantised_fraction >= 0.90 and sparse_fraction >= 0.20:
+                bright = float(np.percentile(signal, 99.99))
+                photons = max(bright / step, 1.0)
+                return {
+                    "snr": float(np.clip(math.sqrt(photons), 0.1, 1e4)),
+                    "reliability": "high" if quantised_fraction >= 0.98 else "medium",
+                    "mode": "photon-count",
+                    "intensity_step": step,
+                    "noise_sigma": math.sqrt(photons) * step,
+                }
+
+    shaped = np.asarray(image, dtype=np.float64)
+    differences = []
+    for axis, size in enumerate(shaped.shape):
+        if size > 1:
+            differences.append(np.diff(shaped, axis=axis).reshape(-1))
+    diff = np.concatenate(differences) if differences else values - np.median(values)
+    diff = diff[np.isfinite(diff)]
+    if diff.size > 1_000_000:
+        diff = diff[::max(1, int(math.ceil(diff.size / 1_000_000)))]
+    diff_med = float(np.median(diff)) if diff.size else 0.0
+    noise_sigma = 1.4826 * float(np.median(np.abs(diff - diff_med))) / math.sqrt(2.0)
+    dynamic = max(float(np.percentile(values, 99.9)) - float(np.median(values)), 0.0)
+    scale = max(float(np.max(values) - np.min(values)), 1e-12)
+    reliable = noise_sigma > scale * 1e-9
+    snr = dynamic / max(noise_sigma, scale * 1e-9)
+    return {
+        "snr": float(np.clip(snr, 0.1, 1e4)),
+        "reliability": "medium" if reliable else "low",
+        "mode": "continuous",
+        "intensity_step": None,
+        "noise_sigma": float(max(noise_sigma, 0.0)),
+    }
+
+
+def _snr_prefilter_sigma(snr: float) -> float:
+    """Piecewise-linear SNR-to-prefilter mapping from the public UI contract."""
+    snr = max(float(snr), 0.1)
+    if snr <= 4.0:
+        return 0.8
+    if snr <= 8.0:
+        return 0.8 + (snr - 4.0) * (0.5 - 0.8) / 4.0
+    if snr <= 15.0:
+        return 0.5 + (snr - 8.0) * (0.25 - 0.5) / 7.0
+    if snr <= 30.0:
+        return 0.25 + (snr - 15.0) * (0.0 - 0.25) / 15.0
+    return 0.0
+
+
+def _resolve_snr_settings(
+    image: np.ndarray,
+    snr: Union[str, float, None],
+    acuity: float,
+    prefilter_sigma: float,
+    rel_threshold: float,
+) -> dict[str, Any]:
+    """Resolve SNR-aware preprocessing while leaving the RL update unchanged."""
+    if snr is None or (isinstance(snr, str) and snr.strip().lower() in {"", "off", "none"}):
+        return {
+            "enabled": False, "requested_snr": None, "effective_snr": None,
+            "acuity": 0.0, "prefilter_sigma": max(float(prefilter_sigma), 0.0),
+            "rel_threshold": float(rel_threshold), "estimate": None,
+        }
+    acuity_value = float(np.clip(float(acuity), -100.0, 100.0))
+    if isinstance(snr, str) and snr.strip().lower() == SNR_AUTO:
+        estimate = estimate_image_snr(image)
+        effective_snr = float(estimate["snr"])
+        requested: Union[str, float] = SNR_AUTO
+    else:
+        effective_snr = float(snr)
+        if not np.isfinite(effective_snr) or effective_snr <= 0.0:
+            raise ValueError("snr must be 'auto', None/off, or a finite value > 0")
+        estimate = {"snr": effective_snr, "reliability": "manual", "mode": "manual",
+                    "intensity_step": None, "noise_sigma": 0.0}
+        requested = effective_snr
+    factor = 2.0 ** (-acuity_value / 50.0)
+    auto_prefilter = _snr_prefilter_sigma(effective_snr) * factor
+    effective_prefilter = max(float(prefilter_sigma), 0.0) if float(prefilter_sigma) > 0.0 else auto_prefilter
+    effective_threshold = float(np.clip(0.02 / effective_snr, 0.0005, 0.005)) * factor
+    return {
+        "enabled": True, "requested_snr": requested, "effective_snr": effective_snr,
+        "acuity": acuity_value, "prefilter_sigma": effective_prefilter,
+        "rel_threshold": effective_threshold, "estimate": estimate,
+    }
+
+
+def _scale_aware_auto_offset(image: np.ndarray, estimate: Optional[dict[str, Any]]) -> float:
+    """Return a small positive offset expressed in the image's own intensity scale."""
+    if estimate and estimate.get("intensity_step"):
+        return float(np.clip(0.05 * float(estimate["intensity_step"]), 1e-6, 5.0))
+    # Full float64 percentile calculation dominated setup for large tiled
+    # volumes (about seven seconds for nine DNA tiles). A deterministic strided
+    # sample is already the established policy for responsive image statistics
+    # and SNR estimation, and is far more precise than this tiny stabilizing
+    # offset requires.
+    values = np.asarray(image).reshape(-1)
+    if values.size > 1_000_000:
+        values = values[::max(1, int(math.ceil(values.size / 1_000_000)))]
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 1e-6
+    dynamic = max(float(np.percentile(values, 99.9)) - float(np.percentile(values, 1.0)), 0.0)
+    noise = float((estimate or {}).get("noise_sigma", 0.0) or 0.0)
+    return float(np.clip(max(0.05 * noise, 1e-6 * dynamic, 1e-6), 1e-6, 5.0))
 
 
 def _gaussian_smooth(image: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -446,6 +757,18 @@ def _resolve_start_mode(start: str, img_t: torch.Tensor, bg: float, microscope_t
     if snr < 8.0:
         return "lowpass_bgsub"
     return "hybrid"
+
+
+def _resolve_snr_start_mode(start: str, snr_settings: dict[str, Any]) -> str:
+    """Resolve automatic initialisation from an explicitly enabled SNR."""
+    if str(start).strip().lower() != "auto" or not snr_settings.get("enabled"):
+        return start
+    snr = float(snr_settings["effective_snr"])
+    if snr < 8.0:
+        return "lowpass_bgsub"
+    if snr <= 20.0:
+        return "hybrid"
+    return "observed_bgsub"
 
 
 def _initial_estimate(
@@ -775,11 +1098,11 @@ def _suggest_max_tile_xy(
 
     Memory model: ``budget ≈ 64 × padded_z × (tile_xy + psf_xy)²`` bytes,
     where ``padded_z ≈ 4 × n_z`` (FFT zero-padding for a 3D PSF of size
-    ``2*n_z - 1``).  CPU uses float64, so effective budget is halved.
+    ``2*n_z - 1``).
     """
     budget = _get_memory_budget_bytes(device)
     dev = _pick_device(device)
-    if dev.type == "cpu":
+    if _pick_dtype(dev) == torch.float64:
         budget //= 2  # float64 uses twice the memory
     padded_z = max(1, 4 * n_z) if n_z > 1 else 1
     inner_sq = budget / max(64 * padded_z, 1)
@@ -945,26 +1268,50 @@ def _ci_deconvolve_tiled(
 
     Z, H, W = image.shape
     numerator = np.zeros_like(image, dtype=np.float32)
-    denominator = np.zeros(image.shape, dtype=np.float32)
+    # Feather weights vary in XY only. Storing the same denominator for every Z
+    # plane wastes a complete image-sized host allocation and repeats identical
+    # additions along Z.
+    denominator = np.zeros((H, W), dtype=np.float32)
 
     total_iterations = 0
     all_convergence: list[float] = []
+    effective_parameters: dict[str, Any] = {}
+    backend_used: Optional[str] = None
+    representative_work_shape: Optional[tuple[int, ...]] = None
+    optimized_workspace_bytes = 0
 
-    for idx, desc in enumerate(tiles):
+    jobs: list[tuple[dict[str, Any], int, int, int, int]] = []
+    for desc in tiles:
         _, ey, ex = desc["extract"]
         y0_m = max(ey.start - margin, 0)
         y1_m = min(ey.stop + margin, H)
         x0_m = max(ex.start - margin, 0)
         x1_m = min(ex.stop + margin, W)
+        jobs.append((desc, y0_m, y1_m, x0_m, x1_m))
+
+    # Reordering does not affect blending. It lets equal tile geometries reuse
+    # one OTF/weights/plan/arena before moving to the next geometry.
+    jobs.sort(key=lambda job: (Z, job[2] - job[1], job[4] - job[3]))
+
+    for idx, (desc, y0_m, y1_m, x0_m, x1_m) in enumerate(jobs):
+        _, ey, ex = desc["extract"]
         tile_img = image[:, y0_m:y1_m, x0_m:x1_m].copy()
 
         log.info("  Tile %d/%d  shape=%s", idx + 1, len(tiles), tile_img.shape)
         tile_out = solver(tile_img, psf, tiling="none", **kwargs)
-        tile_result = tile_out["result"]
+        tile_result = np.asarray(tile_out["result"], dtype=np.float32)
 
         total_iterations = max(total_iterations, tile_out["iterations_used"])
         if tile_out["convergence"]:
             all_convergence = tile_out["convergence"]
+        if tile_out.get("effective_parameters"):
+            effective_parameters = dict(tile_out["effective_parameters"])
+        backend_used = tile_out.get("backend", backend_used)
+        if tile_out.get("work_shape"):
+            representative_work_shape = tuple(tile_out["work_shape"])
+        optimized_workspace_bytes = max(
+            optimized_workspace_bytes, int(tile_out.get("optimized_workspace_bytes", 0)),
+        )
 
         # Crop margin back to the original extract region
         crop_y0 = ey.start - y0_m
@@ -976,12 +1323,12 @@ def _ci_deconvolve_tiled(
         weighted, weight = _blend_tile(tile_cropped, desc)
         ext = desc["extract"]
         numerator[ext] += weighted.astype(np.float32, copy=False)
-        denominator[ext] += weight[np.newaxis, :, :].astype(np.float32, copy=False)
+        denominator[ext[-2:]] += weight.astype(np.float32, copy=False)
         del tile_img, tile_out, tile_result, tile_cropped, weighted, weight
         _release_cuda_cache()
 
     np.maximum(denominator, np.float32(1e-12), out=denominator)
-    np.divide(numerator, denominator, out=numerator)
+    np.divide(numerator, denominator[np.newaxis, :, :], out=numerator)
     np.clip(numerator, 0, None, out=numerator)
     result = numerator
     del denominator
@@ -990,18 +1337,25 @@ def _ci_deconvolve_tiled(
         "result": result,
         "convergence": all_convergence,
         "iterations_used": total_iterations,
+        "effective_parameters": effective_parameters,
+        "backend": backend_used,
+        "work_shape": representative_work_shape,
+        "optimized_workspace_bytes": optimized_workspace_bytes,
+        "tile_count": len(jobs),
     }
 
 
+@_release_cuda_cache_after
 def _ci_rl_deconvolve_2d_widefield(
     image: np.ndarray,
     psf: np.ndarray,
     *,
     niter: int,
     tv_lambda: float,
-    damping: Union[str, float],
     offset: Union[str, float],
     prefilter_sigma: float,
+    snr: Union[str, float, None],
+    acuity: float,
     start: str,
     background: Union[str, float],
     convergence: str,
@@ -1013,6 +1367,7 @@ def _ci_rl_deconvolve_2d_widefield(
     two_d_wf_bg_radius_um: float,
     two_d_wf_bg_scale: float,
     device: Optional[str],
+    backend: str = BACKEND_AUTO,
     iteration_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     channel_index: int = 0,
 ) -> dict[str, Any]:
@@ -1020,40 +1375,35 @@ def _ci_rl_deconvolve_2d_widefield(
     if start not in START_MODES:
         start = "flat"
 
-    dev = _pick_device(device)
+    dev, _, _ = _resolve_backend(backend, device)
     dtype = _pick_dtype(dev)
-    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
+    img_t = _to_tensor(image, dev, dtype)
 
     if psf.ndim == 3:
-        psf_t = _crop_psf_axial_support(_to_tensor(psf.astype(np.float64), dev, dtype))
+        psf_t = _crop_psf_axial_support(_to_tensor(psf, dev, dtype))
         psf_2d = _to_numpy(
             _collapse_widefield_psf_to_2d(psf_t, two_d_wf_aggressiveness).detach()
-        )
+        ).astype(np.float32, copy=False)
     elif psf.ndim == 2:
-        psf_2d = np.asarray(psf, dtype=np.float64)
+        psf_2d = np.asarray(psf, dtype=np.float32)
         psf_2d = psf_2d / max(float(psf_2d.sum()), 1e-12)
     else:
         raise ValueError(f"Unsupported PSF dimensionality for 2D widefield auto mode: {psf.shape}")
 
     mode = str(two_d_wf_aggressiveness).strip().lower()
     if mode == "very conservative":
-        auto_damping_default = 2.5
         auto_offset_default = 3.0
         auto_bg_preset_scale = 1.2
     elif mode == "conservative":
-        auto_damping_default = 2.0
         auto_offset_default = 2.5
         auto_bg_preset_scale = 1.1
     elif mode == "very strong":
-        auto_damping_default = 0.75
         auto_offset_default = 1.0
         auto_bg_preset_scale = 0.8
     elif mode == "strong":
-        auto_damping_default = 1.0
         auto_offset_default = 1.5
         auto_bg_preset_scale = 0.9
     else:
-        auto_damping_default = 1.5
         auto_offset_default = 2.0
         auto_bg_preset_scale = 1.0
 
@@ -1072,13 +1422,8 @@ def _ci_rl_deconvolve_2d_widefield(
     else:
         effective_background = max(float(background), 1e-6)
 
-    if damping == "auto":
-        effective_damping = auto_damping_default
-    else:
-        effective_damping = damping
-
     if offset == "auto":
-        effective_offset = auto_offset_default
+        effective_offset = "auto" if snr is not None else auto_offset_default
     else:
         effective_offset = offset
 
@@ -1086,53 +1431,71 @@ def _ci_rl_deconvolve_2d_widefield(
 
     log.info(
         "  2D WF auto -> collapsed-PSF RL  mode=%s  radius_um=%.3g  bg_scale=%.3g  "
-        "bg=%.4g  damping=%s  offset=%s  prefilter=%.4g",
+        "bg=%.4g  offset=%s  prefilter=%.4g",
         two_d_wf_aggressiveness,
         bg_radius_um,
         bg_scale,
         float(effective_background),
-        effective_damping,
         effective_offset,
         effective_prefilter,
     )
 
-    return ci_rl_deconvolve(
-        image,
-        psf_2d,
-        niter=niter,
-        tv_lambda=tv_lambda,
-        damping=effective_damping,
-        offset=effective_offset,
-        prefilter_sigma=effective_prefilter,
-        start=start,
-        background=effective_background,
-        convergence=convergence,
-        rel_threshold=rel_threshold,
-        check_every=check_every,
-        pixel_size_xy=pixel_size_xy,
-        pixel_size_z=pixel_size_z,
-        microscope_type="widefield",
-        two_d_mode="legacy_2d",
-        device=device,
-        tiling="none",
-        iteration_callback=iteration_callback,
-        channel_index=channel_index,
-    )
+    try:
+        return ci_rl_deconvolve(
+            image,
+            psf_2d,
+            niter=niter,
+            tv_lambda=tv_lambda,
+            offset=effective_offset,
+            prefilter_sigma=effective_prefilter,
+            snr=snr,
+            acuity=acuity,
+            start=start,
+            background=effective_background,
+            convergence=convergence,
+            rel_threshold=rel_threshold,
+            check_every=check_every,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
+            microscope_type="widefield",
+            two_d_mode="legacy_2d",
+            device=device,
+            backend=backend,
+            tiling="none",
+            iteration_callback=iteration_callback,
+            channel_index=channel_index,
+        )
+    finally:
+        try:
+            del img_t
+        except UnboundLocalError:
+            pass
+        try:
+            del psf_t
+        except UnboundLocalError:
+            pass
+        try:
+            del psf_2d
+        except UnboundLocalError:
+            pass
+        _release_cuda_cache()
 
 
 # ---------------------------------------------------------------------------
 # Top-level RL deconvolution
 # ---------------------------------------------------------------------------
 
+@_release_cuda_cache_after
 def ci_rl_deconvolve(
     image: np.ndarray,
     psf: np.ndarray,
     *,
     niter: int = 50,
     tv_lambda: float = 0.0,
-    damping: Union[str, float] = 0.0,
     offset: Union[str, float] = "auto",
     prefilter_sigma: float = 0.0,
+    snr: Union[str, float, None] = None,
+    acuity: float = 0.0,
     start: str = "auto",
     background: Union[str, float] = "auto",
     convergence: str = "auto",
@@ -1146,6 +1509,7 @@ def ci_rl_deconvolve(
     two_d_wf_bg_radius_um: float = 0.5,
     two_d_wf_bg_scale: float = 1.0,
     device: Optional[str] = None,
+    backend: str = BACKEND_AUTO,
     tiling: str = "auto",
     iteration_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     channel_index: int = 0,
@@ -1162,18 +1526,20 @@ def ci_rl_deconvolve(
         Maximum number of iterations.
     tv_lambda : float
         Total-Variation regularisation strength (0 = disabled).
-    damping : ``0.0``, ``"auto"``, or float > 0
-        Noise-gated damping strength for RL-family methods.  When enabled
-        the multiplicative correction factor is attenuated in noisy,
-        near-background regions and preserved in bright structures.
     offset : ``"auto"``, or float >= 0
         Constant added to the image before RL iterations and subtracted
         afterwards.  Shifts all pixels away from zero, preventing the
         extreme ratio amplification that causes background noise.
-        ``"auto"`` uses 5.0 (DeconWolf default).  ``0`` = disabled.
+        With SNR off, ``"auto"`` uses the legacy value 5.0. With SNR
+        enabled it is scaled to the image intensity step. ``0`` disables it.
     prefilter_sigma : float
         Gaussian sigma (in pixels) for Anscombe variance-stabilising
         pre-filter.  ``0`` = disabled.  Typical values: 0.5–1.0.
+    snr : ``None``, ``"auto"``, or float
+        Enable noise-aware initializer, prefilter, convergence, and offset
+        selection. ``None`` preserves legacy behavior.
+    acuity : float
+        Smooth/sharp balance from -100 to +100 when SNR is enabled.
     start : str
         Initial estimate.  Supported modes are ``"auto"``, ``"flat"``,
         ``"percentile_flat"``, ``"observed"``, ``"observed_bgsub"``,
@@ -1212,21 +1578,27 @@ def ci_rl_deconvolve(
         ``"convergence"`` — list of I-divergence values at check-points.
         ``"iterations_used"`` — number of iterations actually performed.
     """
+    dev, optimized_ops, backend_used = _resolve_backend(backend, device)
+    device = str(dev)
+
     # --- Tiling dispatch ---
     psf_xy_est = max(psf.shape[-1], psf.shape[-2]) if psf.ndim >= 2 else 65
     n_tiles = _resolve_tiling(tiling, image.shape, device=device, psf_xy_est=psf_xy_est)
     if n_tiles > 1 and iteration_callback is not None:
-        log.warning(
-            "iteration_callback is not compatible with tiling; "
-            "callback suppressed (image requires %d tiles).", n_tiles,
+        log.info(
+            "Per-iteration image previews disabled for %d-tile execution; "
+            "this does not disable the selected compute backend.", n_tiles,
         )
         iteration_callback = None
     if n_tiles > 1:
+        dispatch_snr = snr
+        if isinstance(snr, str) and snr.strip().lower() == SNR_AUTO:
+            dispatch_snr = float(estimate_image_snr(image)["snr"])
         return _ci_deconvolve_tiled(
             image, psf, n_tiles,
             solver=ci_rl_deconvolve,
-            niter=niter, tv_lambda=tv_lambda, damping=damping, offset=offset,
-            prefilter_sigma=prefilter_sigma, start=start,
+            niter=niter, tv_lambda=tv_lambda, offset=offset,
+            prefilter_sigma=prefilter_sigma, snr=dispatch_snr, acuity=acuity, start=start,
             background=background,
             convergence=convergence, rel_threshold=rel_threshold,
             check_every=check_every,
@@ -1236,6 +1608,7 @@ def ci_rl_deconvolve(
             two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
             two_d_wf_bg_scale=two_d_wf_bg_scale,
             device=device,
+            backend=backend,
             iteration_callback=iteration_callback,
             channel_index=channel_index,
         )
@@ -1248,9 +1621,10 @@ def ci_rl_deconvolve(
             psf,
             niter=niter,
             tv_lambda=tv_lambda,
-            damping=damping,
             offset=offset,
             prefilter_sigma=prefilter_sigma,
+            snr=snr,
+            acuity=acuity,
             start=start,
             background=background,
             convergence=convergence,
@@ -1262,11 +1636,28 @@ def ci_rl_deconvolve(
             two_d_wf_bg_radius_um=two_d_wf_bg_radius_um,
             two_d_wf_bg_scale=two_d_wf_bg_scale,
             device=device,
+            backend=backend,
             iteration_callback=iteration_callback,
             channel_index=channel_index,
         )
 
-    dev = _pick_device(device)
+    snr_settings = _resolve_snr_settings(image, snr, acuity, prefilter_sigma, rel_threshold)
+    effective_snr = snr_settings["effective_snr"]
+    prefilter_sigma = float(snr_settings["prefilter_sigma"])
+    if snr_settings["enabled"] and convergence == "auto":
+        rel_threshold = float(snr_settings["rel_threshold"])
+    start = _resolve_snr_start_mode(start, snr_settings)
+    if offset == "auto" and snr_settings["enabled"]:
+        offset = _scale_aware_auto_offset(image, snr_settings.get("estimate"))
+    if snr_settings["enabled"]:
+        estimate = snr_settings["estimate"] or {}
+        log.info(
+            "  SNR requested=%s effective=%.4g reliability=%s mode=%s acuity=%.1f "
+            "effective_prefilter=%.4g effective_rel_threshold=%.4g",
+            snr_settings["requested_snr"], effective_snr, estimate.get("reliability", "manual"),
+            estimate.get("mode", "manual"), snr_settings["acuity"], prefilter_sigma, rel_threshold,
+        )
+
     dtype = _pick_dtype(dev)
 
     # Resolve offset
@@ -1275,25 +1666,22 @@ def ci_rl_deconvolve(
     else:
         offset_val = max(float(offset), 0.0)
 
-    # Resolve damping
-    if damping == "auto":
-        damp_strength = 3.0
-    else:
-        damp_strength = max(float(damping), 0.0)
-    use_damping = damp_strength > 0.0
-
     if start not in START_MODES:
         start = "flat"
 
-    log.info("ci_rl_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
-             "tv_lambda=%.4g  damping=%.4g  offset=%.4g  prefilter_sigma=%.4g  "
+    log.info("ci_rl_deconvolve  backend=%s  device=%s  dtype=%s  shape=%s  niter=%d  "
+             "tv_lambda=%.4g  offset=%.4g  prefilter_sigma=%.4g  "
              "start=%s  convergence=%s  microscope=%s  two_d_mode=%s",
-             dev, dtype, image.shape, niter, tv_lambda, damp_strength, offset_val,
+             backend_used, dev, dtype, image.shape, niter, tv_lambda, offset_val,
              prefilter_sigma, start, convergence, microscope_type, two_d_mode)
 
     # Move data to device
-    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
-    psf_t = _to_tensor(psf.astype(np.float64), dev, dtype)
+    img_t = _to_tensor(image, dev, dtype)
+    psf_t = _to_tensor(psf, dev, dtype)
+    optimized_squeeze_2d = optimized_ops is not None and img_t.ndim == 2
+    if optimized_squeeze_2d:
+        img_t = img_t.unsqueeze(0)
+        psf_t = psf_t.unsqueeze(0)
 
     # Background
     if background == "auto":
@@ -1317,17 +1705,41 @@ def ci_rl_deconvolve(
     if requested_start != start:
         log.info("  start=%s resolved to %s", requested_start, start)
 
-    if use_damping:
-        noise_sigma = _estimate_noise_sigma(img_t)
-        log.info("  noise_sigma=%.4g  damping=%.4g", noise_sigma, damp_strength)
-
     # Work shape = image + psf - 1  (full linear convolution)
-    work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
+    minimum_work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
     axis_scales = _axis_scales(img_t.ndim, pixel_size_xy, pixel_size_z)
 
     # Prepare OTF & weights
-    otf, otf_conj = _prepare_otf(psf_t, work_shape)
-    W = _bertero_weights(otf, otf_conj, img_t.shape, work_shape)
+    optimized_context = None
+    if optimized_ops is not None:
+        try:
+            optimized_context = _optimized_context(
+                optimized_ops, psf_t, tuple(img_t.shape), minimum_work_shape,
+            )
+        except Exception as exc:
+            if str(backend or BACKEND_AUTO).strip().lower() != BACKEND_AUTO:
+                raise
+            log.warning("Optimized CUDA setup failed; falling back to PyTorch CUDA: %s", exc)
+            clear_optimized_context_cache()
+            optimized_ops = None
+            backend_used = BACKEND_PYTORCH_CUDA
+            if optimized_squeeze_2d:
+                img_t = img_t[0]
+                psf_t = psf_t[0]
+                optimized_squeeze_2d = False
+                minimum_work_shape = tuple(
+                    si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape)
+                )
+                axis_scales = _axis_scales(img_t.ndim, pixel_size_xy, pixel_size_z)
+    if optimized_context is not None:
+        work_shape = optimized_context["work_shape"]
+        otf = optimized_context["otf"]
+        otf_conj = otf.conj()
+        W = optimized_context["weights"]
+    else:
+        work_shape = minimum_work_shape
+        otf, otf_conj = _prepare_otf(psf_t, work_shape)
+        W = _bertero_weights(otf, otf_conj, img_t.shape, work_shape)
 
     # Zero-pad observed image into work domain
     d_work = torch.full(work_shape, bg, dtype=dtype, device=dev)
@@ -1338,6 +1750,9 @@ def ci_rl_deconvolve(
     x_prev, x_cur = _initial_estimate(
         start, img_t, d_work, work_shape, slices, bg, dtype, dev,
     )
+    # Padding is only needed for initialization; do not retain a complete
+    # FFT-sized tensor throughout every iteration of a large tile.
+    del d_work
 
     convergence_history: list[float] = []
     use_tv = tv_lambda > 0.0
@@ -1351,39 +1766,48 @@ def ci_rl_deconvolve(
             alpha = min((k - 1.0) / (k + 2.0), alpha_max)
         else:
             alpha = 0.0
-        p = x_cur + alpha * (x_cur - x_prev)
-        p = p.clamp(min=bg)
-
-        # --- Forward model: y = H ⊗ p ---
-        P_fft = _rfft(p)
-        Y_fft = P_fft * otf
-        y = _irfft(Y_fft, work_shape)
-
-        # --- Ratio: computed ONLY in the image domain (Bertero formulation) ---
-        r = torch.zeros(work_shape, dtype=dtype, device=dev)
-        r[slices] = img_t / y[slices].clamp(min=bg)
-
-        # --- Back-project: IFFT(FFT(r) * conj(H)) ---
-        R_fft = _rfft(r)
-        corr = _irfft(R_fft * otf_conj, work_shape)
-
-        # --- Noise-gated damping (attenuate correction in noisy regions) ---
-        if use_damping:
-            gamma = _damping_map(p, noise_sigma, damp_strength, bg)
-            corr = corr.clamp(min=1e-12) ** gamma
-
-        # --- Multiplicative update with Bertero weights ---
-        x_new = p * corr * W
-
-        # --- TV regularisation ---
-        if use_tv:
-            x_new = x_new * _tv_penalty(x_new, tv_lambda, axis_scales)
-
-        # --- Positivity ---
-        x_new = x_new.clamp(min=bg)
-
-        x_prev = x_cur
-        x_cur = x_new
+        if optimized_context is not None:
+            storage = optimized_context["storage"]
+            plan = optimized_context["plan"]
+            workspace = optimized_context["workspace"]
+            pitch = optimized_context["pitch"]
+            normalization = optimized_context["normalization"]
+            next_buffer = x_prev
+            optimized_ops.momentum_pack(
+                x_cur, next_buffer, alpha, bg, storage, *work_shape, pitch,
+            )
+            plan.forward(storage, workspace)
+            optimized_ops.multiply_otf(optimized_context["frequency"], otf, False)
+            plan.inverse(storage, workspace)
+            optimized_ops.ratio_pitched(
+                storage, img_t, *work_shape, pitch, bg, normalization,
+            )
+            plan.forward(storage, workspace)
+            optimized_ops.multiply_otf(optimized_context["frequency"], otf, True)
+            plan.inverse(storage, workspace)
+            optimized_ops.update_pitched(
+                next_buffer, storage, W, bg, normalization, *work_shape, pitch,
+            )
+            x_prev, x_cur = x_cur, next_buffer
+            if use_tv:
+                optimized_ops.tv_update(x_cur, storage, tv_lambda, *axis_scales, bg)
+            y = None
+        else:
+            p = (x_cur + alpha * (x_cur - x_prev)).clamp(min=bg)
+            P_fft = _rfft(p)
+            Y_fft = P_fft * otf
+            y = _irfft(Y_fft, work_shape)
+            del P_fft, Y_fft
+            r = torch.zeros(work_shape, dtype=dtype, device=dev)
+            r[slices] = img_t / y[slices].clamp(min=bg)
+            R_fft = _rfft(r)
+            corr = _irfft(R_fft * otf_conj, work_shape)
+            del R_fft, r
+            x_new = p * corr * W
+            if use_tv:
+                x_new = x_new * _tv_penalty(x_new, tv_lambda, axis_scales)
+            x_new = x_new.clamp(min=bg)
+            x_prev, x_cur = x_cur, x_new
 
         stop_after_callback = False
         convergence_value: Optional[float] = None
@@ -1393,8 +1817,18 @@ def ci_rl_deconvolve(
             # Recompute forward for I-divergence (reuse y from last iter if
             # it's a check iteration — here y is still valid for p, not x_new,
             # but the difference is small; for exactness re-project)
-            fwd_fft = _rfft(x_cur) * otf
-            fwd = _irfft(fwd_fft, work_shape)
+            if optimized_context is not None:
+                storage = optimized_context["storage"]
+                storage.zero_()
+                storage[..., :work_shape[-1]].copy_(x_cur)
+                optimized_context["plan"].forward(storage, optimized_context["workspace"])
+                optimized_ops.multiply_otf(optimized_context["frequency"], otf, False)
+                optimized_context["plan"].inverse(storage, optimized_context["workspace"])
+                fwd = storage[..., :work_shape[-1]] / optimized_context["normalization"]
+            else:
+                fwd_fft = _rfft(x_cur) * otf
+                fwd = _irfft(fwd_fft, work_shape)
+                del fwd_fft
             idiv = _i_divergence(img_t, fwd[slices].clamp(min=bg))
             convergence_history.append(idiv)
             convergence_value = idiv
@@ -1411,11 +1845,24 @@ def ci_rl_deconvolve(
 
         if iteration_callback is not None:
             if not check_iteration:
-                fwd_fft = _rfft(x_cur) * otf
-                fwd = _irfft(fwd_fft, work_shape)
+                if optimized_context is not None:
+                    storage = optimized_context["storage"]
+                    storage.zero_()
+                    storage[..., :work_shape[-1]].copy_(x_cur)
+                    optimized_context["plan"].forward(storage, optimized_context["workspace"])
+                    optimized_ops.multiply_otf(optimized_context["frequency"], otf, False)
+                    optimized_context["plan"].inverse(storage, optimized_context["workspace"])
+                    fwd = storage[..., :work_shape[-1]] / optimized_context["normalization"]
+                else:
+                    fwd_fft = _rfft(x_cur) * otf
+                    fwd = _irfft(fwd_fft, work_shape)
+                    del fwd_fft
                 convergence_value = _i_divergence(img_t, fwd[slices].clamp(min=bg))
             frame = x_cur[slices]
             estimated = fwd[slices]
+            if optimized_squeeze_2d:
+                frame = frame[0]
+                estimated = estimated[0]
             if offset_val > 0.0:
                 frame = (frame - offset_val).clamp(min=0.0)
                 estimated = (estimated - offset_val).clamp(min=0.0)
@@ -1429,23 +1876,48 @@ def ci_rl_deconvolve(
                 "background": max(float(bg) - offset_val, 0.0),
                 "is_final": bool(stop_after_callback or k == niter),
             })
+            del frame, estimated
+        if "fwd" in locals():
+            del fwd
         if stop_after_callback:
             break
 
     # Extract the image-sized region
     result = x_cur[slices]
+    if optimized_squeeze_2d:
+        result = result[0]
 
     # Remove offset
     if offset_val > 0.0:
         result = (result - offset_val).clamp(min=0.0)
 
+    result_np = _to_numpy(result).astype(np.float32, copy=False)
+    del result, img_t, psf_t, otf, otf_conj, W, x_prev, x_cur
+    _release_cuda_cache()
     return {
-        "result": _to_numpy(result),
+        "result": result_np,
         "convergence": convergence_history,
         "iterations_used": iterations_used,
+        "backend": backend_used,
+        "work_shape": tuple(work_shape),
+        "optimized_workspace_bytes": (
+            optimized_context["workspace_bytes"] if optimized_context is not None else 0
+        ),
+        "effective_parameters": {
+            "snr_requested": snr_settings["requested_snr"],
+            "snr": effective_snr,
+            "snr_reliability": (snr_settings.get("estimate") or {}).get("reliability"),
+            "snr_mode": (snr_settings.get("estimate") or {}).get("mode"),
+            "acuity": snr_settings["acuity"],
+            "start": start,
+            "prefilter_sigma": prefilter_sigma,
+            "rel_threshold": rel_threshold,
+            "offset": offset_val,
+        },
     }
 
 
+@_release_cuda_cache_after
 def ci_sparse_hessian_deconvolve(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1463,17 +1935,20 @@ def ci_sparse_hessian_deconvolve(
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
     device: Optional[str] = None,
+    backend: str = BACKEND_AUTO,
     tiling: str = "auto",
     iteration_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     channel_index: int = 0,
 ) -> dict[str, Any]:
     """Sparse-Hessian / SPITFIRE-style deconvolution with alternating updates."""
+    dev, optimized_ops, backend_used = _resolve_backend(backend, device)
+    device = str(dev)
     psf_xy_est = max(psf.shape[-1], psf.shape[-2]) if psf.ndim >= 2 else 65
     n_tiles = _resolve_tiling(tiling, image.shape, device=device, psf_xy_est=psf_xy_est)
     if n_tiles > 1 and iteration_callback is not None:
-        log.warning(
-            "iteration_callback is not compatible with tiling; "
-            "callback suppressed (image requires %d tiles).", n_tiles,
+        log.info(
+            "Per-iteration image previews disabled for %d-tile execution; "
+            "this does not disable the selected compute backend.", n_tiles,
         )
         iteration_callback = None
     if n_tiles > 1:
@@ -1493,11 +1968,11 @@ def ci_sparse_hessian_deconvolve(
             pixel_size_xy=pixel_size_xy,
             pixel_size_z=pixel_size_z,
             device=device,
+            backend=backend,
             iteration_callback=iteration_callback,
             channel_index=channel_index,
         )
 
-    dev = _pick_device(device)
     dtype = _pick_dtype(dev)
 
     if start not in START_MODES:
@@ -1512,15 +1987,19 @@ def ci_sparse_hessian_deconvolve(
     sparse_hessian_reg = float(np.clip(sparse_hessian_reg, 0.0, 1.0))
 
     log.info(
-        "ci_sparse_hessian_deconvolve  device=%s  dtype=%s  shape=%s  niter=%d  "
+        "ci_sparse_hessian_deconvolve  backend=%s  device=%s  dtype=%s  shape=%s  niter=%d  "
         "weight=%.4g  reg=%.4g  offset=%.4g  prefilter_sigma=%.4g  start=%s  convergence=%s",
-        dev, dtype, image.shape, niter,
+        backend_used, dev, dtype, image.shape, niter,
         sparse_hessian_weight, sparse_hessian_reg,
         offset_val, prefilter_sigma, start, convergence,
     )
 
-    img_t = _to_tensor(image.astype(np.float64), dev, dtype)
-    psf_t = _to_tensor(psf.astype(np.float64), dev, dtype)
+    img_t = _to_tensor(image, dev, dtype)
+    psf_t = _to_tensor(psf, dev, dtype)
+    optimized_squeeze_2d = optimized_ops is not None and img_t.ndim == 2
+    if optimized_squeeze_2d:
+        img_t = img_t.unsqueeze(0)
+        psf_t = psf_t.unsqueeze(0)
 
     if background == "auto":
         bg = max(_estimate_background(img_t), 1e-6)
@@ -1541,12 +2020,41 @@ def ci_sparse_hessian_deconvolve(
     if requested_start != start:
         log.info("  start=%s resolved to %s", requested_start, start)
 
-    work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
+    minimum_work_shape = tuple(si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape))
     axis_scales = _axis_scales(img_t.ndim, pixel_size_xy, pixel_size_z)
     z_scale = axis_scales[0] if img_t.ndim == 3 else 1.0
 
-    otf, otf_conj = _prepare_otf(psf_t, work_shape)
-    W = _bertero_weights(otf, otf_conj, img_t.shape, work_shape)
+    optimized_context = None
+    if optimized_ops is not None:
+        try:
+            optimized_context = _optimized_context(
+                optimized_ops, psf_t, tuple(img_t.shape), minimum_work_shape,
+            )
+        except Exception as exc:
+            if str(backend or BACKEND_AUTO).strip().lower() != BACKEND_AUTO:
+                raise
+            log.warning("Optimized CUDA setup failed; falling back to PyTorch CUDA: %s", exc)
+            clear_optimized_context_cache()
+            optimized_ops = None
+            backend_used = BACKEND_PYTORCH_CUDA
+            if optimized_squeeze_2d:
+                img_t = img_t[0]
+                psf_t = psf_t[0]
+                optimized_squeeze_2d = False
+                minimum_work_shape = tuple(
+                    si + sp - 1 for si, sp in zip(img_t.shape, psf_t.shape)
+                )
+                axis_scales = _axis_scales(img_t.ndim, pixel_size_xy, pixel_size_z)
+                z_scale = 1.0
+    if optimized_context is not None:
+        work_shape = optimized_context["work_shape"]
+        otf = optimized_context["otf"]
+        otf_conj = otf.conj()
+        W = optimized_context["weights"]
+    else:
+        work_shape = minimum_work_shape
+        otf, otf_conj = _prepare_otf(psf_t, work_shape)
+        W = _bertero_weights(otf, otf_conj, img_t.shape, work_shape)
 
     d_work = torch.full(work_shape, bg, dtype=dtype, device=dev)
     slices = tuple(slice(0, s) for s in img_t.shape)
@@ -1562,6 +2070,7 @@ def ci_sparse_hessian_deconvolve(
         dtype,
         dev,
     )
+    del d_work
     x_prev = x_prev.clamp(min=bg)
     x_cur = x_cur.clamp(min=bg)
 
@@ -1572,10 +2081,15 @@ def ci_sparse_hessian_deconvolve(
             float(_sparse_hessian_penalty(x_cur[slices], sparse_hessian_weight, z_scale=z_scale).detach()),
             1e-6,
         )
+        del fwd0
 
     convergence_history: list[float] = []
     iterations_used = niter
     early_stop_min_iter = max(10, niter // 4)
+    sparse_gradient = (
+        torch.empty(tuple(img_t.shape), dtype=torch.float32, device=dev)
+        if optimized_context is not None else None
+    )
 
     for k in range(1, niter + 1):
         if k >= 3:
@@ -1583,31 +2097,62 @@ def ci_sparse_hessian_deconvolve(
             alpha = min((k - 1.0) / (k + 2.0), alpha_max)
         else:
             alpha = 0.0
-        p = (x_cur + alpha * (x_cur - x_prev)).clamp(min=bg)
-
-        y = _forward_project(p, otf, work_shape)
-
-        r = torch.zeros(work_shape, dtype=dtype, device=dev)
-        r[slices] = img_t / y[slices].clamp(min=bg)
-        corr = _irfft(_rfft(r) * otf_conj, work_shape)
-
-        x_data = (p * corr * W).clamp(min=bg)
-
-        prior_probe = x_data[slices].detach().requires_grad_(True)
-        prior_loss_probe = _sparse_hessian_penalty(
-            prior_probe, sparse_hessian_weight, z_scale=z_scale,
-        )
-        prior_grad = torch.autograd.grad(prior_loss_probe, prior_probe)[0]
-        grad_scale = prior_grad.abs().mean().detach().clamp(min=1e-12)
+        if optimized_context is not None:
+            storage = optimized_context["storage"]
+            plan = optimized_context["plan"]
+            workspace = optimized_context["workspace"]
+            pitch = optimized_context["pitch"]
+            normalization = optimized_context["normalization"]
+            x_data = x_prev
+            optimized_ops.momentum_pack(
+                x_cur, x_data, alpha, bg, storage, *work_shape, pitch,
+            )
+            plan.forward(storage, workspace)
+            optimized_ops.multiply_otf(optimized_context["frequency"], otf, False)
+            plan.inverse(storage, workspace)
+            optimized_ops.ratio_pitched(
+                storage, img_t, *work_shape, pitch, bg, normalization,
+            )
+            plan.forward(storage, workspace)
+            optimized_ops.multiply_otf(optimized_context["frequency"], otf, True)
+            plan.inverse(storage, workspace)
+            optimized_ops.update_pitched(
+                x_data, storage, W, bg, normalization, *work_shape, pitch,
+            )
+            optimized_ops.sparse_hessian_gradient(
+                x_data, sparse_gradient, *img_t.shape, sparse_hessian_weight, z_scale,
+            )
+            prior_grad = sparse_gradient
+            grad_scale = prior_grad.abs().mean().detach().clamp(min=1e-12)
+        else:
+            p = (x_cur + alpha * (x_cur - x_prev)).clamp(min=bg)
+            y = _forward_project(p, otf, work_shape)
+            r = torch.zeros(work_shape, dtype=dtype, device=dev)
+            r[slices] = img_t / y[slices].clamp(min=bg)
+            corr = _irfft(_rfft(r) * otf_conj, work_shape)
+            del y, r
+            x_data = (p * corr * W).clamp(min=bg)
+            del corr, p
+            prior_probe = x_data[slices].detach().requires_grad_(True)
+            prior_loss_probe = _sparse_hessian_penalty(
+                prior_probe, sparse_hessian_weight, z_scale=z_scale,
+            )
+            prior_grad = torch.autograd.grad(prior_loss_probe, prior_probe)[0]
+            grad_scale = prior_grad.abs().mean().detach().clamp(min=1e-12)
         signal_scale = max(float((x_data[slices].mean() - bg).detach()), 1.0)
         reg_step = 0.1 * max(1.0 - sparse_hessian_reg, 0.0) * signal_scale
-        x_new = x_data.clone()
-        x_new[slices] = (
-            x_data[slices] - reg_step * prior_grad / grad_scale
-        ).clamp(min=bg)
-
-        x_prev = x_cur
-        x_cur = x_new
+        if optimized_context is not None:
+            optimized_ops.sparse_hessian_update(
+                x_data, prior_grad, *img_t.shape, reg_step / float(grad_scale), bg,
+            )
+            x_prev, x_cur = x_cur, x_data
+        else:
+            x_new = x_data.clone()
+            x_new[slices] = (
+                x_data[slices] - reg_step * prior_grad / grad_scale
+            ).clamp(min=bg)
+            del prior_probe, prior_loss_probe, prior_grad, x_data
+            x_prev, x_cur = x_cur, x_new
 
         stop_after_callback = False
         convergence_value: Optional[float] = None
@@ -1653,6 +2198,9 @@ def ci_sparse_hessian_deconvolve(
                 convergence_value = float(total_loss.detach())
             frame = x_cur[slices]
             estimated = fwd
+            if optimized_squeeze_2d:
+                frame = frame[0]
+                estimated = estimated[0]
             if offset_val > 0.0:
                 frame = (frame - offset_val).clamp(min=0.0)
                 estimated = (estimated - offset_val).clamp(min=0.0)
@@ -1668,17 +2216,36 @@ def ci_sparse_hessian_deconvolve(
                 "background": max(float(bg) - offset_val, 0.0),
                 "is_final": bool(stop_after_callback or k == niter),
             })
+            del frame, estimated
+        if "fwd" in locals():
+            del fwd
+        if "data_loss" in locals():
+            del data_loss
+        if "prior_loss" in locals():
+            del prior_loss
+        if "total_loss" in locals():
+            del total_loss
         if stop_after_callback:
             break
 
     result = x_cur[slices]
+    if optimized_squeeze_2d:
+        result = result[0]
     if offset_val > 0.0:
         result = (result - offset_val).clamp(min=0.0)
 
+    result_np = _to_numpy(result).astype(np.float32, copy=False)
+    del result, img_t, psf_t, otf, otf_conj, W, x_prev, x_cur
+    _release_cuda_cache()
     return {
-        "result": _to_numpy(result),
+        "result": result_np,
         "convergence": convergence_history,
         "iterations_used": iterations_used,
+        "backend": backend_used,
+        "work_shape": tuple(work_shape),
+        "optimized_workspace_bytes": (
+            optimized_context["workspace_bytes"] if optimized_context is not None else 0
+        ),
     }
 
 
@@ -1949,7 +2516,8 @@ def _build_psf_stack(
         plane = intensity[rr_inv.flatten()].reshape(n_xy, n_xy)
         slices_out.append(plane)
 
-    psf_stack = torch.stack(slices_out, dim=0).to(dtype)  # (Z, Y, X)    
+    psf_stack = torch.stack(slices_out, dim=0).to(dtype)  # (Z, Y, X)
+    del slices_out, rr, r_unique, rr_inv, rs, thetas, zs, pupil
     return psf_stack
 
 # ---------------------------------------------------------------------------
@@ -2059,372 +2627,66 @@ def ci_generate_psf(
     def _psf_func(*, fov: float, n_xy: int, **kw) -> torch.Tensor:
         return _build_psf_stack(fov=fov, n_xy=n_xy, **{**common, **kw})
 
-    if integrate_pixels and n_subpixels > 1:
-        psf = _pixel_integrate_psf(
-            _psf_func,
-            pixel_size_xy=pixel_size_xy_nm,
-            n_xy=n_xy,
-            n_subpixels=n_subpixels,
-        )
-    else:
-        fov = pixel_size_xy_nm * n_xy
-        psf = _psf_func(fov=fov, n_xy=n_xy)
-
-    # Confocal: detection PSF × excitation PSF. Finite pinholes are modelled
-    # by laterally integrating the detection/emission PSF over a circular
-    # object-space aperture measured in Airy disk units.
-    if microscope_type == "confocal":
-        detector_psf = psf
-        pinhole_airy_units = float(pinhole_airy_units)
-        if pinhole_airy_units > 0.0:
-            kernel = _make_circular_pinhole_kernel(
-                pinhole_airy_units=pinhole_airy_units,
-                wavelength_nm=wavelength_nm,
-                na=na,
-                pixel_size_xy_nm=pixel_size_xy_nm,
-                device=dev,
-                dtype=dtype,
+    try:
+        if integrate_pixels and n_subpixels > 1:
+            psf = _pixel_integrate_psf(
+                _psf_func,
+                pixel_size_xy=pixel_size_xy_nm,
+                n_xy=n_xy,
+                n_subpixels=n_subpixels,
             )
-            detector_psf = _convolve_lateral_with_kernel(detector_psf, kernel)
+        else:
+            fov = pixel_size_xy_nm * n_xy
+            psf = _psf_func(fov=fov, n_xy=n_xy)
 
-        if excitation_nm is not None and excitation_nm != wavelength_nm:
-            common_ex = {**common, "wavelength_nm": excitation_nm}
-
-            def _psf_ex(*, fov, n_xy, **kw):
-                return _build_psf_stack(fov=fov, n_xy=n_xy, **{**common_ex, **kw})
-
-            if integrate_pixels and n_subpixels > 1:
-                psf_ex = _pixel_integrate_psf(
-                    _psf_ex,
-                    pixel_size_xy=pixel_size_xy_nm,
-                    n_xy=n_xy,
-                    n_subpixels=n_subpixels,
+        # Confocal: detection PSF × excitation PSF. Finite pinholes are modelled
+        # by laterally integrating the detection/emission PSF over a circular
+        # object-space aperture measured in Airy disk units.
+        if microscope_type == "confocal":
+            detector_psf = psf
+            pinhole_airy_units = float(pinhole_airy_units)
+            if pinhole_airy_units > 0.0:
+                kernel = _make_circular_pinhole_kernel(
+                    pinhole_airy_units=pinhole_airy_units,
+                    wavelength_nm=wavelength_nm,
+                    na=na,
+                    pixel_size_xy_nm=pixel_size_xy_nm,
+                    device=dev,
+                    dtype=dtype,
                 )
+                detector_psf = _convolve_lateral_with_kernel(detector_psf, kernel)
+                del kernel
+
+            if excitation_nm is not None and excitation_nm != wavelength_nm:
+                common_ex = {**common, "wavelength_nm": excitation_nm}
+
+                def _psf_ex(*, fov, n_xy, **kw):
+                    return _build_psf_stack(fov=fov, n_xy=n_xy, **{**common_ex, **kw})
+
+                if integrate_pixels and n_subpixels > 1:
+                    psf_ex = _pixel_integrate_psf(
+                        _psf_ex,
+                        pixel_size_xy=pixel_size_xy_nm,
+                        n_xy=n_xy,
+                        n_subpixels=n_subpixels,
+                    )
+                else:
+                    fov = pixel_size_xy_nm * n_xy
+                    psf_ex = _psf_ex(fov=fov, n_xy=n_xy)
+                psf = detector_psf * psf_ex
+                del psf_ex
             else:
-                fov = pixel_size_xy_nm * n_xy
-                psf_ex = _psf_ex(fov=fov, n_xy=n_xy)
-            psf = detector_psf * psf_ex
-        else:
-            psf = detector_psf * psf
+                psf = detector_psf * psf
+            del detector_psf
 
-    # Normalise
-    psf = psf / psf.sum()
+        # Normalise
+        psf = psf / psf.sum()
 
-    result = _to_numpy(psf)
-    log.info("  PSF range [%.3g, %.3g], sum=%.6f", result.min(), result.max(),
-             result.sum())
-    return result
-
-
-# ---------------------------------------------------------------------------
-# PSF parameter fitting via short RL trials
-# ---------------------------------------------------------------------------
-
-def _reblur_np(x: np.ndarray, h: np.ndarray) -> np.ndarray:
-    """Re-blur deconvolved image *x* with PSF *h* in numpy.
-
-    Mirrors the RL forward model: the PSF is zero-padded and circularly
-    shifted so its geometric centre sits at array index [0, 0, ...] before
-    the FFT.  Returns the blurred image cropped to ``x.shape``.
-    """
-    lin = tuple(d + p - 1 for d, p in zip(x.shape, h.shape))
-    # Next power-of-2 work shape for FFT speed
-    work = tuple(1 << max(0, (int(n) - 1).bit_length()) for n in lin)
-
-    # PSF: zero-pad then circularly shift centre → origin
-    h32 = h.astype(np.float32)
-    h_pad = np.zeros(work, dtype=np.float32)
-    h_pad[tuple(slice(0, s) for s in h32.shape)] = h32
-    for ax, s in enumerate(h32.shape):
-        h_pad = np.roll(h_pad, -(s // 2), axis=ax)
-
-    # Image: zero-pad
-    x32 = x.astype(np.float32)
-    x_pad = np.zeros(work, dtype=np.float32)
-    x_pad[tuple(slice(0, s) for s in x32.shape)] = x32
-
-    conv = np.fft.irfftn(np.fft.rfftn(x_pad) * np.fft.rfftn(h_pad), s=work)
-    return conv[tuple(slice(0, s) for s in x.shape)].astype(np.float32)
-
-
-def _roughness_np(x: np.ndarray, axis_scales: tuple[float, ...]) -> float:
-    """Return a normalized TV-like roughness for a numpy image."""
-    x32 = np.asarray(x, dtype=np.float32)
-    denom = float(np.mean(np.clip(x32, 0.0, None))) + 1e-8
-    rough = 0.0
-    for axis, scale in enumerate(axis_scales):
-        if axis >= x32.ndim or x32.shape[axis] <= 1:
-            continue
-        rough += float(np.mean(np.abs(np.diff(x32, axis=axis)))) * float(scale)
-    return rough / denom
-
-
-def _normalize_grid_metric(values: list[float]) -> list[float]:
-    """Min-max normalize a list of trial metrics, preserving inf for failures."""
-    finite = [float(v) for v in values if np.isfinite(v)]
-    if not finite:
-        return [float("inf")] * len(values)
-    lo = min(finite)
-    hi = max(finite)
-    if hi - lo <= max(1e-12, abs(lo) * 1e-6):
-        return [0.0 if np.isfinite(v) else float("inf") for v in values]
-    scale = hi - lo
-    return [((float(v) - lo) / scale) if np.isfinite(v) else float("inf") for v in values]
-
-def ci_fit_psf_params(
-    image: np.ndarray,
-    base_params: dict,
-    *,
-    pinhole_grid: Optional[list[float]] = None,
-    ri_sample_grid: Optional[list[float]] = None,
-    niter_fit: int = 40,
-    callback: Optional[Any] = None,
-    should_stop: Optional[Callable[[], bool]] = None,
-) -> dict:
-    """Find the best-fit PSF parameters by evaluating short RL trials.
-
-    Each combination of *pinhole_airy_units* × *ri_sample* values in the
-    search grids is tried: the PSF is generated, ``niter_fit`` RL iterations
-    are run, and a composite score is recorded. The score combines
-    reconstruction residual with deconvolved-image roughness so that the
-    sharpest PSF does not win purely by self-fitting.
-
-    Parameters
-    ----------
-    image:
-        The observed image (2-D or 3-D numpy array) for one channel.
-    base_params:
-        Dict with the same keys as ``_collect_params()`` in the GUI:
-        ``na``, ``ri_immersion``, ``ri_sample``, ``pinhole_airy_units``
-        (scalar for a single channel), ``pixel_size_xy_nm``,
-        ``pixel_size_z_nm``, ``microscope_type``, ``excitation_nm``,
-        ``t_g``, ``t_g0``, ``t_i0``, ``z_p``, ``integrate_pixels``,
-        ``n_subpixels``, ``n_pupil``, ``device``, ``background``,
-        ``offset``.
-    pinhole_grid:
-        List of pinhole sizes (Airy units) to try.  Ignored for widefield.
-        When ``None``, the confocal pinhole is held fixed at
-        ``base_params["pinhole_airy_units"]``.
-    ri_sample_grid:
-        List of sample RI values to try.
-        Defaults to five steps centred on ``base_params["ri_sample"]`` ±0.03.
-    niter_fit:
-        Number of RL iterations per trial (fast / ranking mode).
-    callback:
-        Optional callable invoked after each trial as
-        ``callback(trial_idx, total_trials, trial_params, residual)``.
-    should_stop:
-        Optional callable returning ``True`` when the search should stop.
-
-    Returns
-    -------
-    dict with keys:
-        ``best_params``  – dict of best-fit PSF-relevant params
-        ``best_i_div``   – compatibility alias for the best composite score
-        ``baseline_i_div`` – compatibility alias for baseline composite score
-        ``improvement_pct`` – relative improvement (0–100 %)
-        ``search_log``   – list of per-trial metrics and composite score
-        ``grid``         – ``{"pinhole": [...], "ri_sample": [...]}``
-    """
-    microscope = str(base_params.get("microscope_type", "widefield"))
-    orig_pinhole = float(base_params.get("pinhole_airy_units", 1.0))
-    if isinstance(orig_pinhole, (list, tuple)):
-        orig_pinhole = float(orig_pinhole[0])
-
-    if pinhole_grid is None:
-        # Keep the confocal pinhole fixed by default. For specimen images the
-        # pinhole is effectively acquisition metadata; searching it collapses
-        # toward the sharpest PSF rather than recovering the real setting.
-        pinhole_grid = [orig_pinhole]
-    if ri_sample_grid is None:
-        # Fixed wide range: water (1.33) → oil immersion (1.515) in ~9 steps
-        ri_sample_grid = [1.330, 1.358, 1.385, 1.410, 1.435, 1.460, 1.480, 1.500, 1.515]
-
-    # Clamp RI values to a physically sensible range and deduplicate
-    ri_sample_grid = [max(1.30, min(1.52, v)) for v in ri_sample_grid]
-    ri_sample_grid = list(dict.fromkeys(ri_sample_grid))
-
-    is_confocal = microscope == "confocal"
-    pinhole_trials = pinhole_grid if is_confocal else [float(base_params.get("pinhole_airy_units", 1.0))]
-    ri_trials = ri_sample_grid
-
-    # Build flat list of (pinhole, ri) combinations
-    combos: list[tuple[float, float]] = [
-        (ph, ri) for ph in pinhole_trials for ri in ri_trials
-    ]
-    total = len(combos)
-
-    search_log: list[dict] = []
-    best_i_div = float("inf")
-    best_params: dict = {}
-    baseline_i_div: float = float("inf")
-
-    # Derive PSF size from image (same logic as the GUI worker)
-    img = np.asarray(image, dtype=np.float32)
-    px_xy = float(base_params.get("pixel_size_xy_nm", 65.0))
-    px_z = float(base_params.get("pixel_size_z_nm", 200.0))
-    na = float(base_params.get("na", 1.4))
-    em_wl = float(base_params.get("emission_nm", base_params.get("emission_wavelengths", 520)))
-    if isinstance(em_wl, (list, tuple)):
-        em_wl = float(em_wl[0])
-    ri_imm = float(base_params.get("ri_immersion", 1.515))
-    device = base_params.get("device", None)
-    axis_scales = _axis_scales(img.ndim, px_xy, px_z)
-    orig_ri = float(base_params.get("ri_sample", 1.33))
-
-    # PSF size heuristic (mirror the GUI worker)
-    max_side = max(img.shape[-2], img.shape[-1])
-    psf_xy_fwhm_px = 0.51 * em_wl / (na * px_xy)
-    n_xy_psf = min(int(psf_xy_fwhm_px * 14 + 1) | 1, max_side | 1)
-    n_xy_psf = max(n_xy_psf, 7)
-    if n_xy_psf % 2 == 0:
-        n_xy_psf += 1
-    if img.ndim == 3:
-        psf_z_fwhm_px = 0.88 * em_wl / (ri_imm - (ri_imm ** 2 - na ** 2) ** 0.5) / px_z
-        n_z_psf = min(max(int(psf_z_fwhm_px * 6 + 1) | 1, 7), img.shape[0])
-        if n_z_psf % 2 == 0:
-            n_z_psf += 1
-        psf_pixel_z = px_z
-    else:
-        n_z_psf = 1
-        psf_pixel_z = px_z
-
-    def _run_trial(pinhole: float, ri_sample: float, trial_idx: int) -> dict:
-        try:
-            psf = ci_generate_psf(
-                na=na,
-                wavelength_nm=em_wl,
-                pixel_size_xy_nm=px_xy,
-                pixel_size_z_nm=psf_pixel_z,
-                n_xy=n_xy_psf,
-                n_z=n_z_psf,
-                ri_immersion=ri_imm,
-                ri_sample=ri_sample,
-                ri_coverslip=ri_imm,
-                ri_coverslip_design=ri_imm,
-                ri_immersion_design=ri_imm,
-                t_g=float(base_params.get("t_g", 170_000.0)),
-                t_g0=float(base_params.get("t_g0", 170_000.0)),
-                t_i0=float(base_params.get("t_i0", 100_000.0)),
-                z_p=float(base_params.get("z_p", 0.0)),
-                microscope_type=microscope,
-                excitation_nm=base_params.get("excitation_nm") or base_params.get("excitation_wavelengths"),
-                pinhole_airy_units=pinhole,
-                integrate_pixels=bool(base_params.get("integrate_pixels", True)),
-                n_subpixels=int(base_params.get("n_subpixels", 3)),
-                n_pupil=int(base_params.get("n_pupil", 129)),
-                device=device,
-            )
-            # Trim PSF Z if needed
-            if img.ndim == 3 and psf.ndim == 3 and psf.shape[0] > img.shape[0]:
-                start = (psf.shape[0] - img.shape[0]) // 2
-                psf = psf[start:start + img.shape[0]]
-            if img.ndim == 2 and psf.ndim == 3:
-                psf = psf[0]
-
-            result = ci_rl_deconvolve(
-                img,
-                psf,
-                niter=niter_fit,
-                offset=base_params.get("offset", "auto"),
-                background=base_params.get("background", "auto"),
-                convergence="fixed",
-                device=device,
-            )
-            # Residual alone still favors the sharpest PSF because it lets the
-            # latent image become arbitrarily rough. Charge that complexity too.
-            deconvolved = np.asarray(result["result"], dtype=np.float32)
-            blurred_est = _reblur_np(deconvolved, psf)
-            raw_scale = float(img.mean()) + 1e-8
-            residual = float(np.mean(np.abs(img - blurred_est))) / raw_scale
-            roughness = _roughness_np(deconvolved, axis_scales)
-            return {
-                "residual": residual,
-                "roughness": roughness,
-            }
-        except Exception as exc:
-            log.warning("PSF fit trial (pinhole=%.2f, ri=%.4f) failed: %s", pinhole, ri_sample, exc)
-            return {
-                "residual": float("inf"),
-                "roughness": float("inf"),
-            }
-
-    for idx, (pinhole, ri_sample) in enumerate(combos):
-        if should_stop is not None and should_stop():
-            raise RuntimeError("Stopped by user")
-        trial_params = {"pinhole_airy_units": pinhole, "ri_sample": ri_sample}
-        metrics = _run_trial(pinhole, ri_sample, idx)
-        residual = float(metrics["residual"])
-        roughness = float(metrics["roughness"])
-        entry = {
-            "params": dict(trial_params),
-            "residual": residual,
-            "roughness": roughness,
-            "score": float("inf"),
-            "i_div": float("inf"),
-        }
-        search_log.append(entry)
-
-        if callback is not None:
-            try:
-                callback(idx + 1, total, trial_params, residual)
-            except Exception:
-                pass
-
-    residual_norm = _normalize_grid_metric([entry["residual"] for entry in search_log])
-    roughness_norm = _normalize_grid_metric([entry["roughness"] for entry in search_log])
-    for entry, resid_n, rough_n in zip(search_log, residual_norm, roughness_norm):
-        score = resid_n + rough_n if np.isfinite(resid_n) and np.isfinite(rough_n) else float("inf")
-        entry["score"] = score
-        entry["i_div"] = score
-
-    best_entry = min(search_log, key=lambda e: e["score"])
-    best_i_div = float(best_entry["score"])
-    best_params = dict(best_entry["params"])
-
-    baseline_entry = next(
-        (
-            entry for entry in search_log
-            if abs(float(entry["params"].get("pinhole_airy_units", -1.0)) - orig_pinhole) < 1e-6
-            and abs(float(entry["params"].get("ri_sample", -1.0)) - orig_ri) < 1e-6
-        ),
-        None,
-    )
-
-    # If baseline was never hit (original params not in grid), compute it
-    if baseline_i_div == float("inf"):
-        if should_stop is not None and should_stop():
-            raise RuntimeError("Stopped by user")
-        if baseline_entry is not None:
-            baseline_i_div = float(baseline_entry["score"])
-        else:
-            baseline_metrics = _run_trial(orig_pinhole, orig_ri, -1)
-            resid_lo = min((float(entry["residual"]) for entry in search_log if np.isfinite(entry["residual"])), default=float("inf"))
-            resid_hi = max((float(entry["residual"]) for entry in search_log if np.isfinite(entry["residual"])), default=float("inf"))
-            rough_lo = min((float(entry["roughness"]) for entry in search_log if np.isfinite(entry["roughness"])), default=float("inf"))
-            rough_hi = max((float(entry["roughness"]) for entry in search_log if np.isfinite(entry["roughness"])), default=float("inf"))
-
-            def _norm_external(value: float, lo: float, hi: float) -> float:
-                if not np.isfinite(value) or not np.isfinite(lo) or not np.isfinite(hi):
-                    return float("inf")
-                if hi - lo <= max(1e-12, abs(lo) * 1e-6):
-                    return 0.0
-                return (float(value) - lo) / (hi - lo)
-
-            baseline_i_div = _norm_external(float(baseline_metrics["residual"]), resid_lo, resid_hi) + _norm_external(float(baseline_metrics["roughness"]), rough_lo, rough_hi)
-
-    improvement_pct = (
-        max(0.0, (baseline_i_div - best_i_div) / baseline_i_div * 100.0)
-        if baseline_i_div > 0 and baseline_i_div != float("inf")
-        else 0.0
-    )
-
-    return {
-        "best_params": best_params,
-        "best_i_div": best_i_div,
-        "baseline_i_div": baseline_i_div,
-        "improvement_pct": improvement_pct,
-        "search_log": search_log,
-        "grid": {"pinhole": pinhole_trials, "ri_sample": ri_trials},
-        "score_label": "normalized residual + normalized roughness",
-    }
+        result = _to_numpy(psf).astype(np.float32, copy=False)
+        log.info("  PSF range [%.3g, %.3g], sum=%.6f", result.min(), result.max(),
+                 result.sum())
+        return result
+    finally:
+        if "psf" in locals():
+            del psf
+        _release_cuda_cache()

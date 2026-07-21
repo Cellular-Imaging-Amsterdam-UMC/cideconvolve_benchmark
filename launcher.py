@@ -1,26 +1,20 @@
-"""
-launcher.py — PyQt6 GUI frontend for W_CIDeconvolve_benchmark descriptor.json.
-
-Dynamically reads descriptor.json and builds a form with appropriate
-widgets for each parameter. On "Run" it executes the Docker container
-in the console that launched this script.
-
-Usage:
-    python launcher.py
-"""
+from __future__ import annotations
 
 import json
-import os
+from pathlib import Path
 import subprocess
 import sys
-from pathlib import Path
 
-# Windows taskbar: set AppUserModelID so the taskbar shows our icon, not Python's
+import yaml
+
 if sys.platform == "win32":
     import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ci.w_cideconvolve_benchmark.launcher")
 
-from PyQt6.QtCore import Qt
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "ci.w_cideconvolve_benchmark.bilayers_launcher"
+    )
+
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -33,474 +27,476 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPushButton,
     QSpinBox,
-    QLineEdit,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-# Resolve paths relative to this script
-SCRIPT_DIR = Path(__file__).resolve().parent
-DESCRIPTOR_PATH = SCRIPT_DIR / "descriptor.json"
-ICON_PATH = SCRIPT_DIR / "icon.svg"
-LAST_SETTINGS_PATH = SCRIPT_DIR / ".last_settings.json"
+
+ROOT = Path(__file__).resolve().parent
+CONFIG = ROOT / "config.yaml"
+ICON = ROOT / "icon.svg"
+SETTINGS = ROOT / ".last_launcher_settings.json"
 
 
-class ToggleSwitch(QCheckBox):
-    """Styled toggle switch using a QCheckBox with a stylesheet."""
+class MultiSelectList(QListWidget):
+    def __init__(self, options: list[dict], selected: list[str]):
+        super().__init__()
+        selected_values = set(selected)
+        self.setMinimumHeight(120)
+        self.setMaximumHeight(160)
+        for option in options:
+            item = QListWidgetItem(str(option["label"]))
+            item.setData(Qt.ItemDataRole.UserRole, option["value"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if option["value"] in selected_values
+                else Qt.CheckState.Unchecked
+            )
+            self.addItem(item)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet(
-            """
-            QCheckBox {
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 40px;
-                height: 22px;
-                border-radius: 11px;
-                background-color: #888;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #4CAF50;
-            }
-            QCheckBox::indicator:unchecked {
-                background-color: #888;
-            }
-            """
-        )
+    def values(self) -> list[str]:
+        return [
+            str(self.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.count())
+            if self.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+
+class NoWheelComboBox(QComboBox):
+    """A selector that never changes its value while the form is scrolled."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        event.ignore()
+
+
+class NoWheelSpinBox(QSpinBox):
+    """An integer editor that ignores mouse-wheel value changes."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """A floating-point editor that ignores mouse-wheel value changes."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        event.ignore()
 
 
 class CollapsiblePanel(QWidget):
-    """Simple collapsible section for advanced parameters."""
-
-    def __init__(self, title: str, parent=None):
-        super().__init__(parent)
-        self.toggle = QToolButton()
-        self.toggle.setText(title)
-        self.toggle.setCheckable(True)
-        self.toggle.setChecked(False)
+    def __init__(self, title: str):
+        super().__init__()
+        self._collapsed_window_height: int | None = None
+        self.toggle = QToolButton(text=title, checkable=True, checked=False)
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.toggle.clicked.connect(self._on_toggled)
-
+        self.toggle.clicked.connect(self._set_open)
         self.content = QWidget()
         self.content.setVisible(False)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.toggle)
         layout.addWidget(self.content)
 
-    def _on_toggled(self, checked: bool):
+    def _set_open(self, opened: bool) -> None:
+        window = self.window()
+        if opened and not window.isMaximized() and not window.isFullScreen():
+            self._collapsed_window_height = window.height()
         self.toggle.setArrowType(
-            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+            Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow
         )
-        self.content.setVisible(checked)
+        self.content.setVisible(opened)
+        self.content.updateGeometry()
+        self.updateGeometry()
+        # Visibility changes are not fully reflected in the top-level size hint
+        # until Qt has completed the current event. Resizing immediately with
+        # adjustSize() can therefore retain the expanded height after collapse,
+        # and the vertical layout distributes that surplus inside every panel.
+        target_height = None if opened else self._collapsed_window_height
+        QTimer.singleShot(
+            0, lambda: self._fit_window_to_visible_content(target_height, retry=True)
+        )
+
+    def _fit_window_to_visible_content(
+        self, target_height: int | None = None, *, retry: bool = False
+    ) -> None:
+        window = self.window()
+        if window.isMaximized() or window.isFullScreen():
+            return
+        own_layout = self.layout()
+        if own_layout is not None:
+            own_layout.activate()
+        central = getattr(window, "centralWidget", lambda: None)()
+        if central is not None and central.layout() is not None:
+            central.layout().activate()
+            central.updateGeometry()
+        window.updateGeometry()
+        hint = window.sizeHint()
+        if target_height is not None:
+            window.resize(window.width(), target_height)
+        elif hint.isValid():
+            window.resize(max(window.width(), hint.width()), hint.height())
+        if retry:
+            # QMainWindow's minimum-size cache is updated one event after its
+            # central layout. A second queued resize is what permits shrinking
+            # all the way back to the pre-expansion height on Windows.
+            QTimer.singleShot(
+                0, lambda: self._fit_window_to_visible_content(target_height)
+            )
 
 
-def load_descriptor() -> dict:
-    with open(DESCRIPTOR_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_config() -> dict:
+    return yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
 
 
-def build_docker_command(descriptor: dict, values: dict, folders: dict) -> list[str]:
-    """Build the docker run command from descriptor and current widget values."""
-    # Derive from descriptor, strip namespace (e.g. "cellularimagingcf/") for local run
-    full_image = descriptor.get("container-image", {}).get("image", "w_cideconvolve_benchmark")
-    image = full_image.rsplit("/", 1)[-1]
-    name = descriptor.get("name", image)
-
-    cmd = [
-        "docker", "run", "--rm", "--gpus", "all",
-        "-v", f"{folders['infolder']}:/data/in",
-        "-v", f"{folders['outfolder']}:/data/out",
-        "-v", f"{folders['gtfolder']}:/data/gt",
-        image,
-        "--infolder", "/data/in",
-        "--outfolder", "/data/out",
-        "--gtfolder", "/data/gt",
-        "--local",
-    ]
-
-    for inp in descriptor.get("inputs", []):
-        param_id = inp["id"]
-        flag = inp.get("command-line-flag", f"--{param_id}")
-        val = values.get(param_id)
-        if val is None:
+def _append_parameters(command: list[str], config: dict, values: dict) -> list[str]:
+    for item in sorted(
+        config.get("parameters", []), key=lambda entry: int(entry.get("cli_order", 0))
+    ):
+        value = values.get(item["name"], item.get("default"))
+        passes_boolean_value = item.get("type") == "checkbox" and item.get(
+            "append_value", False
+        )
+        if value in (None, "", []) or (value is False and not passes_boolean_value):
             continue
-        if inp["type"] == "Boolean":
-            # The local wrapper parses descriptor booleans as --flag True/False.
-            # Always pass the explicit value so launcher behavior does not depend
-            # on whatever default is baked into the current Docker image.
-            cmd.extend([flag, str(bool(val))])
-        else:
-            cmd.extend([flag, str(val)])
-
-    return cmd
+        command.append(str(item["cli_tag"]))
+        if item.get("type") != "checkbox" or item.get("append_value", False):
+            if isinstance(value, list):
+                value = ",".join(value)
+            command.append(str(value))
+    command.append("--local")
+    return command
 
 
-class LauncherWindow(QMainWindow):
+def build_docker_command(
+    config: dict, values: dict, input_dir: str, output_dir: str, gpu: bool = True
+) -> list[str]:
+    image = config["docker_image"]
+    # The desktop launcher runs the image produced by builddocker.cmd. The
+    # organization-qualified image in config.yaml remains the BIOMERO registry
+    # identity and must not make local Docker runs pull from Docker Hub.
+    image_name = f"{image['name']}:{image.get('tag', 'latest')}"
+    command = ["docker", "run", "--rm"]
+    if gpu:
+        command += ["--gpus", "all"]
+    command += [
+        "-v",
+        f"{input_dir}:/data/in",
+        "-v",
+        f"{output_dir}:/data/out",
+        image_name,
+    ]
+    return _append_parameters(command, config, values)
+
+
+def build_local_command(
+    config: dict,
+    values: dict,
+    input_dir: str,
+    output_dir: str,
+    python_executable: str | None = None,
+) -> list[str]:
+    command = [
+        python_executable or sys.executable,
+        str(ROOT / "wrapper.py"),
+        "--infolder",
+        input_dir,
+        "--outfolder",
+        output_dir,
+    ]
+    return _append_parameters(command, config, values)
+
+
+class Window(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.descriptor = load_descriptor()
+        self.config = load_config()
         self.widgets: dict[str, QWidget] = {}
-        self._build_ui()
+        self.run_buttons: list[QPushButton] = []
+        self.setWindowTitle("CIDeconvolve Benchmark - Bilayers Launcher")
+        self.setWindowIcon(QIcon(str(ICON)))
+        self.setMinimumWidth(960)
 
-    def _build_ui(self):
-        name = self.descriptor.get("name", "W_CIDeconvolve_benchmark")
-        self.setWindowTitle(f"{name} — Launcher")
-        self.setWindowIcon(QIcon(str(ICON_PATH)))
-        self.setMinimumWidth(676)
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setSpacing(10)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setSpacing(12)
-
-        # -- Header --
-        title = QLabel(name)
+        title = QLabel("CIDeconvolve Benchmark - Bilayers")
         title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         layout.addWidget(title)
 
-        desc = self.descriptor.get("description", "")
-        if desc:
-            desc_label = QLabel(desc)
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet("color: #666; margin-bottom: 8px;")
-            layout.addWidget(desc_label)
+        folders = QGroupBox("Data folders")
+        folder_form = QFormLayout(folders)
+        self.input_path = QLineEdit(str(ROOT / "infolder"))
+        self.output_path = QLineEdit(str(ROOT / "outfolder"))
+        folder_form.addRow("Input folder:", self._folder_row(self.input_path))
+        folder_form.addRow("Output folder:", self._folder_row(self.output_path))
+        layout.addWidget(folders)
 
-        # -- Data folders with browse buttons --
-        folder_group = QGroupBox("Data Folders")
-        folder_layout = QFormLayout()
-        folder_group.setLayout(folder_layout)
+        runtime = QGroupBox("Docker runtime")
+        runtime_form = QFormLayout(runtime)
+        self.gpu = QCheckBox("Expose NVIDIA GPU to container")
+        self.gpu.setChecked(True)
+        self.gpu.setToolTip("Adds '--gpus all' to the Docker command.")
+        runtime_form.addRow("GPU:", self.gpu)
+        layout.addWidget(runtime)
 
-        self.folder_widgets: dict[str, QLineEdit] = {}
-        for key, label_text, default_path in [
-            ("infolder",  "Input folder",  str(SCRIPT_DIR / "infolder")),
-            ("outfolder", "Output folder", str(SCRIPT_DIR / "outfolder")),
-        ]:
-            row = QHBoxLayout()
-            line = QLineEdit(default_path)
-            line.setMinimumWidth(360)
-            line.textChanged.connect(self._update_preview)
-            browse_btn = QPushButton("Browse…")
-            browse_btn.setFixedWidth(80)
-            browse_btn.clicked.connect(lambda checked, le=line: self._browse_folder(le))
-            row.addWidget(line)
-            row.addWidget(browse_btn)
-            folder_layout.addRow(label_text + ":", row)
-            self.folder_widgets[key] = line
-
-        layout.addWidget(folder_group)
-
-        # -- Parameters from descriptor --
-        param_group = QGroupBox("Parameters")
-        param_layout = QVBoxLayout(param_group)
-        essential_grid = QGridLayout()
-        essential_grid.setHorizontalSpacing(18)
-        essential_grid.setVerticalSpacing(8)
-        essential_grid.setColumnStretch(1, 1)
-        essential_grid.setColumnStretch(3, 1)
-        advanced_grid = QGridLayout()
-        advanced_grid.setHorizontalSpacing(18)
-        advanced_grid.setVerticalSpacing(8)
-        advanced_grid.setColumnStretch(1, 1)
-        advanced_grid.setColumnStretch(3, 1)
-        essential_count = 0
-        advanced_count = 0
-
-        for inp in self.descriptor.get("inputs", []):
-            if inp.get("set-by-server", False):
-                continue
-            widget = self._create_widget(inp)
-            if widget is not None:
-                tooltip = inp.get("description", "")
-                widget.setToolTip(tooltip)
-                label = QLabel(self._display_name(inp))
-                label.setToolTip(tooltip)
-                if self._is_advanced_input(inp):
-                    self._add_two_column_row(advanced_grid, advanced_count, label, widget)
-                    advanced_count += 1
-                else:
-                    self._add_two_column_row(essential_grid, essential_count, label, widget)
-                    essential_count += 1
-                self.widgets[inp["id"]] = widget
-
-        param_layout.addLayout(essential_grid)
-        if advanced_count:
-            advanced_panel = CollapsiblePanel("Advanced parameters")
-            advanced_panel.content.setLayout(advanced_grid)
-            param_layout.addWidget(advanced_panel)
-
-        layout.addWidget(param_group)
-
-        # -- Command preview --
-        self.cmd_preview = QTextEdit()
-        self.cmd_preview.setReadOnly(True)
-        self.cmd_preview.setMaximumHeight(163)
-        self.cmd_preview.setFont(QFont("Consolas", 9))
-        self.cmd_preview.setStyleSheet("background: #1e1e1e; color: #dcdcdc;")
-        layout.addWidget(QLabel("Command preview:"))
-        layout.addWidget(self.cmd_preview)
-
-        # -- Buttons --
-        btn_layout = QHBoxLayout()
-
-        restore_btn = QPushButton("Restore Last Settings")
-        restore_btn.setStyleSheet("padding: 8px 16px;")
-        restore_btn.setToolTip("Restore parameter values from the previous run")
-        restore_btn.setEnabled(LAST_SETTINGS_PATH.exists())
-        restore_btn.clicked.connect(self._on_restore)
-        btn_layout.addWidget(restore_btn)
-
-        load_btn = QPushButton("Load Settings")
-        load_btn.setStyleSheet("padding: 8px 16px;")
-        load_btn.setToolTip("Load parameter values from a JSON file")
-        load_btn.clicked.connect(self._on_load_settings)
-        btn_layout.addWidget(load_btn)
-
-        save_btn = QPushButton("Save Settings")
-        save_btn.setStyleSheet("padding: 8px 16px;")
-        save_btn.setToolTip("Save current parameter values to a JSON file")
-        save_btn.clicked.connect(self._on_save_settings)
-        btn_layout.addWidget(save_btn)
-
-        btn_layout.addStretch()
-
-        run_btn = QPushButton("Run")
-        run_btn.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; "
-            "font-weight: bold; padding: 8px 24px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #45a049; }"
-        )
-        run_btn.clicked.connect(self._on_run)
-
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet("padding: 8px 24px;")
-        close_btn.clicked.connect(self.close)
-
-        btn_layout.addWidget(run_btn)
-        btn_layout.addWidget(close_btn)
-        layout.addLayout(btn_layout)
-
-        # Initial preview
-        self._update_preview()
-
-        # Connect all widgets for live preview updates
-        for inp in self.descriptor.get("inputs", []):
-            w = self.widgets.get(inp["id"])
-            if w is None:
-                continue
-            if isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                w.valueChanged.connect(self._update_preview)
-            elif isinstance(w, QComboBox):
-                w.currentTextChanged.connect(self._update_preview)
-            elif isinstance(w, QCheckBox):
-                w.stateChanged.connect(self._update_preview)
-            elif isinstance(w, QLineEdit):
-                w.textChanged.connect(self._update_preview)
-
-    def _create_widget(self, inp: dict) -> QWidget | None:
-        ptype = inp.get("type", "String")
-        default = inp.get("default-value")
-        choices = inp.get("value-choices")
-
-        if ptype == "Boolean":
-            toggle = ToggleSwitch()
-            toggle.setChecked(bool(default))
-            return toggle
-
-        if choices:
-            combo = QComboBox()
-            combo.addItems([str(c) for c in choices])
-            if default is not None and str(default) in [str(c) for c in choices]:
-                combo.setCurrentText(str(default))
-            return combo
-
-        if ptype == "Number":
-            spin = QSpinBox() if inp.get("integer", False) else QDoubleSpinBox()
-            if isinstance(spin, QDoubleSpinBox):
-                spin.setMinimum(float(inp.get("minimum", 0)))
-                spin.setMaximum(float(inp.get("maximum", 99999)))
-                spin.setDecimals(4)
+        parameters = QGroupBox("Parameters")
+        parameter_layout = QVBoxLayout(parameters)
+        main = QWidget()
+        main_grid = self._parameter_grid(main)
+        advanced = CollapsiblePanel("Advanced parameters")
+        self.advanced_panel = advanced
+        advanced_grid = self._parameter_grid(advanced.content, left_margin=18)
+        main_count = advanced_count = 0
+        for spec in self.config.get("parameters", []):
+            widget = self._widget(spec)
+            widget.setToolTip(spec.get("description", ""))
+            label = QLabel(spec.get("label", spec["name"]))
+            label.setToolTip(spec.get("description", ""))
+            label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            if spec.get("mode") == "advanced":
+                self._add_two_column_row(advanced_grid, advanced_count, label, widget)
+                advanced_count += 1
             else:
-                spin.setMinimum(inp.get("minimum", 0))
-                spin.setMaximum(inp.get("maximum", 99999))
-            if default is not None:
-                value = float(default) if isinstance(spin, QDoubleSpinBox) else int(default)
-                spin.setValue(value)
-            return spin
+                self._add_two_column_row(main_grid, main_count, label, widget)
+                main_count += 1
+            self.widgets[spec["name"]] = widget
+        parameter_layout.addWidget(main)
+        if advanced_count:
+            parameter_layout.addWidget(advanced)
+        layout.addWidget(parameters)
 
-        # Fallback: plain text
-        line = QLineEdit()
-        if default is not None:
-            line.setText(str(default))
-        return line
+        layout.addWidget(QLabel("Command preview:"))
+        self.preview = QTextEdit(readOnly=True)
+        self.preview.setMaximumHeight(125)
+        self.preview.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.preview)
+
+        buttons = QHBoxLayout()
+        restore = QPushButton("Restore settings")
+        restore.clicked.connect(self.restore)
+        buttons.addWidget(restore)
+        save = QPushButton("Save settings")
+        save.clicked.connect(self.save)
+        buttons.addWidget(save)
+        buttons.addStretch()
+        run_local = QPushButton("Run Locally")
+        run_local.setToolTip(
+            "Run wrapper.py with the Python environment used to launch this window."
+        )
+        run_local.clicked.connect(self.run_local)
+        buttons.addWidget(run_local)
+        self.run_buttons.append(run_local)
+        run_docker = QPushButton("Run Docker")
+        run_docker.setToolTip("Run the configured container image with Docker.")
+        run_docker.clicked.connect(self.run_docker)
+        buttons.addWidget(run_docker)
+        self.run_buttons.append(run_docker)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+
+        self._connect_signals()
+        self.refresh()
 
     @staticmethod
-    def _is_advanced_input(inp: dict) -> bool:
-        return str(inp.get("name", "")).strip().startswith("(adv)")
+    def _parameter_grid(parent: QWidget, left_margin: int = 0) -> QGridLayout:
+        grid = QGridLayout(parent)
+        grid.setContentsMargins(left_margin, 0, 0, 0)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        return grid
 
     @staticmethod
-    def _display_name(inp: dict) -> str:
-        name = str(inp.get("name", inp["id"]))
-        for prefix in ("(ess)", "(adv)"):
-            if name.startswith(prefix):
-                return name[len(prefix):].strip()
-        return name
+    def _add_two_column_row(
+        grid: QGridLayout, index: int, label: QLabel, widget: QWidget
+    ) -> None:
+        column = 0 if index % 2 == 0 else 2
+        row = index // 2
+        grid.addWidget(label, row, column)
+        grid.addWidget(widget, row, column + 1)
 
-    @staticmethod
-    def _add_two_column_row(grid: QGridLayout, row_index: int, label: QLabel, widget: QWidget):
-        row = row_index // 2
-        col = (row_index % 2) * 2
-        grid.addWidget(label, row, col)
-        grid.addWidget(widget, row, col + 1)
+    def _folder_row(self, edit: QLineEdit) -> QWidget:
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(edit)
+        button = QPushButton("Browse...")
+        button.clicked.connect(lambda: self._browse(edit))
+        row.addWidget(button)
+        return box
 
-    def _get_values(self) -> dict:
+    def _browse(self, edit: QLineEdit) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Select folder", edit.text())
+        if selected:
+            edit.setText(selected)
+
+    def _widget(self, spec: dict) -> QWidget:
+        if spec.get("multiselect"):
+            return MultiSelectList(spec.get("options", []), spec.get("default", []))
+        if spec.get("type") == "checkbox":
+            widget = QCheckBox()
+            widget.setChecked(bool(spec.get("default")))
+            return widget
+        if spec.get("options"):
+            widget = NoWheelComboBox()
+            for option in spec["options"]:
+                widget.addItem(str(option["label"]), option["value"])
+            widget.setCurrentIndex(max(widget.findData(spec.get("default")), 0))
+            return widget
+        if spec.get("type") == "integer":
+            widget = NoWheelSpinBox()
+            widget.setRange(
+                int(spec.get("minimum", -999999)), int(spec.get("maximum", 999999))
+            )
+            widget.setValue(int(spec.get("default", 0)))
+            return widget
+        if spec.get("type") == "float":
+            widget = NoWheelDoubleSpinBox()
+            widget.setDecimals(6)
+            widget.setRange(
+                float(spec.get("minimum", -999999)),
+                float(spec.get("maximum", 999999)),
+            )
+            widget.setValue(float(spec.get("default", 0)))
+            return widget
+        return QLineEdit(str(spec.get("default", "")))
+
+    def _connect_signals(self) -> None:
+        self.input_path.textChanged.connect(self.refresh)
+        self.output_path.textChanged.connect(self.refresh)
+        self.gpu.stateChanged.connect(self.refresh)
+        for widget in self.widgets.values():
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self.refresh)
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                widget.valueChanged.connect(self.refresh)
+            elif isinstance(widget, QCheckBox):
+                widget.stateChanged.connect(self.refresh)
+            elif isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self.refresh)
+            elif isinstance(widget, MultiSelectList):
+                widget.itemChanged.connect(self.refresh)
+
+    def values(self) -> dict:
         values = {}
-        for inp in self.descriptor.get("inputs", []):
-            w = self.widgets.get(inp["id"])
-            if w is None:
-                continue
-            if isinstance(w, QCheckBox):
-                values[inp["id"]] = w.isChecked()
-            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                values[inp["id"]] = w.value()
-            elif isinstance(w, QComboBox):
-                values[inp["id"]] = w.currentText()
-            elif isinstance(w, QLineEdit):
-                values[inp["id"]] = w.text()
+        for name, widget in self.widgets.items():
+            if isinstance(widget, MultiSelectList):
+                values[name] = widget.values()
+            elif isinstance(widget, QComboBox):
+                values[name] = widget.currentData()
+            elif isinstance(widget, QCheckBox):
+                values[name] = widget.isChecked()
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                values[name] = widget.value()
+            else:
+                values[name] = widget.text()
         return values
 
-    def _get_folders(self) -> dict:
-        return {
-            "infolder": self.folder_widgets["infolder"].text(),
-            "outfolder": self.folder_widgets["outfolder"].text(),
-            "gtfolder": str(SCRIPT_DIR / "gtfolder"),
-        }
-
-    def _browse_folder(self, line_edit: QLineEdit):
-        """Open a folder picker and update the given QLineEdit."""
-        current = line_edit.text()
-        start = current if Path(current).is_dir() else str(SCRIPT_DIR)
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder", start)
-        if folder:
-            line_edit.setText(folder)
-
-    def _update_preview(self):
-        cmd = build_docker_command(
-            self.descriptor, self._get_values(), self._get_folders()
+    def docker_command(self) -> list[str]:
+        return build_docker_command(
+            self.config,
+            self.values(),
+            self.input_path.text(),
+            self.output_path.text(),
+            self.gpu.isChecked(),
         )
-        self.cmd_preview.setPlainText(" ".join(cmd))
 
-    def _save_settings(self):
-        """Persist current widget values and folders to .last_settings.json."""
-        data = {"values": self._get_values(), "folders": self._get_folders()}
-        try:
-            with open(LAST_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except OSError:
-            pass
-
-    def _apply_settings(self, data: dict):
-        """Apply a settings dict (values + folders) to the widgets."""
-        # Restore folders
-        for key, line in self.folder_widgets.items():
-            saved = data.get("folders", {}).get(key)
-            if saved is not None:
-                line.setText(str(saved))
-
-        # Restore parameter values
-        saved_vals = data.get("values", {})
-        for inp in self.descriptor.get("inputs", []):
-            w = self.widgets.get(inp["id"])
-            val = saved_vals.get(inp["id"])
-            if w is None or val is None:
-                continue
-            if isinstance(w, QCheckBox):
-                w.setChecked(bool(val))
-            elif isinstance(w, QDoubleSpinBox):
-                w.setValue(float(val))
-            elif isinstance(w, QSpinBox):
-                w.setValue(int(val))
-            elif isinstance(w, QComboBox):
-                idx = w.findText(str(val))
-                if idx >= 0:
-                    w.setCurrentIndex(idx)
-            elif isinstance(w, QLineEdit):
-                w.setText(str(val))
-
-    def _on_restore(self):
-        """Load settings from .last_settings.json into the widgets."""
-        try:
-            with open(LAST_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return
-        self._apply_settings(data)
-
-    def _on_save_settings(self):
-        """Save current settings to a user-chosen JSON file."""
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Settings", str(SCRIPT_DIR / "settings.json"),
-            "JSON files (*.json);;All files (*)",
+    def local_command(self) -> list[str]:
+        return build_local_command(
+            self.config,
+            self.values(),
+            self.input_path.text(),
+            self.output_path.text(),
         )
-        if not path:
-            return
-        data = {"values": self._get_values(), "folders": self._get_folders()}
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
 
-    def _on_load_settings(self):
-        """Load settings from a user-chosen JSON file."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Settings", str(SCRIPT_DIR),
-            "JSON files (*.json);;All files (*)",
+    def command(self) -> list[str]:
+        """Return the Docker command for backward compatibility."""
+        return self.docker_command()
+
+    def refresh(self) -> None:
+        self.preview.setPlainText(
+            "Docker:\n"
+            + subprocess.list2cmdline(self.docker_command())
+            + "\n\nLocal Python:\n"
+            + subprocess.list2cmdline(self.local_command())
         )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return
-        self._apply_settings(data)
 
-    def _on_run(self):
-        self._save_settings()
-        cmd = build_docker_command(
-            self.descriptor, self._get_values(), self._get_folders()
+    def run_docker(self) -> None:
+        self.save()
+        subprocess.Popen(self.docker_command(), cwd=ROOT)
+
+    def run_local(self) -> None:
+        self.save()
+        subprocess.Popen(self.local_command(), cwd=ROOT)
+
+    def save(self) -> None:
+        SETTINGS.write_text(
+            json.dumps(
+                {
+                    "values": self.values(),
+                    "input": self.input_path.text(),
+                    "output": self.output_path.text(),
+                    "gpu": self.gpu.isChecked(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
         )
-        print("\n" + "=" * 70)
-        print("Running:")
-        print(" ".join(cmd))
-        print("=" * 70 + "\n")
 
-        self.close()
+    def restore(self) -> None:
+        if not SETTINGS.exists():
+            return
+        data = json.loads(SETTINGS.read_text(encoding="utf-8"))
+        self.input_path.setText(data.get("input", ""))
+        self.output_path.setText(data.get("output", ""))
+        self.gpu.setChecked(data.get("gpu", True))
+        restored_values = data.get("values", {})
+        for name, value in restored_values.items():
+            widget = self.widgets.get(name)
+            if isinstance(widget, QComboBox):
+                widget.setCurrentIndex(max(0, widget.findData(value)))
+            elif isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                widget.setValue(value)
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(value))
+            elif isinstance(widget, MultiSelectList):
+                selected = set(value)
+                for index in range(widget.count()):
+                    item = widget.item(index)
+                    item.setCheckState(
+                        Qt.CheckState.Checked
+                        if item.data(Qt.ItemDataRole.UserRole) in selected
+                        else Qt.CheckState.Unchecked
+                    )
+        self.refresh()
 
-        # Run the docker command in the current console (inherits stdin/stdout)
-        subprocess.run(cmd)
 
-
-def main():
+def main() -> int:
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setWindowIcon(QIcon(str(ICON_PATH)))
-    window = LauncherWindow()
+    app.setWindowIcon(QIcon(str(ICON)))
+    window = Window()
     window.show()
-    screen = app.primaryScreen().availableGeometry()
-    window.move(
-        (screen.width() - window.frameGeometry().width()) // 2,
-        (screen.height() - window.frameGeometry().height()) // 2,
-    )
-    app.exec()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

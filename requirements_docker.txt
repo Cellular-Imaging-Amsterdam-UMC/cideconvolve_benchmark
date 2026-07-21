@@ -1,15 +1,10 @@
 # ===========================================================================
 # Docker-specific requirements for CIDeconvolve benchmark
 # ===========================================================================
-# PyTorch CUDA wheels are pulled via --extra-index-url. Optional GPU packages
-# are enabled here; CUDA/OpenCL driver libraries are mounted from the host by
-# NVIDIA Container Toolkit.
+# PyTorch is installed by Dockerfile build arguments. Optional GPU packages are
+# enabled here; driver libraries are mounted by NVIDIA Container Toolkit.
 # All versions pinned for reproducible builds.
 # ===========================================================================
-
-# PyTorch with CUDA 12.6 support
---extra-index-url https://download.pytorch.org/whl/cu126
-torch==2.4.1
 
 # Core dependencies
 numpy==2.4.3
@@ -18,6 +13,7 @@ ome-types==0.6.3
 scipy==1.15.3
 Pillow==10.4.0
 scikit-image==0.24.0
+PyYAML>=6.0,<7
 
 # OME-TIFF and OME-Zarr reading
 bioio==3.2.0

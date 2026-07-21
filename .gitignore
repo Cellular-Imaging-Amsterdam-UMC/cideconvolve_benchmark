@@ -6,6 +6,7 @@ __pycache__/
 *.egg
 dist/
 build/
+optimized_cuda/_build/
 *.whl
 
 # Virtual environments
@@ -49,3 +50,6 @@ pushdocker.cmd
 *.o
 *.so
 *.dylib
+
+# Desktop launcher state
+.last_launcher_settings.json

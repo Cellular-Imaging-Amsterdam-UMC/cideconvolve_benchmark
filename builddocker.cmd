@@ -5,13 +5,13 @@ set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 set "DOCKER_BUILDKIT=1"
 
-REM Derive image name from descriptor.json (strip namespace for local build)
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "(Get-Content '%SCRIPT_DIR%\descriptor.json' | ConvertFrom-Json).'container-image'.image.Split('/')[-1]"`) do set "IMAGE_NAME=%%I"
+REM Local image identity is declared in the Bilayers config.
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$c = Get-Content '%SCRIPT_DIR%\config.yaml' -Raw; if ($c -match '(?m)^\s*name:\s*(w_cideconvolve_benchmark)\s*$') { $Matches[1] }"`) do set "IMAGE_NAME=%%I"
 
 REM Read version from version.txt
 set /p VERSION=<"%SCRIPT_DIR%\version.txt"
 if not defined IMAGE_NAME (
-    echo Failed to read image name from descriptor.json
+    echo Failed to read image name from config.yaml
     exit /b 1
 )
 if not defined VERSION (
