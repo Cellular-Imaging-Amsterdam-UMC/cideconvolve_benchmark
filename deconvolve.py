@@ -656,8 +656,20 @@ METHODS = {
     "skimage_cucim_rl": {"memory_factor": 4, "description": "cuCIM Richardson-Lucy (CUDA GPU)"},
     "ci_rl": {"memory_factor": 8, "description": "CI SHB-accelerated RL (PyTorch GPU)"},
     "ci_rl_tv": {"memory_factor": 8, "description": "CI SHB-accelerated RL + TV (PyTorch GPU)"},
+    "ci_rl_dl": {"memory_factor": 10, "description": "CI RL + 2.5D residual U-Net refinement"},
     "ci_sparse_hessian": {"memory_factor": 8, "description": "CI Sparse-Hessian / SPITFIRE-style (PyTorch GPU)"},
 }
+
+
+def _default_ci_rl_dl_model_path(microscope_type: str | None) -> Path | None:
+    """Return the bundled ci_rl_dl checkpoint path for the microscope type."""
+    microscope = str(microscope_type or "").strip().lower()
+    model_dir = "defaultconfocal" if microscope == "confocal" else "defaultwidefield"
+    model_path = Path(__file__).parent / "models" / model_dir / "best_model.pt"
+    if model_path.is_file():
+        return model_path
+    logger.warning("ci_rl_dl model checkpoint not found: %s", model_path)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -953,8 +965,13 @@ def deconvolve(
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
     microscope_type: str = "widefield",
+    dl_model_path: Optional[Union[str, Path]] = None,
+    dl_residual_strength: float = 1.0,
     # RLTV regularization (DeconvolutionLab2)
     tv_lambda: float = 1e-4,
+    # CI backend convergence control
+    ci_convergence: str = "auto",
+    ci_rel_threshold: float = 0.005,
     # XY tiling for large images
     tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
@@ -1030,6 +1047,8 @@ def deconvolve(
             background=background, device=device,
             pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
             microscope_type=microscope_type, tv_lambda=tv_lambda,
+            ci_convergence=ci_convergence,
+            ci_rel_threshold=ci_rel_threshold,
         )
 
     # Crop PSF to image size when it is larger (e.g. n_defocus = 2*nz-1).
@@ -1048,13 +1067,22 @@ def deconvolve(
             psf = psf[tuple(slices)].copy()
             logger.info("PSF cropped to image size: %s", psf.shape)
 
-    if method in ("ci_rl", "ci_rl_tv"):
-        return _deconvolve_ci_rl(
-            image, psf, niter=niter,
+    if method in ("ci_rl", "ci_rl_tv", "ci_rl_dl"):
+        return _deconvolve_ci_rl_family(
+            image,
+            psf,
+            method=method,
+            niter=niter,
             tv_lambda=tv_lambda if method == "ci_rl_tv" else 0.0,
-            background=background, device=device,
-            pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            background=background,
+            device=device,
+            pixel_size_xy=pixel_size_xy,
+            pixel_size_z=pixel_size_z,
             microscope_type=microscope_type,
+            convergence=ci_convergence,
+            rel_threshold=ci_rel_threshold,
+            dl_model_path=dl_model_path,
+            dl_residual_strength=dl_residual_strength,
         )
 
     if method == "ci_sparse_hessian":
@@ -1062,6 +1090,8 @@ def deconvolve(
             image, psf, niter=niter,
             background=background, device=device,
             pixel_size_xy=pixel_size_xy, pixel_size_z=pixel_size_z,
+            convergence=ci_convergence,
+            rel_threshold=ci_rel_threshold,
         )
 
     if method == "pycudadecon_rl_cuda":
@@ -1117,10 +1147,11 @@ def deconvolve(
 # CI RL backend (deconvolve_ci module)
 # ---------------------------------------------------------------------------
 
-def _deconvolve_ci_rl(
+def _deconvolve_ci_rl_family(
     image: np.ndarray,
     psf: np.ndarray,
     *,
+    method: str = "ci_rl",
     niter: int = 50,
     tv_lambda: float = 0.0,
     background: Union[int, str] = "auto",
@@ -1128,16 +1159,56 @@ def _deconvolve_ci_rl(
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
     microscope_type: str = "widefield",
+    convergence: str = "auto",
+    rel_threshold: float = 0.005,
+    dl_model_path: Optional[Union[str, Path]] = None,
+    dl_residual_strength: float = 1.0,
 ) -> np.ndarray:
+    if method == "ci_rl_dl":
+        from deconvolve_ci_dl import deconvolve_ci_rl_dl
+
+        result = deconvolve_ci_rl_dl(
+            image,
+            psf,
+            model_path=dl_model_path,
+            optical_params={
+                "pixel_size_xy_nm": pixel_size_xy,
+                "pixel_size_z_nm": pixel_size_z,
+                "microscope_type": microscope_type,
+            },
+            device=device or "auto",
+            rl_kwargs={
+                "niter": niter,
+                "tv_lambda": 0.0,
+                "background": background,
+                "pixel_size_xy": pixel_size_xy,
+                "pixel_size_z": pixel_size_z,
+                "microscope_type": microscope_type,
+                "convergence": convergence,
+                "rel_threshold": rel_threshold,
+                "device": device,
+                "tiling": "none",
+            },
+            dl_kwargs={
+                "residual_strength": dl_residual_strength,
+            },
+            return_diagnostics=False,
+        )
+        return np.asarray(result, dtype=np.float32)
+
     from deconvolve_ci import ci_rl_deconvolve
+
     result = ci_rl_deconvolve(
-        image, psf,
+        image,
+        psf,
         niter=niter,
         tv_lambda=tv_lambda,
         background=background,
         pixel_size_xy=pixel_size_xy,
         pixel_size_z=pixel_size_z,
         microscope_type=microscope_type,
+        convergence=convergence,
+        rel_threshold=rel_threshold,
         device=device,
         tiling="none",
     )
@@ -1153,6 +1224,8 @@ def _deconvolve_ci_sparse_hessian(
     device: Optional[str] = None,
     pixel_size_xy: Optional[float] = None,
     pixel_size_z: Optional[float] = None,
+    convergence: str = "auto",
+    rel_threshold: float = 0.005,
 ) -> np.ndarray:
     from deconvolve_ci import ci_sparse_hessian_deconvolve
     result = ci_sparse_hessian_deconvolve(
@@ -1161,6 +1234,8 @@ def _deconvolve_ci_sparse_hessian(
         background=background,
         pixel_size_xy=pixel_size_xy,
         pixel_size_z=pixel_size_z,
+        convergence=convergence,
+        rel_threshold=rel_threshold,
         device=device,
         tiling="none",
     )
@@ -1722,6 +1797,10 @@ def deconvolve_image(
     background: Union[int, str] = "auto",
     device: Optional[str] = None,
     tv_lambda: float = 1e-4,
+    ci_convergence: str = "auto",
+    ci_rel_threshold: float = 0.005,
+    dl_model_path: Optional[Union[str, Path]] = None,
+    dl_residual_strength: float = 1.0,
     tiling: str = "custom",
     max_tile_xy: int = MAX_TILE_XY,
     max_tile_z: int = MAX_TILE_Z,
@@ -1780,6 +1859,11 @@ def deconvolve_image(
 
     results: list[np.ndarray] = []
     psfs: list[np.ndarray] = []
+    resolved_dl_model_path = dl_model_path
+    if method == "ci_rl_dl" and resolved_dl_model_path is None:
+        resolved_dl_model_path = _default_ci_rl_dl_model_path(
+            metadata.get("microscope_type", microscope_type or "widefield")
+        )
 
     for ch_idx in channels:
         if ch_idx >= len(images):
@@ -1798,7 +1882,13 @@ def deconvolve_image(
 
         # Match PSF dimensionality to image
         img = images[ch_idx]
-        if img.ndim == 2 and psf.ndim == 3:
+        keep_hidden_2d_psf = (
+            img.ndim == 2
+            and psf.ndim == 3
+            and metadata.get("microscope_type", "widefield") == "widefield"
+            and method == "ci_rl_dl"
+        )
+        if img.ndim == 2 and psf.ndim == 3 and not keep_hidden_2d_psf:
             psf = psf[psf.shape[0] // 2]  # Take central slice
         elif img.ndim == 3 and psf.ndim == 2:
             # Expand 2D PSF into 3D (single-plane)
@@ -1810,9 +1900,13 @@ def deconvolve_image(
             niter=niter, beta=beta, weight=weight, reg=reg, pad=pad,
             plane_by_plane=plane_by_plane, dzdata=dzdata, dxdata=dxdata,
             background=background, device=device, tv_lambda=tv_lambda,
+            ci_convergence=ci_convergence,
+            ci_rel_threshold=ci_rel_threshold,
             pixel_size_xy=metadata.get("pixel_size_x"),
             pixel_size_z=metadata.get("pixel_size_z"),
             microscope_type=metadata.get("microscope_type", "widefield"),
+            dl_model_path=resolved_dl_model_path,
+            dl_residual_strength=dl_residual_strength,
             tiling=tiling, max_tile_xy=max_tile_xy, max_tile_z=max_tile_z,
         )
         results.append(result)

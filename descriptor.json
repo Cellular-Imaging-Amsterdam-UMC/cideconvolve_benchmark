@@ -5,7 +5,7 @@
     "image": "cellularimagingcf/w_cideconvolve_benchmark",
     "type": "singularity"
   },
-  "command-line": "python wrapper.py --method @method --iterations @iterations --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_size @pinhole_size --refractive_index @refractive_index --sample_ri @sample_ri --projection @projection --benchmark @benchmark --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image --bench_montage @bench_montage --tiling @tiling --tile_limits @tile_limits --device @device --log @log",
+  "command-line": "python wrapper.py --method @method --iterations @iterations --overrule_image_metadata @overrule_image_metadata --na @na --emission_wl @emission_wl --pixel_size_xy @pixel_size_xy --pixel_size_z @pixel_size_z --microscope_type @microscope_type --excitation_wl @excitation_wl --pinhole_size @pinhole_size --refractive_index @refractive_index --sample_ri @sample_ri --residual_strength @residual_strength --projection @projection --benchmark @benchmark --bench_iterations @bench_iterations --bench_methods @bench_methods --bench_crop @bench_crop --bench_one_image @bench_one_image --bench_montage @bench_montage --tiling @tiling --tile_limits @tile_limits --device @device --log @log",
   "inputs": [
     {
       "id": "method",
@@ -23,6 +23,7 @@
         "sdeconv_spitfire",
         "ci_rl",
         "ci_rl_tv",
+        "ci_rl_dl",
         "ci_sparse_hessian",
         "pycudadecon_rl_cuda",
         "deconwolf_rl",
@@ -183,6 +184,19 @@
       ]
     },
     {
+      "id": "residual_strength",
+      "value-key": "@residual_strength",
+      "command-line-flag": "--residual_strength",
+      "name": "(adv) DL residual strength",
+      "description": "Scaling factor for the learned residual in ci_rl_dl. 1.0 uses the full model correction, 0.0 falls back to the underlying ci_rl result.",
+      "default-value": 1.0,
+      "set-by-server": false,
+      "optional": true,
+      "type": "Number",
+      "minimum": 0,
+      "maximum": 5
+    },
+    {
       "id": "projection",
       "value-key": "@projection",
       "command-line-flag": "--projection",
@@ -226,16 +240,16 @@
       "command-line-flag": "--bench_methods",
       "name": "(ess) Benchmark methods",
       "description": "Which set of methods to benchmark. Each tier adds methods to the previous. 'all' includes every public backend. Methods that are unsupported on the current machine are written to the CSV as skipped with a reason.",
-      "default-value": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian",
+      "default-value": "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian",
       "set-by-server": false,
       "optional": true,
       "type": "String",
       "value-choices": [
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian",
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl",
-        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl",
-        "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber",
-        "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_sparse_hessian",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, redlionfish_rl",
+        "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl",
+        "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber",
+        "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian",
         "all"
       ]
     },

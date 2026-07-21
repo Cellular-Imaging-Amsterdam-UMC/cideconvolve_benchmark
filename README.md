@@ -9,6 +9,7 @@ container, through the PyQt6 launcher, or directly from `wrapper.py` in a local
 Python environment.
 
 The core CI deconvolution and PSF code is kept in [deconvolve_ci.py](deconvolve_ci.py)
+with the learned refinement layer in [deconvolve_ci_dl.py](deconvolve_ci_dl.py),
 and is synced from the companion
 [cideconvolve](https://github.com/Cellular-Imaging-Amsterdam-UMC/cideconvolve)
 repository when needed. This benchmark repository adds descriptor handling,
@@ -20,7 +21,7 @@ image generation.
 | Workflow name | `W_CIDeconvolve_benchmark` |
 | Docker image | `cellularimagingcf/w_cideconvolve_benchmark` |
 | Version | `v1.0.0` |
-| Single-method selector | 17 methods in `descriptor.json` |
+| Single-method selector | 18 methods in `descriptor.json` |
 | Benchmark sets | include `ci_sparse_hessian` in addition to the public selector methods |
 | Input format | OME-TIFF / OME-Zarr via `bioio`, with TIFF fallback |
 
@@ -72,6 +73,12 @@ For confocal PSFs, the current `deconvolve_ci.py` uses finite pinhole size in
 the PSF calculation. The descriptor parameter `pinhole_size` is in Airy disk
 units. OME channel `PinholeSize` is stored/read in micrometers and converted to
 Airy units using emission wavelength, NA, and objective magnification.
+
+For `ci_rl_dl`, the workflow automatically chooses the bundled learned
+refinement checkpoint from the resolved microscope type after metadata loading:
+`models/defaultconfocal/best_model.pt` for confocal data and
+`models/defaultwidefield/best_model.pt` for widefield data. No model path needs
+to be supplied through the descriptor.
 
 ## Synthetic 3D Test Images
 
@@ -148,8 +155,8 @@ docker build -t w_cideconvolve_benchmark:v1.0.0 -t w_cideconvolve_benchmark:late
 ```
 
 The Docker image includes Python 3.11, CUDA runtime support, pycudadecon,
-deconwolf, DeconvolutionLab2, Java, vendored `sdeconv`, and the benchmark
-workflow code.
+deconwolf, DeconvolutionLab2, Java, vendored `sdeconv`, the bundled
+`ci_rl_dl` confocal and widefield checkpoints, and the benchmark workflow code.
 
 ## Run With Docker
 
@@ -227,6 +234,7 @@ The user-facing parameters are defined in [descriptor.json](descriptor.json).
 | `--pinhole_size` | `1.0` | Confocal pinhole in Airy disk units |
 | `--refractive_index` | `oil (1.515)` | Immersion medium |
 | `--sample_ri` | `prolong gold (1.47)` | Sample/mounting medium |
+| `--residual_strength` | `1.0` | Scale factor for the learned residual used by `ci_rl_dl` |
 | `--projection` | `none` | `none`, `mip`, or `sum` |
 | `--benchmark` | `True` | Run benchmark instead of one method |
 | `--bench_iterations` | `20, 40, 60` | Iterations used in benchmark mode |
@@ -246,14 +254,14 @@ See [METHODS.md](METHODS.md) for method details and platform notes.
 Single-method choices in `descriptor.json` currently include:
 
 - `sdeconv_rl`, `sdeconv_wiener`, `sdeconv_spitfire`
-- `ci_rl`, `ci_rl_tv`, `ci_sparse_hessian`
+- `ci_rl`, `ci_rl_tv`, `ci_rl_dl`, `ci_sparse_hessian`
 - `pycudadecon_rl_cuda`
 - `deconwolf_rl`, `deconwolf_shb`
 - `deconvlab2_rl`, `deconvlab2_rltv`, `deconvlab2_landweber`, `deconvlab2_ista`
 - `redlionfish_rl`
 - `skimage_rl`, `skimage_unsupervised_wiener`, `skimage_cucim_rl`
 
-Benchmark presets also include `ci_sparse_hessian`.
+Benchmark presets also include `ci_rl_dl` and `ci_sparse_hessian`.
 
 ## Project Structure
 
@@ -261,12 +269,14 @@ Benchmark presets also include `ci_sparse_hessian`.
 wrapper.py               BIAFLOWS entrypoint and benchmark runner
 deconvolve.py            Metadata parsing, PSF generation, method dispatch, saving
 deconvolve_ci.py         CI deconvolution and finite-pinhole PSF implementation
+deconvolve_ci_dl.py      CI RL + learned 2.5D residual refinement
 create3d_gt.py           Local synthetic 3D ground-truth generator
 launcher.py              PyQt6 Docker launcher
 descriptor.json          BIAFLOWS/BIOMERO parameter descriptor
 bioflows_local.py        Local BIAFLOWS compatibility shim
 Dockerfile               GPU-capable benchmark container
 requirements_docker.txt  Docker Python dependencies
+models/                  Bundled confocal and widefield ci_rl_dl checkpoints
 vendor/                  Vendored Python libraries
 ```
 ## References

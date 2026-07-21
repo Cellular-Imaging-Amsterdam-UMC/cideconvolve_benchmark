@@ -116,8 +116,10 @@ RUN python -m pip install --no-cache-dir --no-compile --upgrade pip \
     && micromamba clean -a -f -y
 
 COPY vendor/ /app/vendor/
+COPY models/ /app/models/
 COPY deconvolve.py /app/deconvolve.py
 COPY deconvolve_ci.py /app/deconvolve_ci.py
+COPY deconvolve_ci_dl.py /app/deconvolve_ci_dl.py
 COPY bioflows_local.py /app/bioflows_local.py
 COPY wrapper.py /app/wrapper.py
 COPY descriptor.json /app/descriptor.json

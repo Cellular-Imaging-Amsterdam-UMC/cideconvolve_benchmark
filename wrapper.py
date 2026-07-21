@@ -90,6 +90,7 @@ _BENCH_BASE = [
     "pycudadecon_rl_cuda",
     "ci_rl",
     "ci_rl_tv",
+    "ci_rl_dl",
     "ci_sparse_hessian",
 ]
 _BENCH_BASE_RLF = _BENCH_BASE + [
@@ -110,6 +111,7 @@ _BENCH_FAST = [
     "pycudadecon_rl_cuda",
     "ci_rl",
     "ci_rl_tv",
+    "ci_rl_dl",
     "sdeconv_rl",
     "skimage_cucim_rl",
     "deconvlab2_landweber",
@@ -126,16 +128,17 @@ _BENCH_CROSS = [
     "skimage_rl",
     "ci_rl",
     "ci_rl_tv",
+    "ci_rl_dl",
     "ci_sparse_hessian",
 ]
 _BENCH_ALL = list(METHODS.keys())
 
 BENCH_METHOD_SETS = {
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian": _BENCH_BASE,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, redlionfish_rl": _BENCH_BASE_RLF,
-    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
-    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
-    "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_sparse_hessian": _BENCH_CROSS,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian": _BENCH_BASE,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, redlionfish_rl": _BENCH_BASE_RLF,
+    "sdeconv_rl, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, deconwolf_rl, deconwolf_shb, redlionfish_rl": _BENCH_BASE_DW_RLF,
+    "sdeconv_wiener, pycudadecon_rl_cuda, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian, sdeconv_rl, skimage_cucim_rl, deconvlab2_landweber": _BENCH_FAST,
+    "sdeconv_rl, sdeconv_spitfire, pycudadecon_rl_cuda, deconwolf_rl, deconwolf_shb, deconvlab2_rl, deconvlab2_rltv, redlionfish_rl, skimage_rl, ci_rl, ci_rl_tv, ci_rl_dl, ci_sparse_hessian": _BENCH_CROSS,
     "all": _BENCH_ALL,
 }
 
@@ -431,11 +434,28 @@ def _quality_metrics(
 
 
 def _detect_synthetic_gt(img_path: Path) -> "Path | None":
-    """Return path to synthetic_object_gt.ome.tiff if img_path is a synthetic blurred image."""
+    """Return the matching synthetic GT path if img_path is a synthetic blurred image."""
     if "synthetic_blurred_noisy" not in img_path.name:
         return None
-    gt_path = img_path.parent / "synthetic_object_gt.ome.tiff"
-    return gt_path if gt_path.exists() else None
+
+    name = img_path.name
+    candidates: list[Path] = []
+    prefix = "synthetic_blurred_noisy_snr"
+    for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
+        if name.lower().endswith(suffix):
+            stem = name[: -len(suffix)]
+            if stem.startswith(prefix):
+                tail = stem[len(prefix):]
+                parts = tail.split("_", 1)
+                if len(parts) == 2 and parts[1]:
+                    candidates.append(img_path.parent / f"synthetic_object_gt_{parts[1]}{suffix}")
+            break
+
+    candidates.append(img_path.parent / "synthetic_object_gt.ome.tiff")
+    for gt_path in candidates:
+        if gt_path.exists():
+            return gt_path
+    return None
 
 
 def _compute_frc_area(img1: np.ndarray, img2: np.ndarray) -> float:
@@ -780,7 +800,7 @@ def _method_device(method: str) -> str:
         return "CUDA"
     if method in _CPU_METHODS:
         return "CPU"
-    # ci_rl / ci_rl_tv / ci_sparse_hessian — PyTorch: CUDA when available, else CPU
+    # ci_rl / ci_rl_tv / ci_rl_dl / ci_sparse_hessian — PyTorch: CUDA when available, else CPU
     if method.startswith("ci_"):
         import torch
         return "CUDA" if torch.cuda.is_available() else "CPU"
@@ -1032,6 +1052,13 @@ def _check_method_available(method: str) -> tuple[bool, str]:
         if not (_DECONVLAB2_JAR.exists() and _IJ_JAR.exists() and shutil.which("java")):
             return False, "DeconvolutionLab2 JAR or java not found"
 
+    if method == "ci_rl_dl":
+        base = Path(__file__).parent / "models"
+        confocal_model = base / "defaultconfocal" / "best_model.pt"
+        widefield_model = base / "defaultwidefield" / "best_model.pt"
+        if not (confocal_model.is_file() and widefield_model.is_file()):
+            return False, "ci_rl_dl model checkpoints not found"
+
     return True, ""
 
 
@@ -1046,6 +1073,7 @@ def main(argv):
         method = getattr(parameters, "method", "sdeconv_rl")
         device_param = getattr(parameters, "device", "auto")
         device = None if device_param in (None, "auto") else device_param
+        residual_strength = float(getattr(parameters, "residual_strength", 1.0))
 
         # PSF metadata parameters. By default image metadata wins; descriptor
         # values are fallbacks for missing metadata. With overrule enabled,
@@ -1147,6 +1175,8 @@ def main(argv):
         print(f"  Emission WL  : {em_override}")
         print(f"  Excitation WL: {ex_override}")
         print(f"  Pinhole      : {pinhole_override} Airy Disk")
+        if method == "ci_rl_dl":
+            print(f"  Residual str.: {residual_strength}")
         if benchmark_mode:
             print(f"  Bench iters  : {bench_iterations}")
             print(f"  Bench methods: {bench_methods_key} ({len(bench_methods)} methods)")
@@ -1230,6 +1260,7 @@ def main(argv):
                         excitation_wavelengths=ex_override,
                         pinhole_airy_units=pinhole_override,
                         overrule_metadata=overrule_metadata,
+                        residual_strength=residual_strength,
                     )
                     # Move final montage PNGs from tmp to output
                     for png in tmp_work.glob("decon_benchmark_*.png"):
@@ -1265,6 +1296,7 @@ def main(argv):
                         excitation_wavelengths=ex_override,
                         pinhole_airy_units=pinhole_override,
                         overrule_metadata=overrule_metadata,
+                        dl_residual_strength=residual_strength,
                     )
 
                     if result is None:
@@ -1759,6 +1791,7 @@ def _run_benchmark(
     excitation_wavelengths: list[float] | None = None,
     pinhole_airy_units: float | None = None,
     overrule_metadata: bool = False,
+    residual_strength: float = 1.0,
 ):
     """Run multi-method × multi-iteration benchmark for a single image."""
     del save_psf
@@ -1939,6 +1972,7 @@ def _run_benchmark(
             ),
             "pinhole_airy_units": pinhole_airy_units,
             "overrule_metadata": overrule_metadata,
+            "dl_residual_strength": residual_strength,
         }
     else:
         meta_overrides = {
@@ -1952,6 +1986,7 @@ def _run_benchmark(
             "excitation_wavelengths": excitation_wavelengths,
             "pinhole_airy_units": pinhole_airy_units,
             "overrule_metadata": overrule_metadata,
+            "dl_residual_strength": residual_strength,
         }
 
     available_methods = []
@@ -1985,6 +2020,7 @@ def _run_benchmark(
 
             print(f"\n  -- {method}, {nit} iterations --")
             try:
+                ci_convergence = "fixed" if method.startswith("ci_") else "auto"
                 if method.startswith("sdeconv_"):
                     dev_val = "cuda" if torch.cuda.is_available() else "cpu"
                     monitor = _MetricsMonitor()
@@ -1997,6 +2033,7 @@ def _run_benchmark(
                         tiling=tiling,
                         max_tile_xy=max_tile_xy,
                         max_tile_z=max_tile_z,
+                        ci_convergence=ci_convergence,
                         **meta_overrides,
                     )
                     out_name = f"{stem}_{method}_{dev_val}_{nit}i.ome.tiff"
@@ -2021,6 +2058,7 @@ def _run_benchmark(
                         tiling=tiling,
                         max_tile_xy=max_tile_xy,
                         max_tile_z=max_tile_z,
+                        ci_convergence=ci_convergence,
                         **meta_overrides,
                     )
                     out_name = f"{stem}_{method}_{nit}i.ome.tiff"

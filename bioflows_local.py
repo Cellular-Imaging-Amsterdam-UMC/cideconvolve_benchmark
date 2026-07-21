@@ -267,7 +267,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
             kwargs["type"] = int if is_int else float
         else:
             # Use nargs="+" so Docker CLI space-separated values like
-            # --bench_methods sdeconv_rl, ci_rl, ci_rl_tv  are all captured
+            # --bench_methods sdeconv_rl, ci_rl, ci_rl_tv, ci_rl_dl are all captured
             # instead of only the first token.
             kwargs["type"] = str
             kwargs["nargs"] = "+"
